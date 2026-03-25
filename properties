@@ -1,0 +1,2177 @@
+Это комментарий от меня (ZarakiqKenpachi), ниже я подготовил примерно то, что должно быть в проекте.
+
+Фиксируемый вариант максимум прибыли и превращаем его в жёсткую, формализованную ТС, которую можно сразу кодить или торговать.
+
+Без воды. Только логика.
+
+---
+
+# 🧠 ICT SYSTEM — VARIANT A (MAX PROFIT)
+
+## 📊 Параметры системы
+
+* TF анализа: 1H
+* TF входа: 30m
+* Risk: 1% на сделку
+* RR: 1:3.5
+* Hold: макс 10 свечей 30m
+* Bias: ❌ НЕ используется
+* Второй ретест: ✅ разрешён
+
+---
+
+# 1. 🔍 ПОИСК СЕТАПА (1H)
+
+## 1.1 Sweep (ликвидность)
+
+Условие:
+
+* текущая свеча пробивает high/low последних 4 свечей
+
+High sweep:
+high[i] > max(high[i-1 ... i-4])
+
+Low sweep:
+low[i] < min(low[i-1 ... i-4])
+
+👉 это обязательное условие
+
+---
+
+## 1.2 Displacement (импульс)
+
+После sweep та же свеча должна быть импульсной:
+
+* тело ≥ 35% диапазона
+* диапазон ≥ 0.7 ATR (14)
+
+body = abs(close - open)
+range = high - low
+
+body / range ≥ 0.35
+range ≥ ATR * 0.7
+
+---
+
+## 1.3 Направление сделки
+
+После sweep:
+
+* sweep HIGH → ищем SHORT
+* sweep LOW → ищем LONG
+
+👉 reversal модель
+
+---
+
+# 2. 📉 ЗОНА ВХОДА (30m)
+
+Берём импульсную свечу (1H) и считаем retrace:
+
+range = high - low
+
+long zone:
+low + 35% → low + 70%
+
+short zone:
+high - 70% → high - 35%
+
+---
+
+# 3. 🎯 ВХОД
+
+## Условия входа:
+
+* цена на 30m заходит в зону 35–70%
+* вход limit
+* допускается:
+
+  * первый ретест
+  * второй ретест (если нет обновления экстремума)
+
+---
+
+# 4. 🛑 СТОП
+
+LONG → SL ниже low sweep свечи
+SHORT → SL выше high sweep свечи
+
+👉 стоп всегда за ликвидностью
+
+---
+
+# 5. 🎯 ТЕЙК
+
+TP = entry + (SL distance × 3.5)
+
+👉 фиксированный RR 1:3.5
+
+---
+
+# 6. ⏱️ УПРАВЛЕНИЕ СДЕЛКОЙ
+
+Сделка закрывается если:
+
+1. TP достигнут
+2. SL достигнут
+3. прошло 10 свечей 30m (~5 часов)
+
+👉 если ни TP ни SL → закрытие по рынку
+
+---
+
+# 7. ❌ ФИЛЬТРЫ (обязательные)
+
+## 7.1 Нет второго sweep против позиции
+
+Если после сигнала:
+
+* цена снова делает sweep против нас
+
+👉 сделку пропускаем
+
+---
+
+## 7.2 Минимальная дистанция
+
+Если SL слишком маленький:
+
+* < 0.3% цены
+
+👉 пропускаем (шум)
+
+---
+
+## 7.3 ATR фильтр
+
+Если ATR слишком низкий (флэт):
+👉 не торгуем
+
+---
+
+# 8. 🔁 ПОВТОРНЫЙ ВХОД
+
+Разрешён второй ретест, если:
+
+* не было нового high/low
+* структура не сломалась
+
+---
+
+# 9. 📊 РИСК-МЕНЕДЖМЕНТ
+
+* риск: 1%
+* max подряд SL: 3 → стоп торговля
+* max 1 позиция одновременно
+
+---
+
+# ⚡️ ЛОГИКА В ОДНУ СТРОКУ
+
+👉 локальный sweep → импульс → возврат → вход → забор RR 3.5
+
+---
+
+# 💀 КРИТИЧЕСКИЕ МОМЕНТЫ (очень важно)
+
+## 1. Это НЕ классический ICT
+
+* нет HTF bias
+* нет “идеальной структуры”
+
+👉 это адаптированный liquidity model
+
+---
+
+## 2. Сила системы
+
+* частота ↑
+* winrate держится
+* RR высокий
+
+👉 отсюда прибыль
+
+---
+
+## 3. Главный риск
+
+* переоптимизация
+* второй ретест может сломаться на другом рынке
+
+---
+
+# 📌 ГОТОВАЯ ТС (если коротко)
+
+1. Найди sweep 4 свечей (1H)
+2. Проверь displacement
+3. Определи направление
+4. Построй зону 35–70%
+5. Поставь лимитку
+6. SL за экстремум
+7. TP = 3.5R
+8. Закрой через 10 свечей если не отработало
+
+---
+
+# 🚀 Следующий шаг
+
+Если хочешь по-взрослому:
+
+👉 я могу:
+
+* перевести это в Pine Script v6 (стратегию)
+* добавить комиссии OKX
+* сделать визуал входов/SL/TP
+* и сразу дать тебе инструмент для теста
+
+Скажи:
+код пишем или сначала ещё усилим систему (например добавим ML фильтр)?
+[24.03.2026 5:15] Дима: Да. Ниже даю правильную структуру робота именно под вашу ТС, чтобы он не был “скриптом на коленке”, а был системой, которая:
+
+* сама ищет сетап
+* сама проверяет, что лимитка реально должна стоять
+* сама ставит/снимает заявку
+* сама сопровождает сделку
+* сама пишет журнал
+* и не принимает “эмоциональных” решений
+
+---
+
+# Общая идея
+
+Ваш робот должен быть не одним файлом, а набором модулей.
+
+Потому что у вас ТС не примитивная:
+
+* 1H ищет сетап
+* 30m ищет возврат
+* 1m проверяет исполнение и факт касания зоны
+* вход только лимиткой
+* стоп строго за sweep
+* тейк фиксированный
+* есть тайм-аут сделки
+* есть отмена сетапа, если экстремум сломан
+
+Это уже событийная торговая система, а не просто “если RSI < 30 — купить”.
+
+---
+
+# Какие языки программирования нужны
+
+## 1. Основной язык: Python
+
+Это лучший выбор для первого рабочего робота.
+
+Почему:
+
+* быстро писать
+* удобно работать с API брокеров
+* удобно собирать логику стратегии
+* удобно вести журнал сделок
+* удобно тестировать
+* куча библиотек для датафидов, async, логов, БД
+
+Именно на Python надо писать:
+
+* ядро стратегии
+* обработку свечей
+* генератор сигналов
+* постановку заявок
+* журналирование
+* риск-менеджер
+* бэктест/форвард-режим
+
+---
+
+## 2. Хранилище/БД: PostgreSQL
+
+Не обязательно в первой версии, но правильно использовать именно её.
+
+Для чего:
+
+* хранить свечи
+* хранить сигналы
+* хранить заявки
+* хранить сделки
+* хранить причины отмены сетапов
+* хранить логи исполнения
+
+Если делать совсем простой MVP:
+
+* можно начать с SQLite
+* но если хочешь серьёзно — PostgreSQL
+
+---
+
+## 3. Опционально: JavaScript / TypeScript
+
+Нужен не для стратегии, а если потом захочешь:
+
+* веб-панель
+* мониторинг сделок
+* UI с журналом
+* кнопку включения/отключения торговли
+* просмотр активных сетапов
+
+То есть:
+
+* Python = торговый мозг
+* TypeScript = панель управления
+
+Но на старте можно вообще без TS.
+
+---
+
+## 4. Для скорости исполнения
+
+Если когда-то понадобится сверхнизкая задержка:
+
+* можно часть логики переписать на Go
+* но для РФ рынка и вашей ТС это пока не нужно
+
+Сейчас Python достаточно.
+
+---
+
+# Как должна выглядеть система
+
+Правильная архитектура:
+
+market_data/
+strategy/
+execution/
+risk/
+storage/
+logging/
+backtest/
+config/
+main.py
+
+---
+
+# Структура проекта
+
+## 1. market_data/
+
+Этот блок отвечает за получение и сбор данных.
+
+### Что делает:
+
+* подключается к брокеру / датафиду
+* получает 1m свечи
+* агрегирует из 1m:
+
+  * 30m
+  * 1H
+* следит, чтобы свечи закрывались корректно
+* обновляет локальное хранилище
+
+### Файлы:
+
+market_data/
+    broker_feed.py
+    candle_builder.py
+    symbols.py
+    session_filter.py
+
+### Логика:
+
+* broker_feed.py — подписка на рынок
+* candle_builder.py — сбор 1m/30m/1H свечей
+* session_filter.py — фильтр по времени торгов
+* symbols.py — список инструментов
+
+---
+
+## 2. strategy/
+
+Это сердце робота.
+
+### Что делает:
+
+* ищет sweep на 1H
+* проверяет displacement
+* строит зону 50–70%
+* ждёт первый возврат
+* проверяет, что сетап ещё жив
+* генерирует лимитный вход
+
+### Файлы:
+
+strategy/
+    models.py
+    sweep_detector.py
+    displacement_detector.py
+    entry_zone.py
+    retest_detector.py
+    signal_engine.py
+    trade_validator.py
+
+---
+
+## 3. execution/
+
+Этот блок работает с заявками.
+
+### Что делает:
+
+* ставит лимитную заявку
+* отменяет заявку, если сетап умер
+* выставляет стоп
+* выставляет тейк
+* закрывает по тайм-ауту
+* контролирует статус ордера
+
+### Файлы:
+
+execution/
+    order_manager.py
+    broker_api.py
+    position_manager.py
+    fill_tracker.py
+
+---
+
+## 4. risk/
+
+Это блок безопасности.
+
+### Что делает:
+
+* считает размер позиции
+* ограничивает риск на сделку
+* запрещает несколько конфликтующих входов
+* запрещает вход, если стоп слишком широкий
+* следит за дневным лимитом убытка
+* следит за общим количеством активных позиций
+
+### Файлы:
+
+risk/
+    position_sizer.py
+    risk_manager.py
+    portfolio_limits.py
+
+---
+
+## 5. storage/
+
+Хранилище данных.
+
+### Что хранить:
+
+* свечи
+* сигналы
+* активные сетапы
+* ордера
+* сделки
+* отменённые сделки
+* логи ошибок
+
+### Файлы:
+
+storage/
+    db.py
+    repositories.py
+    schema.sql
+
+---
+
+## 6. logging/
+[24.03.2026 5:15] Дима: Логи должны быть отдельным блоком.
+
+### Что логировать:
+
+* почему найден sweep
+* почему не найден displacement
+* почему сетап отменён
+* когда поставлена лимитка
+* когда лимитка исполнена
+* когда стоп/тейк/тайм-аут
+* все ошибки брокера
+
+### Файлы:
+
+logging/
+    logger.py
+    trade_logger.py
+    event_logger.py
+
+---
+
+## 7. backtest/
+
+Очень важный блок.
+
+Перед live-торговлей у тебя должна быть возможность:
+
+* прогнать логику на истории
+* проверить только реальные лимитные касания
+* проверить тайм-ауты
+* увидеть реальный PnL
+* понять, какие инструменты подходят
+
+### Файлы:
+
+backtest/
+    engine.py
+    simulator.py
+    metrics.py
+    reports.py
+
+---
+
+## 8. config/
+
+Все настройки должны быть отдельно.
+
+### Что там должно быть:
+
+* список инструментов
+* риск на сделку
+* RR
+* параметры sweep
+* параметры displacement
+* параметры зоны
+* длительность тайм-аута
+* параметры сессии
+* API-ключи
+
+### Файлы:
+
+config/
+    settings.yaml
+    symbols.yaml
+
+---
+
+# Главные сущности в коде
+
+Тебе нужно мыслить не “свечками”, а объектами системы.
+
+---
+
+## 1. Candle
+
+class Candle:
+    symbol: str
+    timeframe: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    open_time: datetime
+    close_time: datetime
+
+---
+
+## 2. Setup
+
+Это найденный сетап, но ещё не сделка.
+
+class Setup:
+    id: str
+    symbol: str
+    direction: str  # long / short
+    signal_time: datetime
+
+    sweep_price: float
+    signal_candle_high: float
+    signal_candle_low: float
+
+    entry_zone_low: float
+    entry_zone_high: float
+    entry_price: float
+
+    stop_price: float
+    take_price: float
+
+    status: str
+    # pending / armed / invalidated / ordered / filled / closed
+
+---
+
+## 3. Order
+
+class Order:
+    id: str
+    broker_order_id: str | None
+    symbol: str
+    side: str
+    order_type: str   # limit
+    price: float
+    quantity: int
+    status: str       # new / placed / partially_filled / filled / canceled
+
+---
+
+## 4. Position
+
+class Position:
+    symbol: str
+    direction: str
+    entry_price: float
+    stop_price: float
+    take_price: float
+    quantity: int
+    open_time: datetime
+    close_time: datetime | None
+    status: str
+
+---
+
+# Как робот должен мыслить по шагам
+
+Ниже именно логический pipeline.
+
+---
+
+## Этап 1. Получение данных
+
+Робот получает 1m свечу.
+
+После этого:
+
+* обновляет 30m свечу
+* обновляет 1H свечу
+* сохраняет всё в БД
+
+---
+
+## Этап 2. Проверка 1H сетапа
+
+Когда закрывается новая 1H свеча:
+
+1. берём последние 6 закрытых H1-свечей до сигнальной
+2. проверяем sweep
+3. проверяем displacement
+4. определяем направление
+5. строим зону 50–70%
+6. считаем цену лимитки
+7. считаем стоп
+8. считаем тейк
+9. создаём Setup
+
+---
+
+## Этап 3. Ожидание возврата на 30m
+
+Когда приходит новая 30m свеча:
+
+1. проверяем все pending setup
+2. смотрим, вошла ли цена в рабочую зону
+3. убеждаемся, что это первый ретест
+4. убеждаемся, что sweep-экстремум не сломан
+5. если да — переводим setup в armed
+
+---
+
+## Этап 4. Проверка реального лимитного входа на 1m
+
+Когда сетап armed:
+
+1. отслеживаем 1m данные
+2. проверяем, коснулась ли цена лимитной цены реально
+3. если коснулась — ставим лимитную заявку
+4. если лимитка исполнена — открываем позицию
+5. если цена сломала сетап раньше — отменяем
+
+Тут важный момент:
+не надо “предполагать исполнение” по 30m.
+У вас вся система завязана на реальное касание, значит решение должно приниматься на 1m.
+
+---
+
+# Как кодировать правила вашей ТС
+
+---
+
+## 1. Sweep detector
+
+### Long:
+
+* low текущей H1 свечи ниже low последних 6 H1 свечей
+
+### Short:
+
+* high текущей H1 свечи выше high последних 6 H1 свечей
+
+### Но:
+
+Нужен не просто прокол, а нормальный sweep.
+
+Значит лучше сразу в коде заложить:
+
+* минимальную глубину sweep
+* например в процентах от среднего range последних H1 свечей
+
+Псевдокод:
+[24.03.2026 5:15] Дима: def detect_sweep(candles: list[Candle]) -> dict | None:
+    signal = candles[-1]
+    prev_6 = candles[-7:-1]
+
+    highest = max(c.high for c in prev_6)
+    lowest = min(c.low for c in prev_6)
+
+    if signal.high > highest:
+        return {"side": "short", "sweep_price": signal.high, "ref_level": highest}
+
+    if signal.low < lowest:
+        return {"side": "long", "sweep_price": signal.low, "ref_level": lowest}
+
+    return None
+
+---
+
+## 2. Displacement detector
+
+У вас базовое правило:
+
+* тело свечи не меньше 55% диапазона
+
+Значит:
+
+def body_ratio(candle: Candle) -> float:
+    rng = candle.high - candle.low
+    if rng <= 0:
+        return 0.0
+    return abs(candle.close - candle.open) / rng
+
+Для long:
+
+* свеча бычья
+* body_ratio >= 0.55
+
+Для short:
+
+* свеча медвежья
+* body_ratio >= 0.55
+
+---
+
+## 3. Entry zone 50–70%
+
+def calc_entry_zone(candle: Candle, direction: str) -> tuple[float, float]:
+    rng = candle.high - candle.low
+
+    zone_50 = candle.low + rng * 0.50
+    zone_70 = candle.low + rng * 0.70
+
+    if direction == "long":
+        return (zone_50, zone_70)
+
+    if direction == "short":
+        return (zone_50, zone_70)
+
+Но для short и long удобнее считать через нормализованную функцию retracement, иначе можно запутаться.
+
+Лучше хранить:
+
+* zone_low
+* zone_high
+* entry_price = середина зоны или конкретный % внутри неё
+
+Если по вашей ТС вход лимиткой должен быть в ядре зоны, я бы жёстко делал:
+
+* entry_price = 0.60 retracement
+
+---
+
+## 4. Первый ретест
+
+Робот должен помнить:
+
+* был ли уже вход цены в зону после сигнальной свечи
+
+Это критично.
+
+Нужен флаг:
+
+setup.first_touch_seen = False
+
+Как только цена вошла в зону в первый раз:
+
+* либо активируешь лимитку
+* либо, если входа не было корректно, потом второй возврат уже запрещён
+
+---
+
+## 5. Invalidation
+
+Сетап должен умереть автоматически, если:
+
+* long: обновили low sweep-свечи
+* short: обновили high sweep-свечи
+* возврата не было в течение N свечей
+* уже был первый возврат и он не реализован
+* цена ушла слишком далеко и RR стал неадекватным
+
+---
+
+# Самая важная часть — состояние автомата
+
+Робот лучше строить как state machine.
+
+## Состояния сетапа:
+
+NEW
+PENDING
+ARMED
+ORDER_PLACED
+FILLED
+STOPPED
+TAKEN
+TIMED_OUT
+INVALIDATED
+CANCELED
+
+### Логика переходов:
+
+* NEW -> PENDING
+  найден sweep + displacement
+
+* PENDING -> ARMED
+  цена впервые вошла в зону
+
+* ARMED -> ORDER_PLACED
+  лимитка отправлена брокеру
+
+* ORDER_PLACED -> FILLED
+  ордер исполнен
+
+* ORDER_PLACED -> CANCELED
+  сетап умер до исполнения
+
+* FILLED -> TAKEN
+  достигнут тейк
+
+* FILLED -> STOPPED
+  достигнут стоп
+
+* FILLED -> TIMED_OUT
+  истёк лимит по времени
+
+Эта схема очень важна.
+Без неё у тебя потом начнётся хаос.
+
+---
+
+# Как должен выглядеть основной цикл робота
+
+while True:
+    event = get_next_market_event()
+
+    if event.type == "new_1m_candle":
+        save_1m_candle(event.candle)
+        update_30m()
+        update_1h()
+
+        process_active_setups_on_1m()
+        process_active_orders()
+        process_open_positions()
+
+    if event.type == "new_30m_candle":
+        evaluate_retests()
+
+    if event.type == "new_1h_candle":
+        find_new_setups()
+
+---
+
+# Правильное разделение решений
+
+Очень важно не смешивать всё в одну функцию.
+
+## Нельзя делать вот так:
+
+if sweep and displacement and retest and fill and stop and take:
+    ...
+
+Это плохой код.
+
+## Нужно так:
+
+* отдельный модуль ищет сетап
+* отдельный модуль валидирует возврат
+* отдельный модуль занимается исполнением
+* отдельный модуль сопровождает позицию
+
+---
+
+# Какой стек библиотек я бы взял
+
+## Python:
+
+* pandas — работа с данными и свечами
+* pydantic — модели данных
+* sqlalchemy — БД
+* psycopg2 или asyncpg — PostgreSQL
+* loguru или logging — логи
+* asyncio — асинхронная обработка
+* pyyaml — конфиги
+* pytest — тесты
+
+---
+
+# Что обязательно должно быть в коде
+
+## 1. Режимы работы
+
+Сразу сделай 3 режима:
+
+* backtest
+* paper
+* live
+
+Чтобы одна и та же стратегия работала в трёх режимах.
+
+---
+
+## 2. Dry-run режим
+
+Когда робот:
+
+* генерирует сигнал
+* считает вход
+* логирует, что бы сделал
+* но ничего не отправляет брокеру
+[24.03.2026 5:15] Дима: Это обязательно перед боем.
+
+---
+
+## 3. Журнал причин
+
+Не только сделки, но и почему сделки не было.
+
+Например:
+
+* no_sweep
+* weak_displacement
+* second_retest
+* limit_not_touched
+* invalidated_by_new_extreme
+* timeout_before_entry
+
+Это даст тебе потом реальную статистику.
+
+---
+
+# Пример правильных файлов
+
+trading_bot/
+│
+├── main.py
+├── requirements.txt
+├── .env
+│
+├── config/
+│   ├── settings.yaml
+│   └── symbols.yaml
+│
+├── market_data/
+│   ├── broker_feed.py
+│   ├── candle_builder.py
+│   └── session_filter.py
+│
+├── strategy/
+│   ├── models.py
+│   ├── sweep_detector.py
+│   ├── displacement_detector.py
+│   ├── entry_zone.py
+│   ├── retest_detector.py
+│   ├── signal_engine.py
+│   └── trade_validator.py
+│
+├── execution/
+│   ├── broker_api.py
+│   ├── order_manager.py
+│   ├── fill_tracker.py
+│   └── position_manager.py
+│
+├── risk/
+│   ├── risk_manager.py
+│   ├── position_sizer.py
+│   └── portfolio_limits.py
+│
+├── storage/
+│   ├── db.py
+│   ├── repositories.py
+│   └── models.py
+│
+├── logging_utils/
+│   ├── logger.py
+│   ├── event_logger.py
+│   └── trade_logger.py
+│
+└── backtest/
+    ├── engine.py
+    ├── simulator.py
+    ├── metrics.py
+    └── reports.py
+
+---
+
+# Какой порядок разработки правильный
+
+Не надо сразу писать live-робота.
+
+## Этап 1
+
+Сначала пишешь:
+
+* загрузчик данных
+* Candle model
+* sweep detector
+* displacement detector
+* entry zone builder
+* backtest engine
+
+## Этап 2
+
+Потом:
+
+* проверка первого ретеста
+* проверка лимитного касания на 1m
+* расчёт стоп/тейк/тайм-аут
+
+## Этап 3
+
+Потом:
+
+* симуляция ордеров
+* журнал сделок
+* отчёт по статистике
+
+## Этап 4
+
+Потом:
+
+* paper trading
+
+## Этап 5
+
+Только потом:
+
+* live execution через брокера
+
+---
+
+# Что особенно важно именно для вашей ТС
+
+У вашей ТС есть 4 критические точки, которые код должен учитывать жёстко.
+
+## 1. Сделка существует только если лимитка реально взята
+
+Это значит:
+
+* нельзя симулировать вход просто по факту “цена была в зоне”
+* нужно проверять касание конкретной цены
+
+---
+
+## 2. Первый ретест обязателен
+
+Значит код должен помнить:
+
+* зона уже была тронута или нет
+
+---
+
+## 3. Стоп только за sweep
+
+Никаких “адаптивных стопов” в первой версии
+
+---
+
+## 4. Тайм-аут обязателен
+
+Иначе робот начнёт превращать intraday в болото
+
+---
+
+# Какие комментарии должны быть в коде
+
+Комментарии должны объяснять почему, а не что.
+
+Плохо:
+
+# calculate entry price
+entry_price = ...
+
+Хорошо:
+
+# Entry is placed only inside the first valid retracement of the signal candle.
+# We do not allow market entries because the strategy edge depends on selective
+# execution through passive limit orders.
+entry_price = ...
+
+---
+
+# Самый правильный подход
+
+Я бы рекомендовал такую реализацию:
+
+## Версия 1 — жёсткая
+
+Полностью копирует вашу ТС:
+
+* 1H sweep
+* 1H displacement
+* 30m first retest
+* 1m touch
+* limit only
+* stop behind sweep
+* TP 1:3
+* timeout 8 candles 30m
+
+## Версия 2 — исследовательская
+
+Рядом держать sandbox, где можно тестировать:
+
+* 55% vs 50% body ratio
+* 50–70% vs 60–75% zone
+* RR 1:3 vs 1:2.5
+* timeout 6 vs 8 candles
+
+Но live-ядро не трогать, пока не будет доказательства.
+
+---
+
+# Финальный вывод
+
+Для вашего робота оптимальный стек такой:
+
+* Python — ядро
+* PostgreSQL — хранилище
+* YAML — конфиги
+* TypeScript — только если нужна веб-панель
+
+А архитектура должна быть модульной и событийной, потому что ваша ТС строится на последовательности условий, а не на одном индикаторе.
+
+Если сделать правильно, робот будет мыслить так:
+
+увидел sweep → проверил displacement → построил зону → дождался первого возврата → проверил реальное касание лимитки на 1m → поставил заявку → открыл позицию → сопроводил → записал результат
+
+Именно так и должен выглядеть код под вашу ТС.
+
+Следующим сообщением я могу дать тебе уже готовый каркас проекта на Python: с папками, классами, dataclass-моделями и заготовками функций под вашу ТС.
+[24.03.2026 5:21] Дима: Ниже даю упрощённую модель программы под вашу ТС, но уже в правильной структуре, чтобы потом её можно было наращивать без переписывания всего проекта.
+
+Сделаю акцент именно на:
+
+* структуре
+* участках кода
+* какие библиотеки где используются
+* как всё связано между собой
+
+---
+
+# 1. Главная идея программы
+
+Программа должна быть разбита не “по файлам как попало”, а по ролям:
+
+* получение данных
+* хранение свечей
+* логика ТС
+* постановка лимиток
+* сопровождение сделки
+* журнал
+* запуск
+
+То есть программа мыслится так:
+
+данные → стратегия → сигнал → лимитка → позиция → выход → лог
+
+---
+
+# 2. Упрощённая структура проекта
+
+rf_trading_bot/
+│
+├── main.py
+├── config.py
+├── requirements.txt
+│
+├── core/
+│   ├── models.py
+│   ├── enums.py
+│   └── utils.py
+│
+├── data/
+│   ├── loader.py
+│   ├── resampler.py
+│   └── storage.py
+│
+├── strategy/
+│   ├── sweep.py
+│   ├── displacement.py
+│   ├── zone.py
+│   ├── retest.py
+│   └── signal_engine.py
+│
+├── execution/
+│   ├── orders.py
+│   ├── fills.py
+│   └── position.py
+│
+├── risk/
+│   └── risk_manager.py
+│
+└── logs/
+    └── journal.py
+
+Это упрощённая, но правильная схема.
+
+---
+
+# 3. Какие библиотеки нужны
+
+Вот минимальный стек.
+
+## Основные библиотеки
+
+pandas
+numpy
+dataclasses
+datetime
+typing
+enum
+pathlib
+json
+logging
+
+---
+
+## Если подключать брокера позже
+
+requests
+aiohttp
+asyncio
+
+---
+
+## Если подключать БД позже
+
+sqlalchemy
+sqlite3
+psycopg2
+
+---
+
+# 4. Где какие библиотеки используются
+
+---
+
+## main.py
+
+Задача: запуск всей программы
+
+### Библиотеки:
+
+from pathlib import Path
+from datetime import datetime
+import logging
+
+### Что тут происходит:
+
+* читаются настройки
+* загружаются данные
+* запускается стратегия
+* запускается проверка лимитки
+* формируется журнал
+
+---
+
+## config.py
+
+Задача: хранить параметры ТС
+
+### Библиотеки:
+
+from dataclasses import dataclass
+
+### Что хранить:
+
+* sweep lookback
+* body ratio
+* зона 50–70%
+* RR
+* timeout
+* риск на сделку
+* список инструментов
+
+---
+
+## core/models.py
+
+Задача: главные сущности программы
+
+### Библиотеки:
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+### Тут хранятся:
+
+* Candle
+* Setup
+* Order
+* Position
+* TradeResult
+
+---
+
+## core/enums.py
+
+Задача: статусы и направления
+
+### Библиотеки:
+
+from enum import Enum
+
+### Тут хранятся:
+
+* LONG / SHORT
+* PENDING / FILLED / CANCELED
+* TP / SL / TIMEOUT
+
+---
+
+## core/utils.py
+
+Задача: мелкие расчёты
+
+### Библиотеки:
+
+import math
+from typing import List
+
+### Тут:
+
+* body ratio
+* range candle
+* round to tick
+* RR calculation
+
+---
+
+## data/loader.py
+
+Задача: загрузка 1m данных
+
+### Библиотеки:
+
+import pandas as pd
+from pathlib import Path
+
+### Тут:
+
+* чтение txt/csv
+* приведение колонок
+* преобразование даты и времени
+* сортировка
+
+---
+
+## data/resampler.py
+
+Задача: строить 30m и 1H из 1m
+
+### Библиотеки:
+
+import pandas as pd
+
+### Тут:
+
+* агрегация OHLCV
+* построение 30m
+* построение 1H
+
+---
+
+## data/storage.py
+
+Задача: сохранить сделки/логи/сигналы
+
+### Упрощённый вариант библиотеки:
+
+import json
+from pathlib import Path
+
+### Позже можно:
+
+import sqlite3
+
+---
+
+## strategy/sweep.py
+
+Задача: искать вынос ликвидности
+
+### Библиотеки:
+
+import pandas as pd
+from typing import Optional
+
+### Тут:
+
+* поиск sweep high
+* поиск sweep low
+* lookback 6 свечей
+
+---
+
+## strategy/displacement.py
+
+Задача: проверить импульс
+
+### Библиотеки:
+
+from typing import Optional
+
+### Тут:
+
+* бычья / медвежья свеча
+* body/range >= 0.55
+* фильтр слабых свечей
+
+---
+
+## strategy/zone.py
+
+Задача: построить рабочую зону
+
+### Библиотеки:
+
+from typing import Tuple
+
+### Тут:
+
+* расчёт 50–70%
+* entry price
+* stop price
+* take price
+
+---
+
+## strategy/retest.py
+
+Задача: понять, был ли первый возврат
+
+### Библиотеки:
+
+import pandas as pd
+
+### Тут:
+
+* цена впервые вошла в зону?
+* это первый ретест?
+* сетап ещё жив?
+
+---
+
+## strategy/signal_engine.py
+
+Задача: собрать всё в один сигнал
+
+### Библиотеки:
+
+from typing import List, Optional
+
+### Тут:
+
+* вызывается sweep
+* вызывается displacement
+* строится зона
+* создаётся Setup
+
+---
+
+## execution/orders.py
+
+Задача: логика лимитной заявки
+[24.03.2026 5:21] Дима: ### Библиотеки:
+
+from dataclasses import dataclass
+
+### Тут:
+
+* создать лимитку
+* проверить активна ли лимитка
+* снять лимитку
+* отметить исполнение
+
+---
+
+## execution/fills.py
+
+Задача: проверить по 1m, была ли реально взята лимитка
+
+### Библиотеки:
+
+import pandas as pd
+
+### Тут:
+
+* коснулась ли цена лимитной цены
+* было ли реальное исполнение
+* нет касания = сделки нет
+
+---
+
+## execution/position.py
+
+Задача: сопровождение сделки
+
+### Библиотеки:
+
+from datetime import datetime
+
+### Тут:
+
+* стоп
+* тейк
+* тайм-аут
+* закрытие сделки
+
+---
+
+## risk/risk_manager.py
+
+Задача: размер позиции
+
+### Библиотеки:
+
+import math
+
+### Тут:
+
+* риск на сделку
+* объём позиции
+* проверка адекватности стопа
+
+---
+
+## logs/journal.py
+
+Задача: журнал торговли
+
+### Библиотеки:
+
+import json
+from pathlib import Path
+from datetime import datetime
+
+### Тут:
+
+* запись сигнала
+* запись сделки
+* запись причины пропуска
+
+---
+
+# 5. Упрощённая модель кода
+
+Теперь покажу не просто блоки словами, а как это выглядит по коду.
+
+---
+
+## config.py
+
+from dataclasses import dataclass
+
+@dataclass
+class StrategyConfig:
+    symbol: str = "SBER"
+    sweep_lookback: int = 6
+    min_body_ratio: float = 0.55
+    zone_start: float = 0.50
+    zone_end: float = 0.70
+    entry_ratio: float = 0.60
+    rr: float = 3.0
+    timeout_30m_bars: int = 8
+    risk_per_trade: float = 0.01
+    tick_size: float = 0.01
+
+---
+
+## core/models.py
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional
+
+@dataclass
+class Candle:
+    symbol: str
+    timeframe: str
+    dt: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+@dataclass
+class Setup:
+    symbol: str
+    direction: str
+    signal_time: datetime
+    entry_price: float
+    stop_price: float
+    take_price: float
+    zone_low: float
+    zone_high: float
+    sweep_price: float
+    status: str = "PENDING"
+
+@dataclass
+class TradeResult:
+    symbol: str
+    direction: str
+    entry_time: datetime
+    exit_time: Optional[datetime]
+    entry_price: float
+    exit_price: Optional[float]
+    result: str   # TP / SL / TIMEOUT
+    r_multiple: float
+
+---
+
+## data/loader.py
+
+### Библиотека:
+
+import pandas as pd
+
+### Код:
+
+import pandas as pd
+
+def load_1m_data(filepath: str) -> pd.DataFrame:
+    df = pd.read_csv(filepath)
+    df["datetime"] = pd.to_datetime(
+        df["DATE"].astype(str) + df["TIME"].astype(str).str.zfill(6),
+        format="%Y%m%d%H%M%S"
+    )
+    df = df.rename(columns={
+        "OPEN": "open",
+        "HIGH": "high",
+        "LOW": "low",
+        "CLOSE": "close",
+        "VOL": "volume"
+    })
+    df = df.sort_values("datetime").reset_index(drop=True)
+    return df[["datetime", "open", "high", "low", "close", "volume"]]
+
+---
+
+## data/resampler.py
+
+### Библиотека:
+
+import pandas as pd
+
+### Код:
+
+import pandas as pd
+
+def resample_ohlcv(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    temp = df.copy()
+    temp = temp.set_index("datetime")
+
+    out = temp.resample(tf).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna()
+
+    return out.reset_index()
+
+Для программы:
+
+* 30T → 30m
+* 1H → 1h
+
+---
+
+## strategy/sweep.py
+
+### Библиотеки:
+
+import pandas as pd
+
+### Код:
+
+import pandas as pd
+
+def detect_sweep(signal_row, prev_rows, lookback: int):
+    recent = prev_rows.tail(lookback)
+    prev_high = recent["high"].max()
+    prev_low = recent["low"].min()
+
+    if signal_row["high"] > prev_high:
+        return {
+            "direction": "SHORT",
+            "sweep_price": signal_row["high"],
+            "reference": prev_high
+        }
+
+    if signal_row["low"] < prev_low:
+        return {
+            "direction": "LONG",
+            "sweep_price": signal_row["low"],
+            "reference": prev_low
+        }
+
+    return None
+
+---
+
+## strategy/displacement.py
+
+### Библиотеки:
+
+import math
+
+### Код:
+[24.03.2026 5:21] Дима: def candle_range(row) -> float:
+    return row["high"] - row["low"]
+
+def body_size(row) -> float:
+    return abs(row["close"] - row["open"])
+
+def body_ratio(row) -> float:
+    rng = candle_range(row)
+    if rng <= 0:
+        return 0.0
+    return body_size(row) / rng
+
+def valid_displacement(row, direction: str, min_body_ratio: float) -> bool:
+    ratio = body_ratio(row)
+
+    if direction == "LONG":
+        return row["close"] > row["open"] and ratio >= min_body_ratio
+
+    if direction == "SHORT":
+        return row["close"] < row["open"] and ratio >= min_body_ratio
+
+    return False
+
+---
+
+## strategy/zone.py
+
+### Библиотеки:
+
+from typing import Tuple
+
+### Код:
+
+def build_entry_zone(signal_row, direction: str, zone_start: float, zone_end: float, entry_ratio: float):
+    low = signal_row["low"]
+    high = signal_row["high"]
+    rng = high - low
+
+    z1 = low + rng * zone_start
+    z2 = low + rng * zone_end
+
+    zone_low = min(z1, z2)
+    zone_high = max(z1, z2)
+    entry_price = low + rng * entry_ratio
+
+    if direction == "LONG":
+        stop_price = low
+        take_price = None
+    else:
+        stop_price = high
+        take_price = None
+
+    return zone_low, zone_high, entry_price, stop_price
+
+---
+
+## strategy/signal_engine.py
+
+### Библиотеки:
+
+import pandas as pd
+from typing import List
+
+### Код:
+
+from core.models import Setup
+from strategy.sweep import detect_sweep
+from strategy.displacement import valid_displacement
+from strategy.zone import build_entry_zone
+
+def find_setups(df_1h, config):
+    setups = []
+
+    for i in range(config.sweep_lookback, len(df_1h)):
+        prev_rows = df_1h.iloc[:i]
+        signal_row = df_1h.iloc[i]
+
+        sweep = detect_sweep(signal_row, prev_rows, config.sweep_lookback)
+        if not sweep:
+            continue
+
+        if not valid_displacement(signal_row, sweep["direction"], config.min_body_ratio):
+            continue
+
+        zone_low, zone_high, entry_price, stop_price = build_entry_zone(
+            signal_row,
+            sweep["direction"],
+            config.zone_start,
+            config.zone_end,
+            config.entry_ratio
+        )
+
+        risk = abs(entry_price - stop_price)
+        if risk <= 0:
+            continue
+
+        if sweep["direction"] == "LONG":
+            take_price = entry_price + risk * config.rr
+        else:
+            take_price = entry_price - risk * config.rr
+
+        setup = Setup(
+            symbol=config.symbol,
+            direction=sweep["direction"],
+            signal_time=signal_row["datetime"],
+            entry_price=entry_price,
+            stop_price=stop_price,
+            take_price=take_price,
+            zone_low=zone_low,
+            zone_high=zone_high,
+            sweep_price=sweep["sweep_price"]
+        )
+
+        setups.append(setup)
+
+    return setups
+
+---
+
+## strategy/retest.py
+
+### Библиотеки:
+
+import pandas as pd
+
+### Код:
+
+def first_retest_exists(df_30m, setup, max_bars=4):
+    after_signal = df_30m[df_30m["datetime"] > setup.signal_time].head(max_bars)
+
+    for _, row in after_signal.iterrows():
+        if row["high"] >= setup.zone_low and row["low"] <= setup.zone_high:
+            return row["datetime"]
+
+    return None
+
+---
+
+## execution/fills.py
+
+### Библиотеки:
+
+import pandas as pd
+
+### Код:
+
+def limit_was_filled_on_1m(df_1m, setup, start_time, max_30m_bars=4):
+    end_time = start_time + pd.Timedelta(minutes=max_30m_bars * 30)
+    chunk = df_1m[(df_1m["datetime"] >= start_time) & (df_1m["datetime"] <= end_time)]
+
+    for _, row in chunk.iterrows():
+        if row["low"] <= setup.entry_price <= row["high"]:
+            return True, row["datetime"]
+
+    return False, None
+
+Это один из ключевых блоков вашей программы.
+
+---
+
+## execution/position.py
+
+### Библиотеки:
+
+import pandas as pd
+
+### Код:
+[24.03.2026 5:21] Дима: def simulate_trade(df_30m, setup, fill_time, timeout_bars=8):
+    future = df_30m[df_30m["datetime"] > fill_time].head(timeout_bars)
+
+    for _, row in future.iterrows():
+        if setup.direction == "LONG":
+            if row["low"] <= setup.stop_price:
+                return "SL", setup.stop_price, row["datetime"]
+            if row["high"] >= setup.take_price:
+                return "TP", setup.take_price, row["datetime"]
+
+        if setup.direction == "SHORT":
+            if row["high"] >= setup.stop_price:
+                return "SL", setup.stop_price, row["datetime"]
+            if row["low"] <= setup.take_price:
+                return "TP", setup.take_price, row["datetime"]
+
+    last_row = future.iloc[-1]
+    return "TIMEOUT", last_row["close"], last_row["datetime"]
+
+---
+
+## risk/risk_manager.py
+
+### Библиотеки:
+
+import math
+
+### Код:
+
+import math
+
+def calc_position_size(capital: float, risk_per_trade: float, entry: float, stop: float):
+    risk_money = capital * risk_per_trade
+    risk_per_share = abs(entry - stop)
+
+    if risk_per_share <= 0:
+        return 0
+
+    qty = math.floor(risk_money / risk_per_share)
+    return max(qty, 0)
+
+---
+
+## logs/journal.py
+
+### Библиотеки:
+
+import json
+from pathlib import Path
+
+### Код:
+
+import json
+from pathlib import Path
+
+def save_results(results, filepath="trade_results.json"):
+    path = Path(filepath)
+    serializable = []
+
+    for r in results:
+        serializable.append({
+            "symbol": r.symbol,
+            "direction": r.direction,
+            "entry_time": str(r.entry_time),
+            "exit_time": str(r.exit_time),
+            "entry_price": r.entry_price,
+            "exit_price": r.exit_price,
+            "result": r.result,
+            "r_multiple": r.r_multiple
+        })
+
+    path.write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
+
+---
+
+# 6. Как выглядит главный файл main.py
+
+Вот упрощённый главный pipeline.
+
+### Библиотеки:
+
+import pandas as pd
+
+### Код:
+
+from config import StrategyConfig
+from data.loader import load_1m_data
+from data.resampler import resample_ohlcv
+from strategy.signal_engine import find_setups
+from strategy.retest import first_retest_exists
+from execution.fills import limit_was_filled_on_1m
+from execution.position import simulate_trade
+from core.models import TradeResult
+from logs.journal import save_results
+
+def main():
+    config = StrategyConfig()
+
+    df_1m = load_1m_data("SBER_1m.txt")
+    df_30m = resample_ohlcv(df_1m, "30T")
+    df_1h = resample_ohlcv(df_1m, "1H")
+
+    setups = find_setups(df_1h, config)
+    results = []
+
+    for setup in setups:
+        retest_time = first_retest_exists(df_30m, setup, max_bars=4)
+        if not retest_time:
+            continue
+
+        filled, fill_time = limit_was_filled_on_1m(df_1m, setup, retest_time, max_30m_bars=4)
+        if not filled:
+            continue
+
+        result, exit_price, exit_time = simulate_trade(
+            df_30m,
+            setup,
+            fill_time,
+            timeout_bars=config.timeout_30m_bars
+        )
+
+        if result == "TP":
+            r_multiple = config.rr
+        elif result == "SL":
+            r_multiple = -1.0
+        else:
+            risk = abs(setup.entry_price - setup.stop_price)
+            pnl = exit_price - setup.entry_price if setup.direction == "LONG" else setup.entry_price - exit_price
+            r_multiple = pnl / risk if risk > 0 else 0.0
+
+        results.append(
+            TradeResult(
+                symbol=setup.symbol,
+                direction=setup.direction,
+                entry_time=fill_time,
+                exit_time=exit_time,
+                entry_price=setup.entry_price,
+                exit_price=exit_price,
+                result=result,
+                r_multiple=r_multiple
+            )
+        )
+
+    save_results(results)
+    print(f"Готово. Сделок: {len(results)}")
+
+if __name__ == "__main__":
+    main()
+
+---
+
+# 7. Как именно связаны участки программы
+
+Вот самая важная схема.
+[24.03.2026 5:21] Дима: loader.py
+   ↓
+resampler.py
+   ↓
+signal_engine.py
+   ├── sweep.py
+   ├── displacement.py
+   └── zone.py
+   ↓
+retest.py
+   ↓
+fills.py
+   ↓
+position.py
+   ↓
+journal.py
+
+Это и есть упрощённая модель вашей программы.
+
+---
+
+# 8. Почему такая структура правильная
+
+Потому что она:
+
+* не смешивает всё в одном файле
+* легко тестируется
+* легко расширяется
+* легко переносится в live-режим
+* позволяет отдельно менять только один блок
+
+Например:
+
+* хочешь изменить sweep → меняешь только sweep.py
+* хочешь другой RR → меняешь config.py
+* хочешь подключить брокера → добавляешь execution/broker_api.py
+* хочешь БД → заменяешь journal.py и storage.py
+
+---
+
+# 9. Самая простая рабочая версия программы
+
+Если упростить совсем до минимума, то программа может состоять даже из 6 файлов:
+
+rf_bot/
+├── main.py
+├── config.py
+├── models.py
+├── loader.py
+├── strategy.py
+└── execution.py
+
+Но это хорошо только для very first MVP.
+
+Правильнее всё же вот так:
+
+core/
+data/
+strategy/
+execution/
+risk/
+logs/
+
+---
+
+# 10. Какие библиотеки я бы зафиксировал как обязательные
+
+Для вашей первой версии:
+
+pandas
+dataclasses
+typing
+datetime
+pathlib
+json
+math
+enum
+logging
+
+Если потом делать live:
+
+requests
+aiohttp
+asyncio
+
+Если потом делать хранение серьёзнее:
+
+sqlite3
+sqlalchemy
+psycopg2
+
+---
+
+# 11. Финальный вывод
+
+Для вашей ТС упрощённая правильная архитектура выглядит так:
+
+* `data/` — загружает и строит свечи
+* `strategy/` — ищет sweep, displacement и зону входа
+* `execution/` — проверяет, взялась ли лимитка на 1m, и ведёт сделку
+* `risk/` — считает объём и риск
+* `logs/` — сохраняет итог
+* `main.py` — связывает всё в один pipeline
+
+А ключевые библиотеки:
+
+* `pandas` — свечи, ресемплинг, фильтрация
+* `dataclasses` — объекты Setup / Candle / TradeResult
+* `typing` — структура кода
+* `json/pathlib` — журнал
+* `math` — риск и размер позиции
+
+Это уже база, на которой можно писать робота нормально, а не “скрипт из 800 строк”.
+
+Следующим сообщением я могу собрать тебе полный готовый каркас проекта по папкам и файлам, чтобы ты мог сразу начать писать код.
