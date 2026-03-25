@@ -1,18 +1,13 @@
-from bot.strategies.base import Signal
-
-
 class RiskManager:
-    def __init__(self, max_position_size: int = 10, stop_loss_pct: float = 0.05):
-        self.max_position_size = max_position_size
-        self.stop_loss_pct = stop_loss_pct
+    """1% account risk per trade, 1:3.5 risk-reward."""
 
-    def approve(self, signal: Signal, current_position: int, current_price: float, avg_price: float) -> bool:
-        if signal == Signal.BUY and current_position >= self.max_position_size:
-            return False
+    def __init__(self, risk_pct: float = 0.01):
+        self.risk_pct = risk_pct
 
-        if signal == Signal.SELL and avg_price > 0:
-            loss_pct = (avg_price - current_price) / avg_price
-            if loss_pct >= self.stop_loss_pct:
-                return True
-
-        return signal != Signal.HOLD
+    def position_size(self, balance: float, entry_price: float, stop_price: float) -> int:
+        """Return number of lots to trade given account balance and price levels."""
+        risk_amount = balance * self.risk_pct
+        risk_per_unit = abs(entry_price - stop_price)
+        if risk_per_unit == 0:
+            return 0
+        return max(1, int(risk_amount / risk_per_unit))

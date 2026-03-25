@@ -1,2 +1,4 @@
-tinkoff-investments
+t-tech-investments
+pandas
 streamlit
+python-dotenv

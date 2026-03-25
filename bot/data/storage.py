@@ -1,5 +1,7 @@
 import sqlite3
 
+import pandas as pd
+
 
 class MarketDataStorage:
     def __init__(self, db_path: str = "data.db"):
@@ -36,3 +38,14 @@ class MarketDataStorage:
                 "SELECT * FROM candles WHERE ticker = ? ORDER BY time", (ticker,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def resample(self, df_1m: pd.DataFrame, freq: str) -> pd.DataFrame:
+        """Resample 1m OHLCV dataframe to a higher timeframe (e.g. '30min', '1h')."""
+        resampled = df_1m.resample(freq).agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+        ).dropna()
+        return resampled
