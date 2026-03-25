@@ -39,6 +39,9 @@ class MarketDataStorage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    MOEX_OPEN_MSK = 7   # Regular session starts 07:00 MSK
+    MOEX_CLOSE_MSK = 24  # Last candle at 23:30 MSK
+
     def resample(self, df_1m: pd.DataFrame, freq: str) -> pd.DataFrame:
         """Resample 1m OHLCV dataframe to a higher timeframe (e.g. '30min', '1h')."""
         resampled = df_1m.resample(freq).agg(
@@ -49,3 +52,10 @@ class MarketDataStorage:
             volume=("volume", "sum"),
         ).dropna()
         return resampled
+
+    def filter_moex_hours(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Keep only candles within MOEX regular weekday session (07:00-23:59 MSK, Mon-Fri)."""
+        msk = df.index.tz_convert("Europe/Moscow")
+        in_hours = (msk.hour >= self.MOEX_OPEN_MSK) & (msk.hour < self.MOEX_CLOSE_MSK)
+        weekday = msk.weekday < 5
+        return df[in_hours & weekday]

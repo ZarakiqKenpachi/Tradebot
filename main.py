@@ -14,14 +14,10 @@ from bot.strategies.ict import ICTStrategy
 load_dotenv()
 
 TICKERS = {
-    "SBER": "BBG004730N88",
     "GAZP": "BBG004730RP0",
-    "YDEX": "BBG1M2SHGLV3",   # post-restructuring Yandex — verify if no data
-    "VTBR": "BBG004730ZJ9",
     "GMKN": "BBG004731489",
-    "T":    "BBG00QPYJ5H0",   # T-Bank (ex-Tinkoff) — verify if no data
-    "LKOH": "BBG004731032",
-    "TATN": "BBG004RVFCY3",
+    "VTBR": "BBG004730ZJ9",
+    "SBER": "BBG004730N88",
     "ROSN": "BBG004731354",
     "NVTK": "BBG00475KKY8",
 }
@@ -48,7 +44,7 @@ def main():
         account_id = broker.get_account_id()
 
     storage = MarketDataStorage()
-    strategy = ICTStrategy()
+    strategy = ICTStrategy(risk_reward=2.0)
     risk = RiskManager(risk_pct=0.01)
     journal = TradeJournal()
     execution = ExecutionManager(broker=broker, risk=risk, journal=journal, account_id=account_id)
@@ -64,8 +60,8 @@ def main():
                         print(f"[WARN] No candle data for {ticker}, skipping.")
                         continue
 
-                    df_30m = storage.resample(df_1m, "30min").iloc[:-1]
-                    df_1h  = storage.resample(df_1m, "1h").iloc[:-1]
+                    df_30m = storage.filter_moex_hours(storage.resample(df_1m, "30min").iloc[:-1])
+                    df_1h  = storage.filter_moex_hours(storage.resample(df_1m, "1h").iloc[:-1])
 
                     execution.update(figi, df_30m)
 

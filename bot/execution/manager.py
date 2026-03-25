@@ -8,7 +8,7 @@ from bot.risk.manager import RiskManager
 from bot.strategies.base import Signal
 from bot.strategies.ict import ICTSetup
 
-MAX_CANDLES_30M = 10
+MAX_CANDLES_30M = 20
 
 
 @dataclass
@@ -84,15 +84,15 @@ class ExecutionManager:
         )
 
     def update(self, figi: str, df_30m: pd.DataFrame):
-        """Call once per 30m candle — only handles timeout, SL/TP are on the exchange."""
+        """Call once per 30m candle — handles timeout. SL/TP are on the exchange."""
         if figi not in self._positions or df_30m.empty:
             return
 
         pos = self._positions[figi]
         pos.candles_held += 1
+        price = df_30m.iloc[-1]["close"]
 
         if pos.candles_held >= MAX_CANDLES_30M:
-            price = df_30m.iloc[-1]["close"]
             self._close(pos, price, "timeout")
 
     def _close(self, pos: _Position, exit_price: float, reason: str):

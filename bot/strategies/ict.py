@@ -9,7 +9,8 @@ from bot.strategies.base import BaseStrategy, Signal
 SWEEP_LOOKBACK = 15          # sits in the 10–20 range requested
 DISPLACEMENT_MIN_BODY_RATIO = 0.35
 ENTRY_RETRACEMENT = 0.50     # limit at 50% retracement of the impulse candle
-STOP_BUFFER = 0.001          # 0.1% beyond the swept level
+STOP_BUFFER = 0.003          # 0.3% beyond the swept level
+MIN_SL_DISTANCE = 0.003      # Minimum SL distance: 0.3% of entry price
 DEFAULT_RISK_REWARD = 3.5
 
 
@@ -102,7 +103,7 @@ class ICTStrategy(BaseStrategy):
                 entry_price = candle["close"] - ENTRY_RETRACEMENT * body
                 stop_price  = sweep_level * (1 - STOP_BUFFER)
                 risk = entry_price - stop_price
-                if risk <= 0:
+                if risk <= 0 or risk / entry_price < MIN_SL_DISTANCE:
                     continue
                 return ICTSetup(
                     direction=Signal.BUY,
@@ -116,7 +117,7 @@ class ICTStrategy(BaseStrategy):
                 entry_price = candle["close"] + ENTRY_RETRACEMENT * body
                 stop_price  = sweep_level * (1 + STOP_BUFFER)
                 risk = stop_price - entry_price
-                if risk <= 0:
+                if risk <= 0 or risk / entry_price < MIN_SL_DISTANCE:
                     continue
                 return ICTSetup(
                     direction=Signal.SELL,
