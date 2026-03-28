@@ -37,6 +37,8 @@ python -3.12 -m venv venv
 
 ### 3. Установить зависимости
 
+> **Важно:** все команды запускать из корневой папки проекта (`Tradebot-development/`), **не заходя** в `traderbot/`. Иначе Python перепутает наш файл `types.py` со стандартным модулем и выдаст ошибку импорта.
+
 ```bash
 pip install -r traderbot/requirements.txt
 ```
