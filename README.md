@@ -73,7 +73,7 @@ TELEGRAM_CHAT_ID=your_telegram_chat_id_here
 ### Живая торговля (sandbox по умолчанию)
 
 ```bash
-py -3.12 traderbot/main.py
+py -3.12 -m traderbot.main
 ```
 
 > В `traderbot/config.yaml` по умолчанию `sandbox: true` — деньги реальные не тратятся.
@@ -82,7 +82,7 @@ py -3.12 traderbot/main.py
 ### Бэктест
 
 ```bash
-py -3.12 traderbot/backtest/run.py --config traderbot/config.yaml --days 30
+py -3.12 -m traderbot.backtest.run --config traderbot/config.yaml --days 30
 ```
 
 Результаты сохраняются в `traderbot/backtest/results/`.
