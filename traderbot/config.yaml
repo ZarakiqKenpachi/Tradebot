@@ -1,0 +1,65 @@
+# === Брокер ===
+broker:
+  token_env: "TBANK_TOKEN"
+  sandbox: true
+  app_name: "TraderBot"
+
+# === Риск-менеджмент ===
+risk:
+  risk_pct: 0.10
+  max_position_pct: 0.40
+  max_consecutive_sl: 3
+
+# === Торговые инструменты ===
+tickers:
+  SBER:
+    figi: "BBG004730N88"
+    strategy: "ict_v2_sw10_rr2"
+  GAZP:
+    figi: "BBG004730RP0"
+    strategy: "ict_v2_sw4_rr2"
+  GMKN:
+    figi: "BBG004731489"
+    strategy: "ict_v2_sw4_rr35"
+  VTBR:
+    figi: "BBG004730ZJ9"
+    strategy: "ict_v2_sw4_rr35"
+  ROSN:
+    figi: "BBG004731354"
+    strategy: "ict"
+  NVTK:
+    figi: "BBG00475KKY8"
+    strategy: "ict_v2_sw4_rr35"
+  TATN:
+    figi: "BBG004RVFFC0"
+    strategy: "ict_v2_sw4_rr2"
+  LKOH:
+    figi: "TCS509024277"
+    strategy: "ict_v2_sw4_rr35"
+
+# === Уведомления ===
+notifications:
+  telegram:
+    enabled: true
+    token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+
+# === Журнал сделок ===
+journal:
+  path: "journal/trades.csv"
+
+# === Хранение состояния ===
+state:
+  path: "state/positions.json"
+
+# === Основной цикл ===
+trading:
+  poll_interval_sec: 60
+  max_candles_timeout: 20
+  commission_pct: 0.0004
+
+# === Бэктест ===
+backtest:
+  initial_balance: 100000.0
+  days: 30
+  output_dir: "backtest/results"

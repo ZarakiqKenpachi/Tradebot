@@ -1,0 +1,31 @@
+# Environment — NEVER commit real tokens
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Runtime data (personal, machine-specific)
+traderbot/logs/
+traderbot/journal/
+traderbot/state/positions.json
+backtest/results/
+
+# Claude Code internals
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
