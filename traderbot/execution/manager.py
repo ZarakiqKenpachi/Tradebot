@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 class ExecutionManager:
     """Управление жизненным циклом позиций."""
 
+    PENDING_TIMEOUT_CANDLES = 20  # Отмена лимитки через 20 свечей 30m
+
     def __init__(
         self,
         broker: TBankBroker,
@@ -51,7 +53,7 @@ class ExecutionManager:
         return False
 
     def open_position(self, ticker: str, figi: str, setup: Setup) -> None:
-        """Открыть новую позицию."""
+        """Выставить лимитную заявку. SL/TP будут добавлены после исполнения."""
         # 1. Баланс
         balance = self.broker.get_portfolio_balance(self.account_id)
 
@@ -61,26 +63,18 @@ class ExecutionManager:
             logger.warning("[EXEC] Insufficient balance for %s, qty=0", ticker)
             return
 
-        # 3. Определить направления ордеров для SDK
+        # 3. Определить направление ордера
         if setup.direction == Signal.BUY:
             order_dir = OrderDirection.ORDER_DIRECTION_BUY
-            stop_dir = StopOrderDirection.STOP_ORDER_DIRECTION_SELL
         else:
             order_dir = OrderDirection.ORDER_DIRECTION_SELL
-            stop_dir = StopOrderDirection.STOP_ORDER_DIRECTION_BUY
 
-        # 4. Разместить ордера
+        # 4. Разместить только лимитную заявку
         entry_order_id = self.broker.place_limit_order(
             self.account_id, figi, qty, order_dir, setup.entry_price
         )
-        sl_order_id = self.broker.place_stop_loss(
-            self.account_id, figi, qty, stop_dir, setup.stop_price
-        )
-        tp_order_id = self.broker.place_take_profit(
-            self.account_id, figi, qty, stop_dir, setup.target_price
-        )
 
-        # 5. Создать Position
+        # 5. Создать Position в статусе pending (без SL/TP)
         position = Position(
             ticker=ticker,
             figi=figi,
@@ -92,32 +86,124 @@ class ExecutionManager:
             entry_time=datetime.now(timezone.utc),
             entry_reason=setup.entry_reason,
             entry_order_id=entry_order_id,
-            sl_order_id=sl_order_id,
-            tp_order_id=tp_order_id,
+            status="pending",
         )
 
         # 6. Сохранить
         self.positions[figi] = position
         self.state.save_position(position)
 
-        # 7. Уведомление
+        # 7. Уведомление — заявка выставлена
         msg = (
-            f"\U0001f7e2 Открыта позиция {ticker} {setup.direction.value}\n"
-            f"Вход: {setup.entry_price} | SL: {setup.stop_price} | TP: {setup.target_price}\n"
-            f"Объём: {qty} | Причина: {setup.entry_reason}"
+            f"\U0001f4cb Лимитная заявка {ticker} {setup.direction.value}\n"
+            f"Цена: {setup.entry_price} | Объём: {qty}\n"
+            f"SL: {setup.stop_price} | TP: {setup.target_price}\n"
+            f"Причина: {setup.entry_reason}"
         )
         logger.info("[EXEC] %s", msg)
         if self.notifier:
             self.notifier.send(msg)
 
-    def update(self, figi: str, current_price: float) -> None:
-        """Обновить состояние открытой позиции (вызывается каждый цикл)."""
+    def _activate_position(self, figi: str) -> None:
+        """Лимитка исполнена — выставить SL/TP и перевести позицию в active."""
+        position = self.positions[figi]
+
+        if position.direction == Signal.BUY:
+            stop_dir = StopOrderDirection.STOP_ORDER_DIRECTION_SELL
+        else:
+            stop_dir = StopOrderDirection.STOP_ORDER_DIRECTION_BUY
+
+        sl_order_id = self.broker.place_stop_loss(
+            self.account_id, figi, position.qty, stop_dir, position.stop_price
+        )
+        tp_order_id = self.broker.place_take_profit(
+            self.account_id, figi, position.qty, stop_dir, position.target_price
+        )
+
+        position.sl_order_id = sl_order_id
+        position.tp_order_id = tp_order_id
+        position.status = "active"
+        position.entry_time = datetime.now(timezone.utc)
+        position.candles_held = 0
+        position.last_candle_time = None
+        self.state.save_position(position)
+
+        # Уведомление — позиция открыта
+        msg = (
+            f"\U0001f7e2 Позиция открыта {position.ticker} {position.direction.value}\n"
+            f"Вход: {position.entry_price} | SL: {position.stop_price} | TP: {position.target_price}\n"
+            f"Объём: {position.qty}"
+        )
+        logger.info("[EXEC] %s", msg)
+        if self.notifier:
+            self.notifier.send(msg)
+
+    def _cancel_pending(self, figi: str) -> None:
+        """Отменить неисполненную лимитку по таймауту."""
+        position = self.positions[figi]
+        try:
+            self.broker.cancel_order(self.account_id, position.entry_order_id)
+        except Exception:
+            logger.debug("[EXEC] Could not cancel entry order %s", position.entry_order_id)
+
+        self.state.remove_position(figi)
+        del self.positions[figi]
+
+        msg = (
+            f"\u274c Лимитная заявка {position.ticker} {position.direction.value} отменена\n"
+            f"Цена: {position.entry_price} | Не исполнена за {position.pending_candles} свечей"
+        )
+        logger.info("[EXEC] %s", msg)
+        if self.notifier:
+            self.notifier.send(msg)
+
+    def _is_order_filled(self, order_id: str) -> bool:
+        """Проверить, исполнена ли лимитная заявка."""
+        try:
+            state = self.broker.get_order_state(self.account_id, order_id)
+            return state.execution_report_status.name == "EXECUTION_REPORT_STATUS_FILL"
+        except Exception:
+            logger.debug("[EXEC] Could not get order state for %s", order_id)
+            return False
+
+    def update(self, figi: str, current_price: float, last_candle_time: datetime) -> None:
+        """Обновить состояние позиции (вызывается каждый цикл).
+        pending: проверить исполнение лимитки, считать таймаут ожидания.
+        active: считать таймаут позиции в 30m свечах.
+        """
         if figi not in self.positions:
             return
 
         position = self.positions[figi]
-        position.candles_held += 1
-        self.state.update_candles_held(figi, position.candles_held)
+        new_candle = position.last_candle_time is None or last_candle_time > position.last_candle_time
+
+        if position.status == "pending":
+            # Проверить исполнение лимитки
+            if self._is_order_filled(position.entry_order_id):
+                self._activate_position(figi)
+                return
+
+            # Считать свечи ожидания
+            if new_candle:
+                position.pending_candles += 1
+                position.last_candle_time = last_candle_time
+                self.state.save_position(position)
+                logger.debug("[EXEC] %s pending_candles=%d",
+                             position.ticker, position.pending_candles)
+
+            if position.pending_candles >= self.PENDING_TIMEOUT_CANDLES:
+                logger.info("[EXEC] Pending timeout for %s after %d candles",
+                            position.ticker, position.pending_candles)
+                self._cancel_pending(figi)
+            return
+
+        # status == "active"
+        if new_candle:
+            position.candles_held += 1
+            position.last_candle_time = last_candle_time
+            self.state.update_candles_held(figi, position.candles_held, last_candle_time)
+            logger.debug("[EXEC] %s candles_held=%d, last_candle=%s",
+                         position.ticker, position.candles_held, last_candle_time)
 
         # Проверить таймаут
         if position.candles_held >= self.max_candles_timeout:
@@ -191,12 +277,20 @@ class ExecutionManager:
             self.state.reset_stale_sl_counters()
             return
 
-        # Получить активные стоп-ордера на бирже
-        active_stop_orders = self.broker.get_stop_orders(self.account_id)
-        active_stop_ids = {so.stop_order_id for so in active_stop_orders}
+        for figi, position in list(self.positions.items()):
+            if position.status == "pending":
+                # Проверить, исполнилась ли лимитка пока бот был выключен
+                if self._is_order_filled(position.entry_order_id):
+                    logger.info("[EXEC] Recovery: %s pending order filled, activating", position.ticker)
+                    self._activate_position(figi)
+                else:
+                    logger.info("[EXEC] Recovery: %s pending order still waiting", position.ticker)
+                continue
 
-        closed_figis = []
-        for figi, position in self.positions.items():
+            # status == "active"
+            active_stop_orders = self.broker.get_stop_orders(self.account_id)
+            active_stop_ids = {so.stop_order_id for so in active_stop_orders}
+
             sl_active = position.sl_order_id in active_stop_ids
             tp_active = position.tp_order_id in active_stop_ids
 
@@ -206,22 +300,19 @@ class ExecutionManager:
 
             # Позиция была закрыта пока бот не работал
             if not sl_active and tp_active:
-                # SL сработал
                 self._close_position(figi, position.stop_price, "stop_loss")
             elif sl_active and not tp_active:
-                # TP сработал
                 self._close_position(figi, position.target_price, "take_profit")
             else:
-                # Оба ордера отсутствуют — используем stop_price как worst case
                 self._close_position(figi, position.stop_price, "stop_loss")
-            closed_figis.append(figi)
 
         self.state.reset_stale_sl_counters()
 
-        active_count = len(self.positions)
-        logger.info("[EXEC] Recovery complete. Active positions: %d", active_count)
+        pending_count = sum(1 for p in self.positions.values() if p.status == "pending")
+        active_count = sum(1 for p in self.positions.values() if p.status == "active")
+        logger.info("[EXEC] Recovery complete. Active: %d, Pending: %d", active_count, pending_count)
         if self.notifier:
-            self.notifier.send(f"Бот перезапущен. Активных позиций: {active_count}")
+            self.notifier.send(f"Бот перезапущен. Активных: {active_count}, ожидающих: {pending_count}")
 
     def _cancel_orders_safe(self, position: Position) -> None:
         """Безопасно отменить все ордера позиции (игнорировать ошибки)."""

@@ -40,14 +40,13 @@ class TBankBroker:
     # ------------------------------------------------------------------
 
     def get_candles(self, figi: str, interval: CandleInterval, days: int) -> pd.DataFrame:
-        """Получить свечи за последние N дней (одиночный запрос, для live)."""
+        """Получить свечи за последние N дней (с пагинацией, для live)."""
         with self._client() as client:
-            candles = client.market_data.get_candles(
+            candles = list(client.get_all_candles(
                 figi=figi,
                 from_=now() - timedelta(days=days),
-                to=now(),
                 interval=interval,
-            ).candles
+            ))
         return _candles_to_dataframe(candles)
 
     def get_candles_history(self, figi: str, interval: CandleInterval, days: int) -> pd.DataFrame:
@@ -216,6 +215,7 @@ def _quotation_to_float(q) -> float:
 
 
 def _float_to_quotation(value: float) -> Quotation:
+    value = round(value, 2)
     units = int(value)
     nano = round((value - units) * 1_000_000_000)
     return Quotation(units=units, nano=nano)

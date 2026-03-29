@@ -38,7 +38,9 @@ def main():
     logger = logging.getLogger(__name__)
 
     # 1. Загрузить конфиг
-    config = load_config("config.yaml")
+    import pathlib
+    config_path = str(pathlib.Path(__file__).parent / "config.yaml")
+    config = load_config(config_path)
 
     # 2. Инициализировать модули
     broker = TBankBroker(config.broker.token, config.broker.sandbox, config.broker.app_name)
@@ -92,10 +94,12 @@ def main():
                 figi = ticker_conf.figi
                 strategy = strategies[ticker_name]
 
+                # Всегда включаем 30m для отсчёта таймаута позиции
+                timeframes = list(dict.fromkeys(["30m"] + strategy.required_timeframes))
                 try:
                     candles = feed.get_candles(
                         figi=figi,
-                        timeframes=strategy.required_timeframes,
+                        timeframes=timeframes,
                         days=3,
                     )
                 except Exception:
@@ -110,7 +114,8 @@ def main():
                 current_price = candles[min_tf].iloc[-1]["close"]
 
                 if execution.has_position(figi):
-                    execution.update(figi, current_price)
+                    last_candle_time = candles["30m"].index[-1].to_pydatetime()
+                    execution.update(figi, current_price, last_candle_time)
                 elif execution.is_ticker_blocked(ticker_name):
                     continue
                 else:

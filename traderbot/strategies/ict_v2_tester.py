@@ -7,26 +7,25 @@ from traderbot.types import Setup, Signal
 
 logger = logging.getLogger(__name__)
 
-# Параметры системы V2 (liquidity model)
-DISPLACEMENT_MIN_BODY_RATIO = 0.35      # Мин. соотношение тело/диапазон свечи
-DISPLACEMENT_MIN_ATR_RATIO = 0.70       # Мин. диапазон displacement в долях ATR(14)
-ENTRY_RETRACEMENT = 0.50                # Вход на 50% ретрейсмента (середина зоны 35-70%)
-STOP_BUFFER = 0.003                     # 0.3% буфер за уровнем свипа
-MIN_SL_DISTANCE = 0.003                 # Мин. расстояние до SL (0.3% от цены)
+# =============================================
+#  ПАРАМЕТРЫ ДЛЯ ТЕСТИРОВАНИЯ — меняй здесь
+# =============================================
+SWEEP_LOOKBACK = 4                      # Кол-во 1H свечей для структуры
+RISK_REWARD = 2.0                       # Соотношение риск/прибыль
+DISPLACEMENT_MIN_BODY_RATIO = 0.35      # Мин. тело/диапазон свечи
+DISPLACEMENT_MIN_ATR_RATIO = 0.70       # Мин. диапазон в долях ATR(14)
+ENTRY_RETRACEMENT = 0.50                # Вход на % ретрейсмента тела
+STOP_BUFFER = 0.003                     # Буфер за уровнем свипа
+MIN_SL_DISTANCE = 0.003                 # Мин. расстояние до SL
+# =============================================
 
 
-class ICTStrategyV2(BaseStrategy):
-    """
-    Liquidity Model V2.
-    Параметризованный sweep lookback и RR.
-    TF анализа: 1H, TF входа: 30m.
-    """
+class ICTStrategyV2Tester(BaseStrategy):
+    """ICT V2 — тестовая стратегия с настраиваемыми параметрами."""
 
     required_timeframes = ["30m", "1h"]
 
-    def __init__(self, sweep_lookback: int = 4, risk_reward: float = 3.5):
-        self.sweep_lookback = sweep_lookback
-        self.risk_reward = risk_reward
+    def __init__(self):
         self._pending_setup: Setup | None = None
         self._pending_sweep_level: float | None = None
         self._pending_direction: Signal | None = None
@@ -55,11 +54,11 @@ class ICTStrategyV2(BaseStrategy):
         return setup
 
     def _detect_sweep(self, df_1h: pd.DataFrame) -> tuple[Signal, float, pd.Timestamp] | None:
-        if len(df_1h) < self.sweep_lookback + 1:
+        if len(df_1h) < SWEEP_LOOKBACK + 1:
             return None
 
         sweep_candle = df_1h.iloc[-1]
-        structure = df_1h.iloc[-(self.sweep_lookback + 1):-1]
+        structure = df_1h.iloc[-(SWEEP_LOOKBACK + 1):-1]
         sweep_time = df_1h.index[-1]
 
         structure_low = structure["low"].min()
@@ -108,13 +107,13 @@ class ICTStrategyV2(BaseStrategy):
                 stop_price = sweep_level * (1 - STOP_BUFFER)
                 risk = entry_price - stop_price
                 if risk > 0 and risk / entry_price >= MIN_SL_DISTANCE:
-                    target_price = entry_price + self.risk_reward * risk
+                    target_price = entry_price + RISK_REWARD * risk
                     return Setup(
                         direction=Signal.BUY,
                         entry_price=round(entry_price, 4),
                         stop_price=round(stop_price, 4),
                         target_price=round(target_price, 4),
-                        entry_reason=f"V2: sweep {self.sweep_lookback}, RR {self.risk_reward}",
+                        entry_reason=f"TESTER: sweep {SWEEP_LOOKBACK}, RR {RISK_REWARD}",
                     )
 
             if direction == Signal.SELL and candle["close"] < candle["open"]:
@@ -122,13 +121,13 @@ class ICTStrategyV2(BaseStrategy):
                 stop_price = sweep_level * (1 + STOP_BUFFER)
                 risk = stop_price - entry_price
                 if risk > 0 and risk / entry_price >= MIN_SL_DISTANCE:
-                    target_price = entry_price - self.risk_reward * risk
+                    target_price = entry_price - RISK_REWARD * risk
                     return Setup(
                         direction=Signal.SELL,
                         entry_price=round(entry_price, 4),
                         stop_price=round(stop_price, 4),
                         target_price=round(target_price, 4),
-                        entry_reason=f"V2: sweep {self.sweep_lookback}, RR {self.risk_reward}",
+                        entry_reason=f"TESTER: sweep {SWEEP_LOOKBACK}, RR {RISK_REWARD}",
                     )
 
         return None

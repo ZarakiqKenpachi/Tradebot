@@ -3,7 +3,7 @@
 Автономный торговый бот для MOEX (Московская биржа) через T-Bank Invest API.
 
 **Стратегия:** ICT System — анализ структуры рынка на 1H таймфрейме.
-**Инструменты по умолчанию:** SBER, GAZP, GMKN, VTBR, ROSN, NVTK, TATN, LKOH.
+**Инструменты по умолчанию:** SBER, GAZP, GMKN, VTBR, ROSN, NVTK, TATN.
 
 ---
 
@@ -37,7 +37,7 @@ python -3.12 -m venv venv
 
 ### 3. Установить зависимости
 
-> **Важно:** все команды запускать из корневой папки проекта (`Tradebot-development/`), **не заходя** в `traderbot/`. Иначе Python перепутает наш файл `types.py` со стандартным модулем и выдаст ошибку импорта.
+> **Важно:** все команды запускать из корневой папки проекта, **не заходя** в `traderbot/`. Иначе Python перепутает наш файл `types.py` со стандартным модулем и выдаст ошибку импорта.
 
 ```bash
 pip install -r traderbot/requirements.txt
@@ -56,28 +56,41 @@ cp .env.example .env
 Открыть `.env` и вписать свои данные:
 
 ```env
-TBANK_TOKEN=your_tbank_token_here
+TBANK_SANDBOX_TOKEN=your_sandbox_token_here
+TBANK_LIVE_TOKEN=your_live_token_here
 TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
 TELEGRAM_CHAT_ID=your_telegram_chat_id_here
 ```
 
 **Где взять токены:**
-- `TBANK_TOKEN` — личный кабинет T-Bank Invest → Настройки → API → Sandbox токен
-- `TELEGRAM_BOT_TOKEN` — создать бота через [@BotFather](https://t.me/BotFather) в Telegram
-- `TELEGRAM_CHAT_ID` — написать что угодно своему боту, затем узнать ID через [@userinfobot](https://t.me/userinfobot)
+- **TBANK_SANDBOX_TOKEN** — личный кабинет T-Bank Invest → Настройки → API → Sandbox токен
+- **TBANK_LIVE_TOKEN** — там же, токен для реальной торговли
+- **TELEGRAM_BOT_TOKEN** — создать бота через [@BotFather](https://t.me/BotFather) в Telegram
+- **TELEGRAM_CHAT_ID** — написать что угодно своему боту, затем узнать ID через [@userinfobot](https://t.me/userinfobot)
+
+Бот автоматически выбирает нужный токен по флагу `sandbox` в `config.yaml`.
 
 ---
 
 ## Запуск
 
-### Живая торговля (sandbox по умолчанию)
+### Sandbox (тестовый режим, по умолчанию)
 
 ```bash
 py -3.12 -m traderbot.main
 ```
 
 > В `traderbot/config.yaml` по умолчанию `sandbox: true` — деньги реальные не тратятся.
-> Чтобы торговать реально, поменяй на `sandbox: false` и используй боевой токен.
+
+### Live (реальная торговля)
+
+1. Убедиться что `TBANK_LIVE_TOKEN` заполнен в `.env`
+2. В `traderbot/config.yaml` поменять `sandbox: false`
+3. Запустить:
+
+```bash
+py -3.12 -m traderbot.main
+```
 
 ### Бэктест
 
@@ -101,17 +114,29 @@ tickers:
   # Добавь или убери тикеры здесь
 ```
 
-Доступные стратегии: `ict`, `ict_v2_sw4_rr2`, `ict_v2_sw4_rr35`, `ict_v2_sw10_rr2`.
+Доступные стратегии:
 
-### Основные параметры
+| Стратегия | Sweep | RR | Описание |
+|---|---|---|---|
+| `ict` | 15 | 1:2 | Оригинальная ICT System Variant A |
+| `ict_v2_sw4_rr2` | 4 | 1:2 | V2 — короткий sweep, умеренный RR |
+| `ict_v2_sw4_rr35` | 4 | 1:3.5 | V2 — короткий sweep, высокий RR |
+| `ict_v2_sw10_rr2` | 10 | 1:2 | V2 — средний sweep, умеренный RR |
+| `ict_v2_tester` | ? | ? | Тестовая — параметры меняются в файле |
 
-| Параметр | Где | Описание |
+Параметры `ict_v2_tester` редактируются прямо в `traderbot/strategies/ict_v2_tester.py` (константы наверху файла).
+
+### Основные параметры конфига
+
+| Параметр | Секция | Описание |
 |---|---|---|
-| `sandbox` | `broker` | `true` = тестовый режим без реальных денег |
+| `sandbox` | `broker` | `true` = тестовый режим, `false` = реальная торговля |
 | `risk_pct` | `risk` | Риск на сделку (0.10 = 10% от баланса) |
 | `max_position_pct` | `risk` | Макс. размер позиции (0.40 = 40%) |
+| `max_consecutive_sl` | `risk` | Блокировка тикера после N стоп-лоссов подряд |
 | `poll_interval_sec` | `trading` | Как часто проверять рынок (секунды) |
 | `max_candles_timeout` | `trading` | Таймаут позиции в свечах |
+| `commission_pct` | `trading` | Комиссия брокера (0.0004 = 0.04%) |
 
 ---
 
@@ -124,7 +149,7 @@ traderbot/
 ├── types.py             # Общие типы данных
 ├── broker/tbank.py      # Обёртка над T-Bank API
 ├── data/feed.py         # Загрузка свечей
-├── strategies/          # Торговые стратегии
+├── strategies/          # Торговые стратегии (каждый файл = стратегия)
 ├── risk/manager.py      # Риск-менеджмент
 ├── execution/manager.py # Исполнение ордеров
 ├── notifications/       # Telegram уведомления

@@ -51,12 +51,15 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         raw = yaml.safe_load(f)
 
     # Broker
-    broker_token = os.environ.get(raw["broker"]["token_env"], "")
+    is_sandbox = raw["broker"]["sandbox"]
+    token_env = raw["broker"]["sandbox_token_env"] if is_sandbox else raw["broker"]["live_token_env"]
+    broker_token = os.environ.get(token_env, "")
     if not broker_token:
-        raise ValueError(f"Environment variable {raw['broker']['token_env']} is not set")
+        mode = "sandbox" if is_sandbox else "live"
+        raise ValueError(f"Environment variable {token_env} is not set (mode: {mode})")
     broker = BrokerConfig(
         token=broker_token,
-        sandbox=raw["broker"]["sandbox"],
+        sandbox=is_sandbox,
         app_name=raw["broker"]["app_name"],
     )
 

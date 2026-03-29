@@ -1,7 +1,8 @@
 # === Брокер ===
 broker:
-  token_env: "TBANK_TOKEN"
-  sandbox: true
+  live_token_env: "TBANK_LIVE_TOKEN"
+  sandbox_token_env: "TBANK_SANDBOX_TOKEN"
+  sandbox: false
   app_name: "TraderBot"
 
 # === Риск-менеджмент ===
@@ -33,9 +34,7 @@ tickers:
   TATN:
     figi: "BBG004RVFFC0"
     strategy: "ict_v2_sw4_rr2"
-  LKOH:
-    figi: "TCS509024277"
-    strategy: "ict_v2_sw4_rr35"
+
 
 # === Уведомления ===
 notifications:

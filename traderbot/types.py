@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime
 
@@ -31,9 +31,12 @@ class Position:
     entry_time: datetime
     entry_reason: str
     entry_order_id: str
-    sl_order_id: str
-    tp_order_id: str
+    sl_order_id: str = ""
+    tp_order_id: str = ""
+    status: str = "pending"  # "pending" → "active"
     candles_held: int = 0
+    pending_candles: int = 0
+    last_candle_time: datetime | None = None
 
 
 @dataclass

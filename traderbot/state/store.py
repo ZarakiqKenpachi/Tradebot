@@ -42,7 +42,10 @@ class StateStore:
             "entry_order_id": position.entry_order_id,
             "sl_order_id": position.sl_order_id,
             "tp_order_id": position.tp_order_id,
+            "status": position.status,
             "candles_held": position.candles_held,
+            "pending_candles": position.pending_candles,
+            "last_candle_time": position.last_candle_time.isoformat() if position.last_candle_time else None,
         }
         self._save()
 
@@ -68,14 +71,18 @@ class StateStore:
                 entry_order_id=raw["entry_order_id"],
                 sl_order_id=raw["sl_order_id"],
                 tp_order_id=raw["tp_order_id"],
+                status=raw.get("status", "active"),
                 candles_held=raw.get("candles_held", 0),
+                pending_candles=raw.get("pending_candles", 0),
+                last_candle_time=datetime.fromisoformat(raw["last_candle_time"]) if raw.get("last_candle_time") else None,
             )
         return result
 
-    def update_candles_held(self, figi: str, candles_held: int) -> None:
-        """Обновить счётчик свечей для позиции."""
+    def update_candles_held(self, figi: str, candles_held: int, last_candle_time: datetime) -> None:
+        """Обновить счётчик свечей и время последней свечи для позиции."""
         if figi in self._data["positions"]:
             self._data["positions"][figi]["candles_held"] = candles_held
+            self._data["positions"][figi]["last_candle_time"] = last_candle_time.isoformat()
             self._save()
 
     def increment_consecutive_sl(self, ticker: str) -> None:
