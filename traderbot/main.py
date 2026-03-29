@@ -45,7 +45,6 @@ def main():
     # 2. Инициализировать модули
     broker = TBankBroker(config.broker.token, config.broker.sandbox, config.broker.app_name)
     feed = DataFeed(broker)
-    risk = RiskManager(config.risk_pct, config.max_position_pct)
     journal = TradeJournal(config.journal_path)
     state = StateStore(config.state_path)
     notifier = (
@@ -60,12 +59,17 @@ def main():
     else:
         account_id = broker.get_account_id()
 
-    # 4. Инициализировать стратегии для каждого тикера
+    # 4. Получить депозит из API (фиксируется один раз при старте)
+    deposit = broker.get_portfolio_balance(account_id)
+    logger.info("Депозит: %.2f RUB", deposit)
+    risk = RiskManager(config.risk_pct, config.max_position_pct, deposit)
+
+    # 5. Инициализировать стратегии для каждого тикера
     strategies = {}
     for ticker_name, ticker_conf in config.tickers.items():
         strategies[ticker_name] = get_strategy(ticker_conf.strategy)
 
-    # 5. Инициализировать execution manager
+    # 6. Инициализировать execution manager
     execution = ExecutionManager(
         broker=broker,
         risk=risk,
@@ -78,16 +82,16 @@ def main():
         max_consecutive_sl=config.max_consecutive_sl,
     )
 
-    # 6. Восстановить открытые позиции после перезапуска
+    # 7. Восстановить открытые позиции после перезапуска
     execution.recover()
 
-    # 7. Уведомить о запуске
+    # 8. Уведомить о запуске
     mode = "sandbox" if config.broker.sandbox else "live"
     logger.info("Бот запущен. Режим: %s. Тикеров: %d", mode, len(config.tickers))
     if notifier:
         notifier.send(f"Бот запущен. Режим: {mode}. Тикеров: {len(config.tickers)}")
 
-    # 8. Основной цикл
+    # 9. Основной цикл
     while True:
         try:
             for ticker_name, ticker_conf in config.tickers.items():

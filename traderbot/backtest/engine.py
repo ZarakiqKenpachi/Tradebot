@@ -32,7 +32,7 @@ class BacktestEngine:
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.risk = RiskManager(config.risk_pct, config.max_position_pct)
+        self.risk = RiskManager(config.risk_pct, config.max_position_pct, config.backtest_initial_balance)
         self.commission_pct = config.commission_pct
         self.max_candles_timeout = config.max_candles_timeout
 

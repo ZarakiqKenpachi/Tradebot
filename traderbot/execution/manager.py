@@ -166,6 +166,18 @@ class ExecutionManager:
             logger.debug("[EXEC] Could not get order state for %s", order_id)
             return False
 
+    def _is_order_cancelled(self, order_id: str) -> bool:
+        """Проверить, отменена ли лимитная заявка (вручную или биржей)."""
+        try:
+            state = self.broker.get_order_state(self.account_id, order_id)
+            return state.execution_report_status.name in (
+                "EXECUTION_REPORT_STATUS_CANCELLED",
+                "EXECUTION_REPORT_STATUS_REJECTED",
+            )
+        except Exception:
+            logger.debug("[EXEC] Could not get order state for %s", order_id)
+            return False
+
     def update(self, figi: str, current_price: float, last_candle_time: datetime) -> None:
         """Обновить состояние позиции (вызывается каждый цикл).
         pending: проверить исполнение лимитки, считать таймаут ожидания.
@@ -181,6 +193,21 @@ class ExecutionManager:
             # Проверить исполнение лимитки
             if self._is_order_filled(position.entry_order_id):
                 self._activate_position(figi)
+                return
+
+            # Проверить, не отменена ли заявка вручную через терминал
+            if self._is_order_cancelled(position.entry_order_id):
+                logger.info("[EXEC] %s pending order was cancelled externally, removing position",
+                            position.ticker)
+                self.state.remove_position(figi)
+                del self.positions[figi]
+                msg = (
+                    f"\u274c Лимитная заявка {position.ticker} {position.direction.value} "
+                    f"отменена через терминал\nЦена: {position.entry_price}"
+                )
+                logger.info("[EXEC] %s", msg)
+                if self.notifier:
+                    self.notifier.send(msg)
                 return
 
             # Считать свечи ожидания
@@ -283,6 +310,16 @@ class ExecutionManager:
                 if self._is_order_filled(position.entry_order_id):
                     logger.info("[EXEC] Recovery: %s pending order filled, activating", position.ticker)
                     self._activate_position(figi)
+                elif self._is_order_cancelled(position.entry_order_id):
+                    logger.info("[EXEC] Recovery: %s pending order was cancelled externally, removing",
+                                position.ticker)
+                    self.state.remove_position(figi)
+                    del self.positions[figi]
+                    if self.notifier:
+                        self.notifier.send(
+                            f"\u274c Лимитная заявка {position.ticker} {position.direction.value} "
+                            f"была отменена через терминал\nЦена: {position.entry_price}"
+                        )
                 else:
                     logger.info("[EXEC] Recovery: %s pending order still waiting", position.ticker)
                 continue
