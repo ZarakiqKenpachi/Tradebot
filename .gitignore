@@ -15,7 +15,7 @@ env/
 
 # Runtime data (personal, machine-specific)
 traderbot/logs/
-traderbot/journal/
+traderbot/journal/*.csv
 traderbot/state/positions.json
 backtest/results/
 
