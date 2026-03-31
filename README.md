@@ -127,18 +127,25 @@ py -3.12 -m traderbot.backtest.run --config traderbot/config.yaml --days 30
 
 | Флаг | Тип | По умолчанию | Описание |
 |---|---|---|---|
-| `--config` | путь | `config.yaml` | Путь к файлу конфига |
+| `--config` | путь или шорткат | `config.yaml` | Путь к файлу конфига, или `live` / `test` |
 | `--days` | число | из конфига | Глубина истории в днях |
 | `--tickers` | строка | все из конфига | Тикеры через запятую: `SBER,GAZP` |
+
+**Шорткаты `--config`:**
+
+| Значение | Путь |
+|---|---|
+| `live` | `traderbot/config.yaml` |
+| `test` | `traderbot/backtest/test_config.yaml` |
 
 #### Примеры
 
 ```bash
-# Все тикеры из конфига, 30 дней
-py -3.12 -m traderbot.backtest.run --config traderbot/config.yaml --days 30
+# Живой конфиг, 30 дней
+py -3.12 -m traderbot.backtest.run --config live --days 30
 
-# Только SBER и GAZP, 90 дней
-py -3.12 -m traderbot.backtest.run --config traderbot/config.yaml --days 90 --tickers SBER,GAZP
+# Тестовый конфиг, только SBER и GAZP, 90 дней
+py -3.12 -m traderbot.backtest.run --config test --days 90 --tickers SBER,GAZP
 
 # Конфиг по умолчанию, глубина из config.yaml
 py -3.12 -m traderbot.backtest.run
@@ -213,9 +220,18 @@ py -3.12 -m traderbot.backtest.compare --config traderbot/config.yaml --days 90
 
 | Флаг | Тип | По умолчанию | Описание |
 |---|---|---|---|
-| `--config` | путь | `traderbot/config.yaml` | Путь к конфигу |
+| `--config` | путь или шорткат | `traderbot/config.yaml` | Путь к конфигу, или `live` / `test` |
 | `--days` | число | 90 | Глубина истории |
 | `--tickers` | строка | все из конфига | Тикеры через запятую |
+| `--strategies` | строка | все варианты | Стратегии через запятую: `ict,ict_v2_sw4_rr2` |
+
+```bash
+# Все стратегии, живой конфиг, 90 дней
+py -3.12 -m traderbot.backtest.compare --config live --days 90
+
+# Только две стратегии, один тикер
+py -3.12 -m traderbot.backtest.compare --config test --days 60 --tickers SBER --strategies ict,ict_v2_sw10_rr2
+```
 
 Вывод — три блока:
 
