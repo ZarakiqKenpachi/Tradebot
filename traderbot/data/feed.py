@@ -14,9 +14,11 @@ MOEX_TIMEZONE = "Europe/Moscow"
 # Маппинг строковых таймфреймов в частоты pandas для ресемплинга
 _FREQ_MAP = {
     "1m": "1min",
+    "15m": "15min",
     "30m": "30min",
     "1h": "1h",
     "4h": "4h",
+    "1d": "1D",
 }
 
 
@@ -56,7 +58,8 @@ class DataFeed:
                 df = df_1m.copy()
             else:
                 df = resample(df_1m, _FREQ_MAP[tf])
-            df = filter_moex_hours(df)
+            if tf != "1d":
+                df = filter_moex_hours(df)
             result[tf] = df
         return result
 
@@ -79,16 +82,13 @@ def resample(df_1m: pd.DataFrame, freq: str) -> pd.DataFrame:
 
 def filter_moex_hours(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Оставить только свечи в рабочие часы MOEX.
-    Рабочие часы: Пн-Пт, 07:00-23:59 МСК (UTC+3).
+    Оставить только свечи в торговые часы MOEX (включая выходные дни).
+    Часы: 07:00-23:59 МСК (UTC+3). Фильтрация по дням недели не применяется —
+    выходные свечи включаются для анализа; запрет торговли в выходные
+    обеспечивается на уровне основного цикла.
     """
     if df.empty:
         return df
-    # Конвертировать индекс в московское время для фильтрации
     msk = df.index.tz_convert(MOEX_TIMEZONE)
-    # Пн-Пт (weekday 0-4)
-    weekday_mask = msk.weekday < 5
-    # 07:00 - 23:59
     hour_mask = msk.hour >= MOEX_OPEN_HOUR_MSK
-    # MOEX_CLOSE_HOUR_MSK = 24, значит hour < 24 всегда true, оставляем все часы >= 7
-    return df[weekday_mask & hour_mask]
+    return df[hour_mask]

@@ -4,7 +4,9 @@
 """
 import logging
 import time
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 import os
 
 from traderbot.broker.tbank import TBankBroker
@@ -123,6 +125,9 @@ def main():
                 elif execution.is_ticker_blocked(ticker_name):
                     continue
                 else:
+                    now_msk = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Moscow"))
+                    if now_msk.weekday() >= 5:  # Сб=5, Вс=6
+                        continue
                     setup = strategy.find_setup(candles)
                     if setup:
                         execution.open_position(ticker_name, figi, setup)

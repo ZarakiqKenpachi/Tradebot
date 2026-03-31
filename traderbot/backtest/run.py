@@ -54,12 +54,21 @@ def main():
     broker = TBankBroker(config.broker.token, sandbox=True, app_name=config.broker.app_name)
     feed = DataFeed(broker)
 
-    # Загрузить данные для всех тикеров
+    # Загрузить размеры лотов и свечи для всех тикеров
     logger.info("Loading data for %d tickers, %d days...", len(tickers), days)
     all_data = {}
     for ticker_name, ticker_conf in tickers.items():
         strategy = get_strategy(ticker_conf.strategy)
         logger.info("  Loading %s...", ticker_name)
+
+        # Получить размер лота из API
+        lot_size, _ = broker.get_instrument_info(ticker_conf.figi)
+        if lot_size < 1:
+            logger.warning("  Invalid lot_size=%d for %s, defaulting to 1", lot_size, ticker_name)
+            lot_size = 1
+        ticker_conf.lot_size = lot_size
+        logger.info("  %s: lot_size=%d", ticker_name, lot_size)
+
         # Всегда загружаем 1m для точного времени входа/выхода в бэктесте
         timeframes = list(strategy.required_timeframes)
         if "1m" not in timeframes:

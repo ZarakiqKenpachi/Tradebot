@@ -18,7 +18,7 @@ tickers:
     strategy: "ict_v2_sw10_rr2"
   GAZP:
     figi: "BBG004730RP0"
-    strategy: "ict_v2_sw4_rr2"
+    strategy: "ict_gazp"
   GMKN:
     figi: "BBG004731489"
     strategy: "ict_v2_sw4_rr35"

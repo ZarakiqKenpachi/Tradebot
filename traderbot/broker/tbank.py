@@ -7,6 +7,7 @@ from t_tech.invest import (
     CandleInterval,
     Client,
     ExchangeOrderType,
+    InstrumentIdType,
     MoneyValue,
     OrderDirection,
     OrderType,
@@ -67,6 +68,17 @@ class TBankBroker:
         """Получить ID первого доступного аккаунта."""
         with self._client() as client:
             return client.users.get_accounts().accounts[0].id
+
+    def get_instrument_info(self, figi: str) -> tuple[int, float]:
+        """Получить (lot_size, min_price_increment) для инструмента."""
+        with self._client() as client:
+            instrument = client.instruments.get_instrument_by(
+                id_type=InstrumentIdType.INSTRUMENT_ID_TYPE_FIGI,
+                id=figi,
+            ).instrument
+        lot_size = instrument.lot
+        step = _quotation_to_float(instrument.min_price_increment)
+        return lot_size, step
 
     def get_portfolio_balance(self, account_id: str) -> float:
         """Получить баланс портфеля в RUB."""
@@ -215,10 +227,22 @@ def _quotation_to_float(q) -> float:
 
 
 def _float_to_quotation(value: float) -> Quotation:
-    value = round(value, 2)
-    units = int(value)
-    nano = round((value - units) * 1_000_000_000)
+    total_nano = round(value * 1_000_000_000)
+    units = int(total_nano // 1_000_000_000)
+    nano = int(total_nano % 1_000_000_000)
     return Quotation(units=units, nano=nano)
+
+
+def round_to_step(price: float, step: float) -> float:
+    """Округлить цену до ближайшего шага цены инструмента."""
+    if step <= 0:
+        return price
+    step_nano = round(step * 1_000_000_000)
+    if step_nano <= 0:
+        return price
+    price_nano = round(price * 1_000_000_000)
+    snapped_nano = round(price_nano / step_nano) * step_nano
+    return snapped_nano / 1_000_000_000
 
 
 def _candles_to_dataframe(candles: list) -> pd.DataFrame:

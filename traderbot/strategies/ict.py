@@ -8,6 +8,7 @@ from traderbot.types import Setup, Signal
 logger = logging.getLogger(__name__)
 
 # Параметры системы
+MIN_CANDLES = 15                        # Мин. количество свечей на каждом ТФ для принятия решения
 SWEEP_LOOKBACK = 15                     # Кол-во 1H свечей для определения структуры
 DISPLACEMENT_MIN_BODY_RATIO = 0.35      # Мин. соотношение тело/диапазон свечи
 DISPLACEMENT_MIN_ATR_RATIO = 0.70       # Мин. диапазон displacement в долях ATR(14)
@@ -34,6 +35,14 @@ class ICTStrategy(BaseStrategy):
     def find_setup(self, candles: dict[str, pd.DataFrame]) -> Setup | None:
         df_1h = candles["1h"]
         df_30m = candles["30m"]
+
+        # Проверить достаточность данных по 1H (решение принимается на этом ТФ)
+        if len(df_1h) < MIN_CANDLES:
+            logger.debug(
+                "[ICT] Недостаточно данных: 1h=%d (минимум %d)",
+                len(df_1h), MIN_CANDLES,
+            )
+            return None
 
         # Проверить повторный ретест (pending setup)
         if self._pending_setup is not None:
@@ -122,7 +131,8 @@ class ICTStrategy(BaseStrategy):
                 if risk > 0 and risk / entry_price >= MIN_SL_DISTANCE:
                     target_price = entry_price + RISK_REWARD * risk
                     reason = self._format_reason(
-                        "бычий", sweep_level, body, candle_range, candle_atr
+                        Signal.BUY, sweep_level, sweep_time, idx,
+                        body, candle_range, candle_atr,
                     )
                     return Setup(
                         direction=Signal.BUY,
@@ -139,7 +149,8 @@ class ICTStrategy(BaseStrategy):
                 if risk > 0 and risk / entry_price >= MIN_SL_DISTANCE:
                     target_price = entry_price - RISK_REWARD * risk
                     reason = self._format_reason(
-                        "медвежий", sweep_level, body, candle_range, candle_atr
+                        Signal.SELL, sweep_level, sweep_time, idx,
+                        body, candle_range, candle_atr,
                     )
                     return Setup(
                         direction=Signal.SELL,
@@ -190,20 +201,26 @@ class ICTStrategy(BaseStrategy):
 
     @staticmethod
     def _format_reason(
-        direction_str: str,
+        direction: Signal,
         sweep_level: float,
+        sweep_time: pd.Timestamp,
+        candle_time: pd.Timestamp,
         body: float,
         candle_range: float,
         atr: float,
     ) -> str:
         body_pct = body / candle_range * 100 if candle_range else 0
         atr_pct = candle_range / atr * 100 if atr else 0
-        direction_word = "вверх" if "бычий" in direction_str else "вниз"
+        is_buy = direction == Signal.BUY
+        sweep_dir = "ниже" if is_buy else "выше"
+        structure_ext = "минимум" if is_buy else "максимум"
+        impulse_dir = "вверх" if is_buy else "вниз"
+        sweep_ts = sweep_time.strftime("%Y-%m-%d %H:%M")
+        candle_ts = candle_time.strftime("%Y-%m-%d %H:%M")
         return (
-            f"1H {direction_str} свип ниже {sweep_level:.2f} "
-            f"(структурный {'минимум' if 'бычий' in direction_str else 'максимум'} "
-            f"{SWEEP_LOOKBACK} свечей); "
-            f"30m импульсная свеча {direction_word} "
+            f"1H свип {sweep_dir} структурного {structure_ext}а {sweep_level:.2f} "
+            f"(глубина {SWEEP_LOOKBACK} свечей, время свипа {sweep_ts}); "
+            f"30m импульсная свеча {impulse_dir} в {candle_ts} "
             f"(тело {body_pct:.0f}% диапазона, диапазон {atr_pct:.0f}% ATR); "
-            f"вход на {ENTRY_RETRACEMENT*100:.0f}% ретрейсменте импульса"
+            f"вход на {ENTRY_RETRACEMENT*100:.0f}% ретрейсменте импульсной свечи"
         )

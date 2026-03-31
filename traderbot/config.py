@@ -16,6 +16,7 @@ class BrokerConfig:
 class TickerConfig:
     figi: str
     strategy: str
+    lot_size: int = 1
 
 
 @dataclass
@@ -72,7 +73,11 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     # Tickers
     tickers = {}
     for name, conf in raw["tickers"].items():
-        tickers[name] = TickerConfig(figi=conf["figi"], strategy=conf["strategy"])
+        tickers[name] = TickerConfig(
+            figi=conf["figi"],
+            strategy=conf["strategy"],
+            lot_size=conf.get("lot_size", 1),
+        )
 
     # Telegram
     tg_raw = raw["notifications"]["telegram"]

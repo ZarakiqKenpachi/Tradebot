@@ -3,7 +3,7 @@ from datetime import date, datetime, timezone
 
 from t_tech.invest import OrderDirection, StopOrderDirection
 
-from traderbot.broker.tbank import TBankBroker
+from traderbot.broker.tbank import TBankBroker, round_to_step
 from traderbot.journal.writer import TradeJournal
 from traderbot.notifications.telegram import TelegramNotifier
 from traderbot.risk.manager import RiskManager
@@ -54,50 +54,61 @@ class ExecutionManager:
 
     def open_position(self, ticker: str, figi: str, setup: Setup) -> None:
         """Выставить лимитную заявку. SL/TP будут добавлены после исполнения."""
-        # 1. Баланс
+        # 1. Баланс, размер лота и шаг цены
         balance = self.broker.get_portfolio_balance(self.account_id)
+        lot_size, price_step = self.broker.get_instrument_info(figi)
+        if lot_size < 1:
+            logger.error("[EXEC] Invalid lot_size=%d for %s from API, aborting", lot_size, ticker)
+            return
+        logger.info("[EXEC] %s lot_size=%d price_step=%.6f", ticker, lot_size, price_step)
 
-        # 2. Размер позиции
-        qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price)
+        # 2. Округлить цены до шага цены инструмента
+        entry_price = round_to_step(setup.entry_price, price_step)
+        stop_price = round_to_step(setup.stop_price, price_step)
+        target_price = round_to_step(setup.target_price, price_step)
+
+        # 3. Размер позиции в лотах
+        qty = self.risk.position_size(balance, entry_price, stop_price, lot_size)
         if qty < 1:
             logger.warning("[EXEC] Insufficient balance for %s, qty=0", ticker)
             return
 
-        # 3. Определить направление ордера
+        # 4. Определить направление ордера
         if setup.direction == Signal.BUY:
             order_dir = OrderDirection.ORDER_DIRECTION_BUY
         else:
             order_dir = OrderDirection.ORDER_DIRECTION_SELL
 
-        # 4. Разместить только лимитную заявку
+        # 5. Разместить только лимитную заявку
         entry_order_id = self.broker.place_limit_order(
-            self.account_id, figi, qty, order_dir, setup.entry_price
+            self.account_id, figi, qty, order_dir, entry_price
         )
 
-        # 5. Создать Position в статусе pending (без SL/TP)
+        # 6. Создать Position в статусе pending (без SL/TP)
         position = Position(
             ticker=ticker,
             figi=figi,
             direction=setup.direction,
-            entry_price=setup.entry_price,
-            stop_price=setup.stop_price,
-            target_price=setup.target_price,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=target_price,
             qty=qty,
+            lot_size=lot_size,
             entry_time=datetime.now(timezone.utc),
             entry_reason=setup.entry_reason,
             entry_order_id=entry_order_id,
             status="pending",
         )
 
-        # 6. Сохранить
+        # 7. Сохранить
         self.positions[figi] = position
         self.state.save_position(position)
 
-        # 7. Уведомление — заявка выставлена
+        # 8. Уведомление — заявка выставлена
         msg = (
             f"\U0001f4cb Лимитная заявка {ticker} {setup.direction.value}\n"
-            f"Цена: {setup.entry_price} | Объём: {qty}\n"
-            f"SL: {setup.stop_price} | TP: {setup.target_price}\n"
+            f"Цена: {entry_price} | Объём: {qty}\n"
+            f"SL: {stop_price} | TP: {target_price}\n"
             f"Причина: {setup.entry_reason}"
         )
         logger.info("[EXEC] %s", msg)
@@ -245,14 +256,15 @@ class ExecutionManager:
         # 1. Отменить оставшиеся ордера
         self._cancel_orders_safe(position)
 
-        # 2. Рассчитать PnL
+        # 2. Рассчитать PnL (qty — в лотах, умножаем на lot_size для перевода в акции)
+        shares = position.qty * position.lot_size
         if position.direction == Signal.BUY:
-            pnl = (exit_price - position.entry_price) * position.qty
+            pnl = (exit_price - position.entry_price) * shares
         else:
-            pnl = (position.entry_price - exit_price) * position.qty
+            pnl = (position.entry_price - exit_price) * shares
 
         avg_price = (position.entry_price + exit_price) / 2
-        commission = 2 * self.commission_pct * avg_price * position.qty
+        commission = 2 * self.commission_pct * avg_price * shares
         pnl_net = pnl - commission
 
         # 3. Записать в журнал

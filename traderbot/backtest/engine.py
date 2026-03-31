@@ -21,7 +21,8 @@ class _VirtualPosition:
     entry_price: float
     stop_price: float
     target_price: float
-    qty: int
+    qty: int        # в лотах
+    lot_size: int   # акций в одном лоте
     entry_time: datetime
     entry_reason: str
     candles_held: int = 0
@@ -58,7 +59,8 @@ class BacktestEngine:
 
             df_entry = candles_dict[min_tf]
             ticker_trades = self._simulate_ticker(
-                ticker_name, ticker_conf.figi, strategy, candles_dict, df_entry, balance
+                ticker_name, ticker_conf.figi, ticker_conf.lot_size,
+                strategy, candles_dict, df_entry, balance
             )
             trades.extend(ticker_trades)
 
@@ -71,6 +73,7 @@ class BacktestEngine:
         self,
         ticker: str,
         figi: str,
+        lot_size: int,
         strategy: BaseStrategy,
         candles_dict: dict[str, pd.DataFrame],
         df_entry: pd.DataFrame,
@@ -112,7 +115,7 @@ class BacktestEngine:
             # === Ожидание заполнения лимитного ордера ===
             if pending is not None:
                 setup, qty = pending
-                result = self._scan_fill(setup, qty, ticker, figi, bar_1m)
+                result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m)
                 if result == "invalidated":
                     pending = None
                     # Сетап аннулирован — ищем новый в этом же баре (ниже)
@@ -124,18 +127,23 @@ class BacktestEngine:
                     continue  # Ещё ждём заполнения
 
             # === Поиск нового сетапа ===
+            # Не искать точки входа в выходные дни (МСК)
+            current_time_msk = current_time.tz_convert("Europe/Moscow")
+            if current_time_msk.weekday() >= 5:  # Сб=5, Вс=6
+                continue
+
             window = {tf: df[df.index <= current_time] for tf, df in candles_dict.items() if tf != "1m"}
             setup = strategy.find_setup(window)
             if setup is None:
                 continue
-            qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price)
+            qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price, lot_size)
             if qty < 1:
                 continue
 
             strategy.on_trade_opened()
 
             # Пробуем заполнить прямо на 1m-свечах текущего бара
-            result = self._scan_fill(setup, qty, ticker, figi, bar_1m)
+            result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m)
             if result == "invalidated":
                 pass  # Не вошли
             elif result is not None:
@@ -190,6 +198,7 @@ class BacktestEngine:
         self,
         setup: Setup,
         qty: int,
+        lot_size: int,
         ticker: str,
         figi: str,
         bar_1m: pd.DataFrame,
@@ -205,16 +214,16 @@ class BacktestEngine:
                     return "invalidated"
                 # Цена откатилась к уровню входа — заполнение
                 if c["low"] <= setup.entry_price:
-                    return self._make_position(setup, qty, ticker, figi, ts)
+                    return self._make_position(setup, qty, lot_size, ticker, figi, ts)
             else:
                 if c["high"] >= setup.stop_price:
                     return "invalidated"
                 if c["high"] >= setup.entry_price:
-                    return self._make_position(setup, qty, ticker, figi, ts)
+                    return self._make_position(setup, qty, lot_size, ticker, figi, ts)
         return None
 
     def _make_position(
-        self, setup: Setup, qty: int, ticker: str, figi: str, ts: pd.Timestamp
+        self, setup: Setup, qty: int, lot_size: int, ticker: str, figi: str, ts: pd.Timestamp
     ) -> _VirtualPosition:
         entry_dt = ts.to_pydatetime()
         if entry_dt.tzinfo is None:
@@ -227,6 +236,7 @@ class BacktestEngine:
             stop_price=setup.stop_price,
             target_price=setup.target_price,
             qty=qty,
+            lot_size=lot_size,
             entry_time=entry_dt,
             entry_reason=setup.entry_reason,
         )
@@ -238,13 +248,14 @@ class BacktestEngine:
         reason: str,
         exit_time,
     ) -> TradeRecord:
+        shares = pos.qty * pos.lot_size
         if pos.direction == Signal.BUY:
-            pnl = (exit_price - pos.entry_price) * pos.qty
+            pnl = (exit_price - pos.entry_price) * shares
         else:
-            pnl = (pos.entry_price - exit_price) * pos.qty
+            pnl = (pos.entry_price - exit_price) * shares
 
         avg_price = (pos.entry_price + exit_price) / 2
-        commission = 2 * self.commission_pct * avg_price * pos.qty
+        commission = 2 * self.commission_pct * avg_price * shares
         pnl_net = pnl - commission
 
         if hasattr(exit_time, "to_pydatetime"):

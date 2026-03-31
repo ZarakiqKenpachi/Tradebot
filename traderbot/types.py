@@ -16,6 +16,8 @@ class Setup:
     stop_price: float
     target_price: float
     entry_reason: str
+    tp2: float | None = None
+    tp3: float | None = None
 
 
 @dataclass
@@ -28,6 +30,7 @@ class Position:
     stop_price: float
     target_price: float
     qty: int
+    lot_size: int
     entry_time: datetime
     entry_reason: str
     entry_order_id: str
