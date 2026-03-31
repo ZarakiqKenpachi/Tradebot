@@ -236,6 +236,28 @@ class ExecutionManager:
             return
 
         # status == "active"
+        # Проверить, не закрылась ли позиция по SL/TP на бирже
+        active_stop_orders = self.broker.get_stop_orders(self.account_id)
+        active_stop_ids = {so.stop_order_id for so in active_stop_orders}
+        sl_active = position.sl_order_id in active_stop_ids
+        tp_active = position.tp_order_id in active_stop_ids
+
+        if not sl_active and not tp_active:
+            # Оба ордера исчезли — позиция закрыта биржей (SL сработал, TP отменился)
+            logger.info("[EXEC] %s: both SL/TP gone, assuming stop_loss", position.ticker)
+            self._close_position(figi, position.stop_price, "stop_loss")
+            return
+        if not tp_active and sl_active:
+            # TP исчез, SL ещё жив — значит TP сработал
+            logger.info("[EXEC] %s: TP filled (SL still active)", position.ticker)
+            self._close_position(figi, position.target_price, "take_profit")
+            return
+        if not sl_active and tp_active:
+            # SL исчез, TP ещё жив — значит SL сработал
+            logger.info("[EXEC] %s: SL filled (TP still active)", position.ticker)
+            self._close_position(figi, position.stop_price, "stop_loss")
+            return
+
         if new_candle:
             position.candles_held += 1
             position.last_candle_time = last_candle_time
