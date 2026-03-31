@@ -30,13 +30,21 @@ def main():
 
     # CLI аргументы
     parser = argparse.ArgumentParser(description="TraderBot Backtest")
-    parser.add_argument("--config", default="config.yaml", help="Path to config file")
+    parser.add_argument("--config", default="config.yaml",
+                        help="Path to config file, or 'live' (traderbot/config.yaml) / 'test' (traderbot/backtest/test_config.yaml)")
     parser.add_argument("--tickers", default=None, help="Comma-separated ticker list (default: all from config)")
     parser.add_argument("--days", type=int, default=None, help="Lookback days (default: from config)")
     args = parser.parse_args()
 
+    # Шорткаты для --config
+    CONFIG_SHORTCUTS = {
+        "live": "traderbot/config.yaml",
+        "test": "traderbot/backtest/test_config.yaml",
+    }
+    config_path = CONFIG_SHORTCUTS.get(args.config, args.config)
+
     # Загрузить конфиг
-    config = load_config(args.config)
+    config = load_config(config_path)
     days = args.days or config.backtest_days
 
     # Выбрать тикеры

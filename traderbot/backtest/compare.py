@@ -18,7 +18,7 @@ from traderbot.backtest.engine import BacktestEngine
 from traderbot.backtest.report import BacktestReport
 
 
-STRATEGY_VARIANTS = [
+DEFAULT_STRATEGY_VARIANTS = [
     "ict",
     "ict_v2_sw4_rr2",
     "ict_v2_sw4_rr35",
@@ -48,12 +48,22 @@ def main():
     logger = logging.getLogger(__name__)
 
     parser = argparse.ArgumentParser(description="Compare strategies")
-    parser.add_argument("--config", default="traderbot/config.yaml")
+    parser.add_argument("--config", default="traderbot/config.yaml",
+                        help="Path to config file, or 'live' (traderbot/config.yaml) / 'test' (traderbot/backtest/test_config.yaml)")
     parser.add_argument("--tickers", default=None)
     parser.add_argument("--days", type=int, default=90)
+    parser.add_argument("--strategies", default=None,
+                        help="Comma-separated strategy list (default: all variants)")
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    # Шорткаты для --config
+    CONFIG_SHORTCUTS = {
+        "live": "traderbot/config.yaml",
+        "test": "traderbot/backtest/test_config.yaml",
+    }
+    config_path = CONFIG_SHORTCUTS.get(args.config, args.config)
+
+    config = load_config(config_path)
     days = args.days
 
     if args.tickers:
@@ -66,9 +76,15 @@ def main():
     broker = TBankBroker(config.broker.token, sandbox=True, app_name=config.broker.app_name)
     feed = DataFeed(broker)
 
+    # Выбрать стратегии
+    if args.strategies:
+        strategy_variants = args.strategies.split(",")
+    else:
+        strategy_variants = DEFAULT_STRATEGY_VARIANTS
+
     # Собираем все нужные таймфреймы из всех стратегий
     all_timeframes = set(["1m"])
-    for strat_name in STRATEGY_VARIANTS:
+    for strat_name in strategy_variants:
         s = get_strategy(strat_name)
         all_timeframes.update(s.required_timeframes)
     all_timeframes = sorted(all_timeframes)
@@ -93,14 +109,14 @@ def main():
         logger.error("No data loaded")
         sys.exit(1)
 
-    logger.info("Data loaded. Running %d strategy variants...", len(STRATEGY_VARIANTS))
+    logger.info("Data loaded. Running %d strategy variants...", len(strategy_variants))
 
     # === Шаг 2: прогнать все стратегии по одним данным ===
     # {strat_name: {ticker: {pnl, tr, w, tp, sl, to, pf}}}
     results = {}
 
-    for strat_name in STRATEGY_VARIANTS:
-        logger.info("  Strategy: %s", NAMES[strat_name])
+    for strat_name in strategy_variants:
+        logger.info("  Strategy: %s", NAMES.get(strat_name, strat_name))
 
         # Подменяем стратегию в конфиге для каждого тикера
         for tc in config.tickers.values():
@@ -136,8 +152,8 @@ def main():
     print(f"FULL MATRIX ({days} days): P&L by ticker x strategy")
     print("=" * 105)
     header = f"{'Ticker':<6}"
-    for s in STRATEGY_VARIANTS:
-        header += f" | {NAMES[s]:>16}"
+    for s in strategy_variants:
+        header += f" | {NAMES.get(s, s):>16}"
     header += " | BEST"
     print(header)
     print("-" * 105)
@@ -147,7 +163,7 @@ def main():
         line = f"{t:<6}"
         best_strat = None
         best_pnl = -999999
-        for s in STRATEGY_VARIANTS:
+        for s in strategy_variants:
             d = results[s][t]
             pnl = d["pnl"]
             wr = d["w"] / d["tr"] * 100 if d["tr"] else 0
@@ -155,7 +171,7 @@ def main():
             if pnl > best_pnl:
                 best_pnl = pnl
                 best_strat = s
-        line += f" | {NAMES[best_strat]}"
+        line += f" | {NAMES.get(best_strat, best_strat)}"
         best_per_ticker[t] = best_strat
         print(line)
 
@@ -173,7 +189,7 @@ def main():
         s = best_per_ticker[t]
         d = results[s][t]
         wr = d["w"] / d["tr"] * 100 if d["tr"] else 0
-        print(f"  {t:<6} {NAMES[s]:<14} {d['pnl']:>+10,.0f} {d['tr']:>4} {d['tp']:>4} {d['sl']:>4} {d['to']:>4} {wr:>4.0f}% {d['pf']:>5.2f}")
+        print(f"  {t:<6} {NAMES.get(s, s):<14} {d['pnl']:>+10,.0f} {d['tr']:>4} {d['tp']:>4} {d['sl']:>4} {d['to']:>4} {wr:>4.0f}% {d['pf']:>5.2f}")
         total_pnl += d["pnl"]
         total_tr += d["tr"]
         total_w += d["w"]
@@ -185,12 +201,12 @@ def main():
     # Compare with uniform
     print(f"\nCOMPARISON: best-per-ticker vs uniform")
     print("-" * 60)
-    for s in STRATEGY_VARIANTS:
+    for s in strategy_variants:
         tp = sum(results[s][t]["pnl"] for t in ticker_names)
         tr = sum(results[s][t]["tr"] for t in ticker_names)
         w = sum(results[s][t]["w"] for t in ticker_names)
         wr = w / tr * 100 if tr else 0
-        print(f"  {NAMES[s]:<16} P&L: {tp:>+10,.0f}  {w}/{tr} trades  WR:{wr:.0f}%")
+        print(f"  {NAMES.get(s, s):<16} P&L: {tp:>+10,.0f}  {w}/{tr} trades  WR:{wr:.0f}%")
     print(f"  {'BEST MIX':<16} P&L: {total_pnl:>+10,.0f}  {total_w}/{total_tr} trades  WR:{total_wr:.0f}%")
 
 
