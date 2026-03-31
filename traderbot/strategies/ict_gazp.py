@@ -112,6 +112,17 @@ class ICTGazpStrategy(BaseStrategy):
         if setup is None:
             return None
 
+        d1_str = "нейтральный" if d1_neutral else ("бычий" if bias == Signal.BUY else "медвежий")
+        bias_str = "покупка" if bias == Signal.BUY else "продажа"
+        model_ru = "свип+разворот" if impulse.model == "sweep_shift" else "продолжение"
+        imp_ts = impulse.end_time.strftime("%Y-%m-%d %H:%M")
+        setup.entry_reason = (
+            f"GAZP 3.2: D1 тренд {d1_str}; 4H подтверждает {bias_str}; "
+            f"1H импульс ({model_ru}) в {imp_ts} "
+            f"[{impulse.low:.2f}–{impulse.high:.2f}]; "
+            f"15m вход на 50% уровне {setup.entry_price:.2f}"
+        )
+
         self._pending_setup = setup
         self._pending_invalidation = invalidation
         self._pending_direction = bias

@@ -110,7 +110,10 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
                         entry_price=round(entry_price, 4),
                         stop_price=round(stop_price, 4),
                         target_price=round(target_price, 4),
-                        entry_reason=f"V2: sweep {SWEEP_LOOKBACK}, RR {RISK_REWARD}",
+                        entry_reason=self._format_reason(
+                            Signal.BUY, sweep_level, sweep_time, idx,
+                            body, candle_range, candle_atr,
+                        ),
                     )
 
             if direction == Signal.SELL and candle["close"] < candle["open"]:
@@ -124,7 +127,10 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
                         entry_price=round(entry_price, 4),
                         stop_price=round(stop_price, 4),
                         target_price=round(target_price, 4),
-                        entry_reason=f"V2: sweep {SWEEP_LOOKBACK}, RR {RISK_REWARD}",
+                        entry_reason=self._format_reason(
+                            Signal.SELL, sweep_level, sweep_time, idx,
+                            body, candle_range, candle_atr,
+                        ),
                     )
 
         return None
@@ -160,3 +166,29 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
         self._pending_setup = None
         self._pending_sweep_level = None
         self._pending_direction = None
+
+    @staticmethod
+    def _format_reason(
+        direction: Signal,
+        sweep_level: float,
+        sweep_time: pd.Timestamp,
+        candle_time: pd.Timestamp,
+        body: float,
+        candle_range: float,
+        atr: float,
+    ) -> str:
+        body_pct = body / candle_range * 100 if candle_range else 0
+        atr_pct = candle_range / atr * 100 if atr else 0
+        is_buy = direction == Signal.BUY
+        sweep_dir = "ниже" if is_buy else "выше"
+        structure_ext = "минимум" if is_buy else "максимум"
+        impulse_dir = "вверх" if is_buy else "вниз"
+        sweep_ts = sweep_time.strftime("%Y-%m-%d %H:%M")
+        candle_ts = candle_time.strftime("%Y-%m-%d %H:%M")
+        return (
+            f"1H свип {sweep_dir} структурного {structure_ext}а {sweep_level:.2f} "
+            f"(глубина {SWEEP_LOOKBACK} свечей, время свипа {sweep_ts}); "
+            f"30m импульсная свеча {impulse_dir} в {candle_ts} "
+            f"(тело {body_pct:.0f}% диапазона, диапазон {atr_pct:.0f}% ATR); "
+            f"вход на {ENTRY_RETRACEMENT*100:.0f}% ретрейсменте импульсной свечи"
+        )
