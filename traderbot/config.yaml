@@ -33,7 +33,7 @@ tickers:
     strategy: "ict_v2_sw4_rr35"
   TATN:
     figi: "BBG004RVFFC0"
-    strategy: "ict_v2_sw4_rr2"
+    strategy: "tatn_strat"
 
 
 # === Уведомления ===
