@@ -69,7 +69,7 @@ def main():
         sys.exit(1)
 
     # Инициализировать брокер (sandbox для получения данных)
-    broker = TBankBroker(config.broker.token, sandbox=True, app_name=config.broker.app_name)
+    broker = TBankBroker(config.market_data.token_env, sandbox=True, app_name=config.market_data.app_name)
     feed = DataFeed(broker)
 
     # Загрузить размеры лотов и свечи для всех тикеров

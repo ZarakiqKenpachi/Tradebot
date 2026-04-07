@@ -84,6 +84,7 @@ class BacktestEngine:
         trades: list[TradeRecord] = []
         position: _VirtualPosition | None = None
         pending: tuple[Setup, int] | None = None  # (setup, qty) — ожидаем заполнения лимитки
+        used_setup_key: tuple | None = None  # блокировка повторного входа в тот же сетап
         min_bars = 20
 
         for i in range(min_bars, len(df_entry)):
@@ -98,6 +99,7 @@ class BacktestEngine:
                 if exit_trade:
                     trades.append(exit_trade)
                     balance += exit_trade.pnl
+                    used_setup_key = (position.direction, position.entry_price, position.stop_price)
                     position = None
                 elif position.candles_held >= self.max_candles_timeout:
                     if not bar_1m.empty:
@@ -109,6 +111,7 @@ class BacktestEngine:
                     trade = self._close(position, exit_price, "timeout", exit_ts)
                     trades.append(trade)
                     balance += trade.pnl
+                    used_setup_key = None  # таймаут — разрешаем переоткрытие
                     position = None
                 continue
 
@@ -122,6 +125,15 @@ class BacktestEngine:
                 elif result is not None:
                     position = result
                     pending = None
+                    # Проверить оставшиеся 1m-свечи того же бара после точки входа
+                    remaining = self._remaining_1m(bar_1m, result.entry_time)
+                    if not remaining.empty:
+                        exit_trade = self._scan_exit(position, remaining)
+                        if exit_trade:
+                            trades.append(exit_trade)
+                            balance += exit_trade.pnl
+                            used_setup_key = (position.direction, position.entry_price, position.stop_price)
+                            position = None
                     continue
                 else:
                     continue  # Ещё ждём заполнения
@@ -135,7 +147,14 @@ class BacktestEngine:
             window = {tf: df[df.index <= current_time] for tf, df in candles_dict.items() if tf != "1m"}
             setup = strategy.find_setup(window)
             if setup is None:
+                used_setup_key = None  # сетап сменился — снимаем блокировку
                 continue
+
+            # Пропустить сетап, если это тот же, по которому уже был SL/TP
+            setup_key = (setup.direction, setup.entry_price, setup.stop_price)
+            if used_setup_key == setup_key:
+                continue
+            used_setup_key = None  # новый сетап — сбрасываем
             qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price, lot_size)
             if qty < 1:
                 continue
@@ -148,6 +167,15 @@ class BacktestEngine:
                 pass  # Не вошли
             elif result is not None:
                 position = result
+                # Проверить оставшиеся 1m-свечи того же бара после точки входа
+                remaining = self._remaining_1m(bar_1m, result.entry_time)
+                if not remaining.empty:
+                    exit_trade = self._scan_exit(position, remaining)
+                    if exit_trade:
+                        trades.append(exit_trade)
+                        balance += exit_trade.pnl
+                        used_setup_key = (position.direction, position.entry_price, position.stop_price)
+                        position = None
             else:
                 pending = (setup, qty)  # Ждём следующих баров
 
@@ -166,6 +194,15 @@ class BacktestEngine:
         return trades
 
     # ── Вспомогательные методы ──────────────────────────────────────────────
+
+    def _remaining_1m(
+        self, bar_1m: pd.DataFrame, entry_time: datetime
+    ) -> pd.DataFrame:
+        """1m-свечи в том же баре, строго после момента входа."""
+        if bar_1m is None or bar_1m.empty:
+            return pd.DataFrame()
+        entry_ts = pd.Timestamp(entry_time)
+        return bar_1m[bar_1m.index > entry_ts]
 
     def _get_1m_slice(
         self, df_1m: pd.DataFrame | None, df_entry: pd.DataFrame, i: int
