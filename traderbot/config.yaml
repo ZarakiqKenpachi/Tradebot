@@ -1,0 +1,81 @@
+# === База данных ===
+database:
+  path: "data/traderbot.db"
+
+# === Market data (свечи — один токен для всех) ===
+market_data:
+  token_env: "TBANK_MARKET_TOKEN"
+  app_name: "TraderBot-MD"
+
+# === Админские аккаунты (self-run, бесплатно) ===
+# chat_ids_env — CSV chat_id всех администраторов для broadcast-уведомлений
+# Каждый токен в tokens[] — отдельный торговый аккаунт T-Bank
+admin:
+  chat_ids_env: "TELEGRAM_ADMIN_CHAT_IDS"
+  tokens:
+    - token_env: "TBANK_ADMIN_TOKEN_1"
+      name: "primary"
+      chat_id_env: "TELEGRAM_ADMIN_CHAT_ID_1"
+    # Второй администратор (раскомментировать и заполнить .env):
+    # - token_env: "TBANK_ADMIN_TOKEN_2"
+    #   name: "secondary"
+    #   chat_id_env: "TELEGRAM_ADMIN_CHAT_ID_2"
+
+# === Подписка ===
+subscription:
+  price_rub: 0         # задать позже
+  period_days: 30
+  provider: "manual"   # manual | yookassa | ...
+
+# === Риск-менеджмент ===
+risk:
+  risk_pct: 0.10
+  max_position_pct: 0.40
+  max_consecutive_sl: 3
+
+# === Торговые инструменты ===
+tickers:
+  SBER:
+    figi: "BBG004730N88"
+    strategy: "ict_v2_sw10_rr2"
+  GAZP:
+    figi: "BBG004730RP0"
+    strategy: "ict_gazp"
+  GMKN:
+    figi: "BBG004731489"
+    strategy: "gmkn_pro_trend_strat"
+  VTBR:
+    figi: "BBG004730ZJ9"
+    strategy: "ict_v2_sw4_rr35"
+  ROSN:
+    figi: "BBG004731354"
+    strategy: "ict"
+  NVTK:
+    figi: "BBG00475KKY8"
+    strategy: "nvtk_pro_strategy"
+  TATN:
+    figi: "BBG004RVFFC0"
+    strategy: "tatn_strat"
+
+# === Уведомления ===
+notifications:
+  telegram:
+    enabled: true
+    token_env: "TELEGRAM_BOT_TOKEN"
+    admin_chat_id_env: "TELEGRAM_ADMIN_CHAT_ID"
+
+# === Журнал сделок ===
+journal:
+  path: "journal/trades.csv"
+
+# === Основной цикл ===
+trading:
+  poll_interval_sec: 60
+  max_candles_timeout: 12
+  commission_pct: 0.0004
+
+# === Бэктест ===
+backtest:
+  initial_balance: 100000.0
+  days: 30
+  output_dir: "backtest/results"

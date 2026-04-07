@@ -1,0 +1,52 @@
+# Environment — NEVER commit real tokens
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Runtime data (personal, machine-specific)
+traderbot/logs/
+logs/
+traderbot/journal/*.csv
+traderbot/state/positions.json
+traderbot/state/*.migrated
+state/*.migrated
+
+# SQLite database (contains client tokens — never commit)
+traderbot/data/traderbot.db
+data/traderbot.db
+data/traderbot.db-shm
+data/traderbot.db-wal
+traderbot/data/traderbot.db-shm
+traderbot/data/traderbot.db-wal
+
+# Trade journal CSV (personal trading data)
+journal/
+traderbot/journal/*.csv
+
+# Backups
+backups/
+
+# Backtest results
+backtest/results/
+traderbot/backtest/results/
+
+# Claude Code internals
+.claude/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
