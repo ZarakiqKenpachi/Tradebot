@@ -198,10 +198,18 @@ def register(
                         f"P&L: {pnl:+.2f}₽ ({row['exit_reason']})"
                     )
         else:
-            # Подписчик видит только количество открытых позиций
+            # Подписчик: количество позиций, тикеры (без направления), P&L за сегодня
             if client.status == ClientStatus.ACTIVE:
                 pos_count = len(em.positions) if em else 0
                 lines.append(f"\nОткрытых позиций: {pos_count}")
+                if em and em.positions:
+                    tickers = [p.ticker for p in em.positions.values()]
+                    lines.append(f"Тикеры: {', '.join(tickers)}")
+
+                # P&L за сегодня
+                today_pnl = _get_today_pnl(db, client.id)
+                if today_pnl is not None:
+                    lines.append(f"\nP&L за сегодня: {today_pnl:+.2f} ₽")
 
         bot.reply_to(message, "\n".join(lines))
 
@@ -267,6 +275,65 @@ def register(
         fsm.set_onboarding(chat_id, OnboardingState.TOKEN_UPDATE)
 
     # ------------------------------------------------------------------
+    # /mybalance — текущий баланс портфеля
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["mybalance"])
+    def handle_mybalance(message):
+        chat_id = message.chat.id
+        client = registry.get_by_chat_id(chat_id)
+        if client is None:
+            bot.reply_to(message, "Сначала отправьте /start.")
+            return
+        if client.status != ClientStatus.ACTIVE:
+            bot.reply_to(message, f"Команда доступна только при активной подписке.\nТекущий статус: {_status_label(client.status)}")
+            return
+
+        em = execs.get(client.id)
+        if em is None:
+            bot.reply_to(message, "Ваш аккаунт пока не подключён к торговому циклу.\nПопробуйте через минуту.")
+            return
+
+        try:
+            balance = em.broker.get_portfolio_balance(em.account_id)
+            bot.reply_to(message, f"💼 Баланс портфеля: {balance:,.2f} ₽")
+        except Exception:
+            bot.reply_to(message, "Не удалось получить баланс. Попробуйте позже.")
+
+    # ------------------------------------------------------------------
+    # /mystats — финансовая статистика (без деталей стратегии)
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["mystats"])
+    def handle_mystats(message):
+        chat_id = message.chat.id
+        client = registry.get_by_chat_id(chat_id)
+        if client is None:
+            bot.reply_to(message, "Сначала отправьте /start.")
+            return
+        if client.status not in (ClientStatus.ACTIVE, ClientStatus.PAUSED):
+            bot.reply_to(message, f"Статистика доступна только активным подписчикам.\nТекущий статус: {_status_label(client.status)}")
+            return
+
+        stats = _get_client_financial_stats(db, client.id)
+        if stats["total"] == 0:
+            bot.reply_to(message, "📊 Сделок пока нет.")
+            return
+
+        lines = [
+            "📊 Ваша статистика",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"Всего сделок: {stats['total']}",
+            f"✅ Прибыльных: {stats['wins']} ({stats['win_rate']:.0f}%)",
+            f"❌ Убыточных: {stats['losses']}",
+            f"\nОбщий P&L: {stats['total_pnl']:+.2f} ₽",
+            f"Средний P&L за сделку: {stats['avg_pnl']:+.2f} ₽",
+            f"Лучшая сделка: {stats['best_pnl']:+.2f} ₽",
+            f"Худшая сделка: {stats['worst_pnl']:+.2f} ₽",
+        ]
+        bot.reply_to(message, "\n".join(lines))
+
+    # ------------------------------------------------------------------
     # /pause — клиент сам приостанавливает торговлю
     # ------------------------------------------------------------------
 
@@ -330,6 +397,54 @@ def register(
 # Вспомогательные функции
 # ---------------------------------------------------------------------------
 
+def _get_today_pnl(db: Database, client_id: int) -> float | None:
+    """P&L клиента за сегодня (UTC day)."""
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(SUM(pnl), 0) AS total, COUNT(*) AS cnt "
+            "FROM trades WHERE client_id = ? AND exit_time >= ?",
+            (client_id, today_start.isoformat()),
+        )
+        row = cur.fetchone()
+    if row and int(row["cnt"]) > 0:
+        return float(row["total"])
+    return None
+
+
+def _get_client_financial_stats(db: Database, client_id: int) -> dict:
+    """Финансовая статистика клиента (без деталей стратегии)."""
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(AVG(pnl), 2) AS avg_pnl,
+                   ROUND(SUM(pnl), 2) AS total_pnl,
+                   ROUND(MAX(pnl), 2) AS best_pnl,
+                   ROUND(MIN(pnl), 2) AS worst_pnl
+            FROM trades WHERE client_id = ?
+            """,
+            (client_id,),
+        )
+        row = cur.fetchone()
+    total = int(row["total"]) if row and row["total"] else 0
+    if total == 0:
+        return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+                "avg_pnl": 0.0, "total_pnl": 0.0, "best_pnl": 0.0, "worst_pnl": 0.0}
+    wins = int(row["wins"] or 0)
+    return {
+        "total": total,
+        "wins": wins,
+        "losses": total - wins,
+        "win_rate": wins / total * 100,
+        "avg_pnl": float(row["avg_pnl"] or 0),
+        "total_pnl": float(row["total_pnl"] or 0),
+        "best_pnl": float(row["best_pnl"] or 0),
+        "worst_pnl": float(row["worst_pnl"] or 0),
+    }
+
+
 def _get_recent_trades(db: Database, client_id: int, limit: int = 5) -> list:
     with db.cursor() as cur:
         cur.execute(
@@ -376,8 +491,10 @@ def _client_help_text(status: ClientStatus) -> str:
         "  /pay — оформить/продлить подписку\n"
         "  /setup — настроить торговый токен\n"
         "  /nickname — изменить никнейм\n"
-        "  /mytoken — заменить T-Bank токен (подписка сохраняется)\n"
-        "  /status — текущие позиции и статистика\n"
+        "  /mytoken — заменить T-Bank токен\n"
+        "  /status — текущие позиции и P&L\n"
+        "  /mybalance — баланс портфеля\n"
+        "  /mystats — ваша статистика\n"
         "  /pause — приостановить торговлю\n"
         "  /resume — возобновить торговлю\n"
         "  /help — эта справка"
@@ -392,22 +509,27 @@ def _admin_help_text() -> str:
         "Клиенты:\n"
         "  /clients — список всех клиентов\n"
         "  /client <id> — детали клиента\n"
-        "  /grant <chat_id> <days> — выдать/продлить подписку\n"
+        "  /grant <chat_id> <days> — подписка\n"
         "  /revoke <chat_id> — отозвать доступ\n"
-        "  /reset_client <chat_id> — сбросить профиль (онбординг заново)\n"
-        "  /delete_client <chat_id> — удалить профиль полностью\n"
-        "  /pause_client <chat_id> — приостановить клиента\n"
-        "  /resume_client <chat_id> — возобновить клиента\n\n"
-        "Статистика:\n"
+        "  /reset_client <chat_id> — сброс профиля\n"
+        "  /delete_client <chat_id> — удалить профиль\n"
+        "  /pause_client / /resume_client <chat_id>\n\n"
+        "Аналитика:\n"
         "  /admin — общая сводка\n"
-        "  /pnl_all — P&L по всем клиентам\n"
-        "  /balance_all — балансы всех клиентов\n\n"
+        "  /today — итоги текущего дня\n"
+        "  /positions — открытые позиции с P&L\n"
+        "  /pnl_all [день|неделя|месяц] — P&L по клиентам\n"
+        "  /stats [тикер] — статистика по тикеру\n"
+        "  /equity [client_id] — кривая эквити\n"
+        "  /balance_all — балансы клиентов\n\n"
         "Управление:\n"
+        "  /config — текущая конфигурация\n"
+        "  /logs [N] — последние строки лога\n"
         "  /nickname — изменить никнейм\n"
-        "  /mytoken — установить/обновить T-Bank токен\n"
-        "  /broadcast <текст> — разослать всем активным\n"
-        "  /export_trades <chat_id> — выгрузить сделки клиента в CSV\n"
-        "  /reload_clients — форсировать обновление реестра\n"
+        "  /mytoken — T-Bank токен\n"
+        "  /broadcast <текст> — рассылка\n"
+        "  /export_trades <chat_id> — CSV сделок\n"
+        "  /reload_clients — обновить реестр\n"
         "  /status — ваши позиции\n"
         "  /help — эта справка"
     )

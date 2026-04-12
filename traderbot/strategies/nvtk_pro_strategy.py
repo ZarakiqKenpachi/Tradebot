@@ -255,7 +255,11 @@ class NVTKProStrategy(BaseStrategy):
                 entry_price=round(entry, 4),
                 stop_price=round(stop, 4),
                 target_price=round(target, 4),
-                entry_reason="NVTK PRO v3: trend continuation buy",
+                entry_reason=(
+                    f"NVTK тренд BUY: 30m импульс в {impulse_idx.strftime('%H:%M')} "
+                    f"(зона OTE {zone_low:.2f}–{zone_high:.2f}); "
+                    f"15m подтверждение в {confirm_idx.strftime('%H:%M')}"
+                ),
             )
             zone_key = f"trend_buy_{impulse_idx}_{round(zone_low,1)}_{round(zone_high,1)}"
             return CandidateSetup(setup, zone_key, stop, Signal.BUY)
@@ -300,7 +304,11 @@ class NVTKProStrategy(BaseStrategy):
                 entry_price=round(entry, 4),
                 stop_price=round(stop, 4),
                 target_price=round(target, 4),
-                entry_reason="NVTK PRO v3: trend continuation sell",
+                entry_reason=(
+                    f"NVTK тренд SELL: 30m импульс в {impulse_idx.strftime('%H:%M')} "
+                    f"(зона OTE {zone_low:.2f}–{zone_high:.2f}); "
+                    f"15m подтверждение в {confirm_idx.strftime('%H:%M')}"
+                ),
             )
             zone_key = f"trend_sell_{impulse_idx}_{round(zone_low,1)}_{round(zone_high,1)}"
             return CandidateSetup(setup, zone_key, stop, Signal.SELL)
@@ -394,7 +402,11 @@ class NVTKProStrategy(BaseStrategy):
                 entry_price=round(entry, 4),
                 stop_price=round(stop, 4),
                 target_price=round(target, 4),
-                entry_reason="NVTK PRO v3: range reversal sell",
+                entry_reason=(
+                    f"NVTK флэт SELL: диапазон {range_low:.2f}–{range_high:.2f}; "
+                    f"отбой от максимума {struct_high:.2f} "
+                    f"в {df_30m.index[-1].strftime('%H:%M')}"
+                ),
             )
             zone_key = f"range_sell_{round(struct_high,1)}_{df_30m.index[-1]}"
             return CandidateSetup(setup, zone_key, stop, Signal.SELL)
@@ -427,7 +439,11 @@ class NVTKProStrategy(BaseStrategy):
                 entry_price=round(entry, 4),
                 stop_price=round(stop, 4),
                 target_price=round(target, 4),
-                entry_reason="NVTK PRO v3: range reversal buy",
+                entry_reason=(
+                    f"NVTK флэт BUY: диапазон {range_low:.2f}–{range_high:.2f}; "
+                    f"отбой от минимума {struct_low:.2f} "
+                    f"в {df_30m.index[-1].strftime('%H:%M')}"
+                ),
             )
             zone_key = f"range_buy_{round(struct_low,1)}_{df_30m.index[-1]}"
             return CandidateSetup(setup, zone_key, stop, Signal.BUY)

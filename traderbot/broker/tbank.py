@@ -220,6 +220,21 @@ class TBankBroker:
                 account_id=account_id
             ).securities)
 
+    def get_last_price(self, figi: str) -> float | None:
+        """Получить последнюю цену инструмента (последняя закрытая 1m-свеча за 30 мин).
+
+        Возвращает None если данных нет (нерабочее время, нет свечей).
+        """
+        with self._client() as client:
+            candles = list(client.get_all_candles(
+                figi=figi,
+                from_=now() - timedelta(minutes=30),
+                interval=CandleInterval.CANDLE_INTERVAL_1_MIN,
+            ))
+        if not candles:
+            return None
+        return _quotation_to_float(candles[-1].close)
+
     # ------------------------------------------------------------------
     # Песочница
     # ------------------------------------------------------------------

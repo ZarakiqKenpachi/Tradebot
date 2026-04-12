@@ -12,6 +12,8 @@
 /pause_client <chat_id> — приостановить
 /resume_client <chat_id>— возобновить
 /broadcast <текст>      — разослать всем активным
+/today          — итоги текущего торгового дня (P&L, сделки, разбивка по тикерам)
+/positions      — все открытые позиции с нереализованным P&L
 /pnl_all [день|неделя|месяц] — P&L по клиентам
 /balance_all    — балансы всех активных клиентов
 /export_trades <chat_id> — выгрузить сделки клиента в CSV
@@ -24,6 +26,7 @@ import io
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import telebot
 
@@ -684,6 +687,79 @@ def register(
         _send_long(bot, message.chat.id, "\n".join(lines))
 
     # ------------------------------------------------------------------
+    # /today — итоги текущего торгового дня
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["today"])
+    def handle_today(message):
+        if not require_admin(message):
+            return
+        MSK = ZoneInfo("Europe/Moscow")
+        now_msk = datetime.now(timezone.utc).astimezone(MSK)
+        text = _build_daily_report(db, registry, now_msk)
+        _send_long(bot, message.chat.id, text)
+
+    # ------------------------------------------------------------------
+    # /positions — открытые позиции с нереализованным P&L
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["positions"])
+    def handle_positions(message):
+        if not require_admin(message):
+            return
+
+        if not execs:
+            bot.reply_to(message, "Нет активных клиентов в торговом цикле.")
+            return
+
+        has_any = any(em.positions for em in execs.values())
+        if not has_any:
+            bot.reply_to(message, "Открытых позиций нет.")
+            return
+
+        lines = ["📊 Открытые позиции\n"]
+        total_unrealized = 0.0
+
+        for client_id, em in execs.items():
+            if not em.positions:
+                continue
+            client = registry.get_by_id(client_id)
+            name = (client.account_name or client.email or f"#{client_id}") if client else f"#{client_id}"
+            lines.append(f"— {name} —")
+
+            for figi, pos in em.positions.items():
+                # Получить текущую цену
+                current_price = None
+                try:
+                    current_price = em.broker.get_last_price(figi)
+                except Exception:
+                    logger.debug("[ADMIN] positions: get_last_price failed for %s", figi)
+
+                if current_price is not None:
+                    shares = pos.qty * pos.lot_size
+                    if pos.direction.value == "BUY":
+                        unrealized = (current_price - pos.entry_price) * shares
+                    else:
+                        unrealized = (pos.entry_price - current_price) * shares
+                    total_unrealized += unrealized
+                    pnl_str = f"{unrealized:+.2f} ₽"
+                    price_str = f"Тек: {current_price:.2f}"
+                else:
+                    pnl_str = "—"
+                    price_str = "цена недоступна"
+
+                status_icon = "🟢" if pos.status == "active" else "📋"
+                lines.append(
+                    f"  {status_icon} {pos.ticker} {pos.direction.value} | {pos.qty} лот. | {pnl_str}\n"
+                    f"    Вход: {pos.entry_price:.2f} | {price_str}\n"
+                    f"    SL: {pos.stop_price:.2f} | TP: {pos.target_price:.2f}\n"
+                    f"    Свечей: {pos.candles_held} | Причина: {pos.entry_reason or '—'}"
+                )
+
+        lines.append(f"\nНереализованный P&L: {total_unrealized:+.2f} ₽")
+        _send_long(bot, message.chat.id, "\n".join(lines))
+
+    # ------------------------------------------------------------------
     # /balance_all
     # ------------------------------------------------------------------
 
@@ -774,6 +850,150 @@ def register(
 
         reload_event.set()
         bot.reply_to(message, "✅ Сигнал обновления реестра отправлен.\nОбновление произойдёт в течение нескольких секунд.")
+
+    # ------------------------------------------------------------------
+    # /stats [тикер] — статистика по тикеру
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["stats"])
+    def handle_stats(message):
+        if not require_admin(message):
+            return
+
+        parts = message.text.split()
+        if len(parts) < 2:
+            # Общая разбивка по всем тикерам
+            rows = _stats_all_tickers(db)
+            if not rows:
+                bot.reply_to(message, "Сделок нет.")
+                return
+            lines = ["📈 Статистика по тикерам\n"]
+            for r in rows:
+                wr = r["wins"] / r["total"] * 100 if r["total"] else 0
+                icon = "✅" if float(r["total_pnl"]) >= 0 else "❌"
+                lines.append(
+                    f"{icon} {r['ticker']}: {float(r['total_pnl']):+.2f} ₽ | "
+                    f"{r['total']} сд. | WR {wr:.0f}% | "
+                    f"ср. {float(r['avg_pnl']):+.2f} ₽"
+                )
+            _send_long(bot, message.chat.id, "\n".join(lines))
+        else:
+            ticker = parts[1].upper()
+            stats = _stats_for_ticker(db, ticker)
+            if stats["total"] == 0:
+                bot.reply_to(message, f"Сделок по {ticker} не найдено.")
+                return
+            wr = stats["wins"] / stats["total"] * 100
+            lines = [
+                f"📈 Статистика {ticker}",
+                "━━━━━━━━━━━━━━━━━━━━━",
+                f"Всего сделок: {stats['total']}",
+                f"✅ Прибыльных: {stats['wins']} ({wr:.0f}%)",
+                f"❌ Убыточных: {stats['total'] - stats['wins']}",
+                f"\nОбщий P&L: {stats['total_pnl']:+.2f} ₽",
+                f"Средний P&L: {stats['avg_pnl']:+.2f} ₽",
+                f"Лучшая: {stats['best_pnl']:+.2f} ₽",
+                f"Худшая: {stats['worst_pnl']:+.2f} ₽",
+                f"Средняя длительность: {stats['avg_candles']:.1f} свечей",
+            ]
+            bot.reply_to(message, "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # /equity [client_id] — кривая эквити (PNG)
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["equity"])
+    def handle_equity(message):
+        if not require_admin(message):
+            return
+
+        parts = message.text.split()
+        client_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+
+        png = _build_equity_chart(db, client_id)
+        if png is None:
+            bot.reply_to(message, "Недостаточно данных для построения графика.")
+            return
+
+        label = f"клиента #{client_id}" if client_id else "всех клиентов"
+        bot.send_photo(
+            message.chat.id,
+            telebot.types.InputFile(png, file_name="equity.png"),
+            caption=f"📈 Кривая эквити {label}",
+        )
+
+    # ------------------------------------------------------------------
+    # /config — текущая конфигурация
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["config"])
+    def handle_config(message):
+        if not require_admin(message):
+            return
+
+        import yaml
+        from traderbot.config import load_config as _lc
+        import pathlib
+
+        try:
+            config_path = str(pathlib.Path(__file__).parent.parent.parent / "config.yaml")
+            with open(config_path, encoding="utf-8") as f:
+                raw = yaml.safe_load(f)
+        except Exception:
+            bot.reply_to(message, "Ошибка чтения config.yaml.")
+            return
+
+        lines = ["⚙️ Конфигурация\n"]
+
+        # Тикеры
+        tickers = raw.get("tickers", {})
+        lines.append(f"Тикеры ({len(tickers)}):")
+        for name, conf in tickers.items():
+            lines.append(f"  {name}: {conf.get('strategy', '—')}")
+
+        # Риск
+        risk = raw.get("risk", {})
+        lines.append(f"\nРиск:")
+        lines.append(f"  risk_pct: {risk.get('risk_pct', '—')}")
+        lines.append(f"  max_position_pct: {risk.get('max_position_pct', '—')}")
+        lines.append(f"  max_consecutive_sl: {risk.get('max_consecutive_sl', '—')}")
+
+        # Trading
+        trading = raw.get("trading", {})
+        lines.append(f"\nТрейдинг:")
+        lines.append(f"  poll_interval: {trading.get('poll_interval_sec', '—')}s")
+        lines.append(f"  max_candles_timeout: {trading.get('max_candles_timeout', '—')}")
+        lines.append(f"  commission_pct: {trading.get('commission_pct', '—')}")
+
+        _send_long(bot, message.chat.id, "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # /logs [N] — последние строки лога
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["logs"])
+    def handle_logs(message):
+        if not require_admin(message):
+            return
+
+        parts = message.text.split()
+        count = 30
+        if len(parts) > 1 and parts[1].isdigit():
+            count = min(int(parts[1]), 100)
+
+        try:
+            with open("logs/bot.log", "r", encoding="utf-8") as f:
+                all_lines = f.readlines()
+            tail = all_lines[-count:]
+            text = "".join(tail)
+            if not text.strip():
+                bot.reply_to(message, "Лог пуст.")
+                return
+            _send_long(bot, message.chat.id, f"📄 Последние {len(tail)} строк:\n\n{text}")
+        except FileNotFoundError:
+            bot.reply_to(message, "Файл лога не найден.")
+        except Exception:
+            bot.reply_to(message, "Ошибка чтения лога.")
 
 
 # ---------------------------------------------------------------------------
@@ -1004,6 +1224,214 @@ def _status_label_ru(status: ClientStatus) -> str:
         ClientStatus.EXPIRED: "истёк",
         ClientStatus.REVOKED: "отозван",
     }.get(status, status.value)
+
+
+def _stats_all_tickers(db: Database) -> list:
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ticker,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(SUM(pnl), 2) AS total_pnl,
+                   ROUND(AVG(pnl), 2) AS avg_pnl
+            FROM trades
+            GROUP BY ticker
+            ORDER BY total_pnl DESC
+            """
+        )
+        return cur.fetchall()
+
+
+def _stats_for_ticker(db: Database, ticker: str) -> dict:
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                   ROUND(SUM(pnl), 2) AS total_pnl,
+                   ROUND(AVG(pnl), 2) AS avg_pnl,
+                   ROUND(MAX(pnl), 2) AS best_pnl,
+                   ROUND(MIN(pnl), 2) AS worst_pnl,
+                   ROUND(AVG(candles_held), 1) AS avg_candles
+            FROM trades WHERE ticker = ?
+            """,
+            (ticker,),
+        )
+        row = cur.fetchone()
+    total = int(row["total"]) if row and row["total"] else 0
+    if total == 0:
+        return {"total": 0, "wins": 0, "total_pnl": 0.0, "avg_pnl": 0.0,
+                "best_pnl": 0.0, "worst_pnl": 0.0, "avg_candles": 0.0}
+    return {
+        "total": total,
+        "wins": int(row["wins"] or 0),
+        "total_pnl": float(row["total_pnl"] or 0),
+        "avg_pnl": float(row["avg_pnl"] or 0),
+        "best_pnl": float(row["best_pnl"] or 0),
+        "worst_pnl": float(row["worst_pnl"] or 0),
+        "avg_candles": float(row["avg_candles"] or 0),
+    }
+
+
+def _build_equity_chart(db: Database, client_id: int | None = None) -> io.BytesIO | None:
+    """Построить кривую эквити и вернуть PNG как BytesIO (или None если данных нет)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        return None
+
+    with db.cursor() as cur:
+        if client_id:
+            cur.execute(
+                "SELECT pnl, exit_time FROM trades WHERE client_id = ? ORDER BY exit_time ASC",
+                (client_id,),
+            )
+        else:
+            cur.execute("SELECT pnl, exit_time FROM trades ORDER BY exit_time ASC")
+        rows = cur.fetchall()
+
+    if len(rows) < 2:
+        return None
+
+    # Накопленный P&L
+    equity = []
+    dates = []
+    cumulative = 0.0
+    for r in rows:
+        cumulative += float(r["pnl"])
+        equity.append(cumulative)
+        try:
+            dt = datetime.fromisoformat(r["exit_time"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dates.append(dt)
+        except Exception:
+            dates.append(None)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    if all(d is not None for d in dates):
+        ax.plot(dates, equity, linewidth=1.5, color="#2196F3")
+        ax.fill_between(dates, equity, alpha=0.1, color="#2196F3")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d.%m"))
+        fig.autofmt_xdate()
+    else:
+        ax.plot(range(1, len(equity) + 1), equity, linewidth=1.5, color="#2196F3")
+        ax.set_xlabel("Сделки")
+
+    ax.set_ylabel("P&L, ₽")
+    ax.set_title("Кривая эквити")
+    ax.axhline(y=0, color="gray", linewidth=0.5, linestyle="--")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _build_daily_report(db: Database, registry, now_msk: datetime) -> str:
+    """Сформировать текст итогов торгового дня (используется /today и авто-отчёт)."""
+    MSK = ZoneInfo("Europe/Moscow")
+    today_start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_msk.astimezone(timezone.utc)
+    date_str = now_msk.strftime("%d.%m.%Y")
+
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            SELECT ticker, direction, entry_price, exit_price, stop_price, target_price,
+                   qty, pnl, commission, entry_time, exit_time,
+                   entry_reason, exit_reason, candles_held, client_id
+            FROM trades
+            WHERE exit_time >= ?
+            ORDER BY exit_time ASC
+            """,
+            (today_start_utc.isoformat(),),
+        )
+        trades = cur.fetchall()
+
+    if not trades:
+        return f"📊 Итоги дня {date_str}: сделок не было."
+
+    total_pnl = sum(float(t["pnl"]) for t in trades)
+    wins = sum(1 for t in trades if float(t["pnl"]) > 0)
+    losses = len(trades) - wins
+    win_rate = wins / len(trades) * 100
+
+    _exit_labels = {
+        "stop_loss": "стоп-лосс",
+        "take_profit": "тейк-профит",
+        "timeout": "таймаут",
+        "revoked": "принудительно",
+    }
+
+    # Разбивка по тикерам
+    ticker_stats: dict[str, dict] = {}
+    for t in trades:
+        tk = t["ticker"]
+        if tk not in ticker_stats:
+            ticker_stats[tk] = {"pnl": 0.0, "total": 0, "wins": 0}
+        ticker_stats[tk]["pnl"] += float(t["pnl"])
+        ticker_stats[tk]["total"] += 1
+        if float(t["pnl"]) > 0:
+            ticker_stats[tk]["wins"] += 1
+
+    lines = [
+        f"📊 Итоги торгового дня {date_str}",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"Сделок: {len(trades)} | P&L: {total_pnl:+.2f} ₽",
+        f"✅ Прибыльных: {wins} ({win_rate:.0f}%) | ❌ Убыточных: {losses}",
+    ]
+
+    if len(ticker_stats) > 1:
+        lines.append("\n📈 По тикерам:")
+        for tk, s in sorted(ticker_stats.items(), key=lambda x: -x[1]["pnl"]):
+            tk_wr = s["wins"] / s["total"] * 100
+            icon = "✅" if s["pnl"] >= 0 else "❌"
+            lines.append(
+                f"  {icon} {tk}: {s['pnl']:+.2f} ₽ | {s['total']} сд. | WR {tk_wr:.0f}%"
+            )
+
+    lines.append("\n📋 Сделки:")
+
+    for i, t in enumerate(trades, 1):
+        pnl = float(t["pnl"])
+        icon = "✅" if pnl >= 0 else "❌"
+        try:
+            entry_dt = datetime.fromisoformat(t["entry_time"])
+            if entry_dt.tzinfo is None:
+                entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+            entry_msk = entry_dt.astimezone(MSK).strftime("%H:%M")
+        except Exception:
+            entry_msk = "??"
+        try:
+            exit_dt = datetime.fromisoformat(t["exit_time"])
+            if exit_dt.tzinfo is None:
+                exit_dt = exit_dt.replace(tzinfo=timezone.utc)
+            exit_msk = exit_dt.astimezone(MSK).strftime("%H:%M")
+        except Exception:
+            exit_msk = "??"
+
+        # Имя клиента
+        client = registry.get_by_id(t["client_id"])
+        client_name = (client.account_name or client.email or f"#{t['client_id']}") if client else f"#{t['client_id']}"
+
+        exit_label = _exit_labels.get(t["exit_reason"], t["exit_reason"] or "—")
+        lines.append(
+            f"\n{i}. {icon} {t['ticker']} {t['direction']} | P&L: {pnl:+.2f} ₽ | {client_name}\n"
+            f"   Вход {entry_msk} @ {t['entry_price']:.2f} → Выход {exit_msk} @ {t['exit_price']:.2f}\n"
+            f"   SL: {t['stop_price']:.2f} | TP: {t['target_price']:.2f}\n"
+            f"   Причина входа: {t['entry_reason'] or '—'}\n"
+            f"   Выход по: {exit_label} | Длительность: {t['candles_held']} свечей"
+        )
+
+    return "\n".join(lines)
 
 
 def _record_payment(db: Database, client_id: int, period_days: int) -> None:

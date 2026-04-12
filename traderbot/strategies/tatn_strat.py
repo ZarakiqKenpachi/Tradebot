@@ -79,6 +79,9 @@ class ICTStrategyV3Pro(BaseStrategy):
             if r < a * DISPLACEMENT_MIN_ATR_RATIO:
                 continue
 
+            body_pct = body / r * 100
+            atr_pct = r / float(a) * 100
+
             if direction == Signal.BUY:
                 if c["close"] <= c["open"]:
                     continue
@@ -92,13 +95,14 @@ class ICTStrategyV3Pro(BaseStrategy):
 
                 tp = entry + risk * RISK_REWARD
 
-                return Setup(
-                    Signal.BUY,
-                    round(entry, 4),
-                    round(stop, 4),
-                    round(tp, 4),
-                    "V3 PRO"
+                reason = (
+                    f"1H свип ниже структурного минимума {level:.2f} "
+                    f"(время {time.strftime('%H:%M')}); "
+                    f"30m импульс вверх в {idx.strftime('%H:%M')} "
+                    f"(тело {body_pct:.0f}%, диапазон {atr_pct:.0f}% ATR); "
+                    f"вход на {ENTRY_RETRACEMENT * 100:.0f}% ретрейсменте"
                 )
+                return Setup(Signal.BUY, round(entry, 4), round(stop, 4), round(tp, 4), reason)
 
             else:
                 if c["close"] >= c["open"]:
@@ -113,13 +117,14 @@ class ICTStrategyV3Pro(BaseStrategy):
 
                 tp = entry - risk * RISK_REWARD
 
-                return Setup(
-                    Signal.SELL,
-                    round(entry, 4),
-                    round(stop, 4),
-                    round(tp, 4),
-                    "V3 PRO"
+                reason = (
+                    f"1H свип выше структурного максимума {level:.2f} "
+                    f"(время {time.strftime('%H:%M')}); "
+                    f"30m импульс вниз в {idx.strftime('%H:%M')} "
+                    f"(тело {body_pct:.0f}%, диапазон {atr_pct:.0f}% ATR); "
+                    f"вход на {ENTRY_RETRACEMENT * 100:.0f}% ретрейсменте"
                 )
+                return Setup(Signal.SELL, round(entry, 4), round(stop, 4), round(tp, 4), reason)
 
         return None
 

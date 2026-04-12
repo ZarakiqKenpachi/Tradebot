@@ -56,6 +56,24 @@ class ExecutionManager:
             return True
         return False
 
+    # ------------------------------------------------------------------
+    # Уведомления
+    # ------------------------------------------------------------------
+
+    def _notify_trade(self, msg: str, client_msg: str | None = None) -> None:
+        """Отправить уведомление о торговом событии.
+
+        - Подробное сообщение уходит ВСЕМ администраторам через send_admin.
+        - Для подписчиков: отдельное краткое сообщение (client_msg).
+          Если client_msg=None — подписчик НЕ получает уведомление (лимитки и т.п.).
+        """
+        if not self.notifier:
+            return
+        admin_msg = msg if self.is_admin else f"[Клиент {self.client_id}]\n{msg}"
+        self.notifier.send_admin(admin_msg)
+        if not self.is_admin and client_msg is not None:
+            self.notifier.send_to_client(self.client_id, client_msg)
+
     def open_position(self, ticker: str, figi: str, setup: Setup) -> None:
         """Выставить лимитную заявку. SL/TP будут добавлены после исполнения."""
         # 1. Баланс, размер лота и шаг цены
@@ -116,14 +134,7 @@ class ExecutionManager:
             f"Причина: {setup.entry_reason}"
         )
         logger.info("[EXEC] %s", msg)
-        if self.notifier:
-            if self.is_admin:
-                self.notifier.send_to_client(self.client_id, msg)
-            else:
-                self.notifier.send_to_client(
-                    self.client_id,
-                    f"\U0001f4cb Заявка {ticker} {setup.direction.value}",
-                )
+        self._notify_trade(msg)  # подписчик не видит выставление лимитки
 
     def _activate_position(self, figi: str) -> None:
         """Лимитка исполнена — выставить SL/TP и перевести позицию в active."""
@@ -157,14 +168,7 @@ class ExecutionManager:
             f"Причина: {position.entry_reason}"
         )
         logger.info("[EXEC] %s", msg)
-        if self.notifier:
-            if self.is_admin:
-                self.notifier.send_to_client(self.client_id, msg)
-            else:
-                self.notifier.send_to_client(
-                    self.client_id,
-                    f"\U0001f7e2 Открыта позиция {position.ticker} {position.direction.value}",
-                )
+        self._notify_trade(msg, f"\U0001f7e2 Открыта новая позиция {position.ticker}")
 
     def _cancel_pending(self, figi: str) -> None:
         """Отменить неисполненную лимитку по таймауту."""
@@ -182,14 +186,7 @@ class ExecutionManager:
             f"Цена: {position.entry_price} | Не исполнена за {position.pending_candles} свечей"
         )
         logger.info("[EXEC] %s", msg)
-        if self.notifier:
-            if self.is_admin:
-                self.notifier.send_to_client(self.client_id, msg)
-            else:
-                self.notifier.send_to_client(
-                    self.client_id,
-                    f"\u274c Заявка {position.ticker} {position.direction.value} отменена",
-                )
+        self._notify_trade(msg)  # подписчик не видит отмену лимитки
 
     def _is_order_filled(self, order_id: str) -> bool:
         """Проверить, исполнена ли лимитная заявка."""
@@ -240,14 +237,7 @@ class ExecutionManager:
                     f"отменена через терминал\nЦена: {position.entry_price}"
                 )
                 logger.info("[EXEC] %s", msg)
-                if self.notifier:
-                    if self.is_admin:
-                        self.notifier.send_to_client(self.client_id, msg)
-                    else:
-                        self.notifier.send_to_client(
-                            self.client_id,
-                            f"\u274c Заявка {position.ticker} {position.direction.value} отменена",
-                        )
+                self._notify_trade(msg)  # подписчик не видит отмену лимитки
                 return
 
             # Считать свечи ожидания
@@ -383,20 +373,15 @@ class ExecutionManager:
         msg = (
             f"\U0001f534 Закрыта позиция {position.ticker} {position.direction.value}\n"
             f"Вход: {position.entry_price} \u2192 Выход: {exit_price}\n"
-            f"P&L: {pnl_net:+.2f} RUB | Причина закрытия: {reason}\n"
-            f"Причина открытия: {position.entry_reason}\n"
+            f"P&L: {pnl_net:+.2f} RUB | Причина закрытия: {_reason_label.get(reason, reason)}\n"
+            f"Причина входа: {position.entry_reason}\n"
             f"Длительность: {position.candles_held} свечей"
         )
         logger.info("[EXEC] %s", msg)
-        if self.notifier:
-            if self.is_admin:
-                self.notifier.send_to_client(self.client_id, msg)
-            else:
-                self.notifier.send_to_client(
-                    self.client_id,
-                    f"\U0001f534 Закрыта позиция {position.ticker} {position.direction.value}"
-                    f" — {_reason_label.get(reason, reason)}",
-                )
+        client_msg = (
+            f"\U0001f534 Позиция {position.ticker} закрыта | P&L: {pnl_net:+.2f} ₽"
+        )
+        self._notify_trade(msg, client_msg)
 
     def reconcile_with_broker(self, known_tickers_by_figi: dict[str, str]) -> None:
         """Сверить фактические позиции на счёте со state бота.

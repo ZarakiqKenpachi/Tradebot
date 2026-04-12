@@ -14,7 +14,7 @@ import pathlib
 import signal
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, time as dt_time, timezone
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
@@ -44,11 +44,273 @@ logger = logging.getLogger(__name__)
 MAX_CLIENT_ERRORS = 5
 # Как часто (сек) проверять новых активных клиентов в БД
 REGISTRY_REFRESH_SEC = 60
-# Как часто (сек) сверять реальные позиции на бирже со state
-RECONCILE_INTERVAL_SEC = 600
+# Как часто (сек) сверять реальные позиции на бирже со state (только в торговые часы)
+RECONCILE_INTERVAL_SEC = 300
+# Как часто (сек) отправлять heartbeat в торговое время
+HEARTBEAT_INTERVAL_SEC = 3600
+
+# Торговые часы МОEX (МСК)
+MSK = ZoneInfo("Europe/Moscow")
+_MARKET_OPEN = dt_time(7, 0)
+_MARKET_CLOSE = dt_time(23, 50)
+
+# Праздничные дни MOEX 2025–2026 (YYYY-MM-DD), когда биржа закрыта
+# Источник: https://www.moex.com/s719
+_MOEX_HOLIDAYS: frozenset[str] = frozenset({
+    # 2025
+    "2025-01-01", "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07",
+    "2025-01-08",
+    "2025-02-24",
+    "2025-03-10",
+    "2025-05-01", "2025-05-02", "2025-05-08", "2025-05-09",
+    "2025-06-12", "2025-06-13",
+    "2025-11-03", "2025-11-04",
+    "2025-12-31",
+    # 2026
+    "2026-01-01", "2026-01-02", "2026-01-07", "2026-01-08", "2026-01-09",
+    "2026-02-23",
+    "2026-03-09",
+    "2026-05-01", "2026-05-04", "2026-05-11",
+    "2026-06-12",
+    "2026-11-04",
+    "2026-12-31",
+})
 
 # Клиенты, которым уже отправлено уведомление об отсутствии токена (дедупликация)
 _no_token_warned: set[int] = set()
+
+
+# ---------------------------------------------------------------------------
+# Market hours helpers
+# ---------------------------------------------------------------------------
+
+def is_market_open(now_msk: datetime) -> bool:
+    """Проверить, открыта ли сейчас торговая сессия MOEX.
+
+    Учитывает: время (07:00–23:50 МСК), выходные дни, официальные праздники MOEX.
+    """
+    if now_msk.weekday() >= 5:   # суббота=5, воскресенье=6
+        return False
+    if now_msk.strftime("%Y-%m-%d") in _MOEX_HOLIDAYS:
+        return False
+    t = now_msk.time().replace(tzinfo=None)
+    return _MARKET_OPEN <= t < _MARKET_CLOSE
+
+
+def _get_today_pnl(db, now_msk: datetime) -> float:
+    """Суммарный P&L по всем закрытым сделкам за текущий торговый день (МСК)."""
+    today_start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_msk.astimezone(timezone.utc)
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE exit_time >= ?",
+                (today_start_utc.isoformat(),),
+            )
+            row = cur.fetchone()
+        return float(row[0]) if row else 0.0
+    except Exception:
+        logger.exception("[MAIN] _get_today_pnl failed")
+        return 0.0
+
+
+def _send_daily_summary(db, notifier, now_msk: datetime) -> None:
+    """Отправить итоги торгового дня всем администраторам."""
+    if notifier is None:
+        return
+
+    today_start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_msk.astimezone(timezone.utc)
+
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ticker, direction, entry_price, exit_price, stop_price, target_price,
+                       qty, pnl, commission, entry_time, exit_time,
+                       entry_reason, exit_reason, candles_held, client_id
+                FROM trades
+                WHERE exit_time >= ?
+                ORDER BY exit_time ASC
+                """,
+                (today_start_utc.isoformat(),),
+            )
+            trades = cur.fetchall()
+    except Exception:
+        logger.exception("[MAIN] daily_summary: DB query failed")
+        return
+
+    date_str = now_msk.strftime("%d.%m.%Y")
+
+    if not trades:
+        notifier.send_admin(f"📊 Итоги дня {date_str}: сделок не было.")
+        return
+
+    total_pnl = sum(float(t["pnl"]) for t in trades)
+    wins = sum(1 for t in trades if float(t["pnl"]) > 0)
+    losses = len(trades) - wins
+    win_rate = wins / len(trades) * 100
+
+    _exit_labels = {
+        "stop_loss": "стоп-лосс",
+        "take_profit": "тейк-профит",
+        "timeout": "таймаут",
+        "revoked": "принудительно",
+    }
+
+    # Разбивка по тикерам
+    ticker_stats: dict[str, dict] = {}
+    for t in trades:
+        tk = t["ticker"]
+        if tk not in ticker_stats:
+            ticker_stats[tk] = {"pnl": 0.0, "total": 0, "wins": 0}
+        ticker_stats[tk]["pnl"] += float(t["pnl"])
+        ticker_stats[tk]["total"] += 1
+        if float(t["pnl"]) > 0:
+            ticker_stats[tk]["wins"] += 1
+
+    lines = [
+        f"📊 Итоги торгового дня {date_str}",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"Сделок: {len(trades)} | P&L: {total_pnl:+.2f} ₽",
+        f"✅ Прибыльных: {wins} ({win_rate:.0f}%) | ❌ Убыточных: {losses}",
+    ]
+
+    if len(ticker_stats) > 1:
+        lines.append("\n📈 По тикерам:")
+        for tk, s in sorted(ticker_stats.items(), key=lambda x: -x[1]["pnl"]):
+            tk_wr = s["wins"] / s["total"] * 100
+            icon = "✅" if s["pnl"] >= 0 else "❌"
+            lines.append(
+                f"  {icon} {tk}: {s['pnl']:+.2f} ₽ | {s['total']} сд. | WR {tk_wr:.0f}%"
+            )
+
+    lines.append("\n📋 Сделки:")
+
+    for i, t in enumerate(trades, 1):
+        pnl = float(t["pnl"])
+        icon = "✅" if pnl >= 0 else "❌"
+        try:
+            entry_dt = datetime.fromisoformat(t["entry_time"])
+            if entry_dt.tzinfo is None:
+                entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+            entry_msk = entry_dt.astimezone(MSK).strftime("%H:%M")
+        except Exception:
+            entry_msk = "??"
+        try:
+            exit_dt = datetime.fromisoformat(t["exit_time"])
+            if exit_dt.tzinfo is None:
+                exit_dt = exit_dt.replace(tzinfo=timezone.utc)
+            exit_msk = exit_dt.astimezone(MSK).strftime("%H:%M")
+        except Exception:
+            exit_msk = "??"
+
+        exit_label = _exit_labels.get(t["exit_reason"], t["exit_reason"] or "—")
+        lines.append(
+            f"\n{i}. {icon} {t['ticker']} {t['direction']} | P&L: {pnl:+.2f} ₽\n"
+            f"   Вход {entry_msk} @ {t['entry_price']:.2f} → Выход {exit_msk} @ {t['exit_price']:.2f}\n"
+            f"   SL: {t['stop_price']:.2f} | TP: {t['target_price']:.2f}\n"
+            f"   Причина входа: {t['entry_reason'] or '—'}\n"
+            f"   Выход по: {exit_label} | Длительность: {t['candles_held']} свечей"
+        )
+
+    notifier.send_admin("\n".join(lines))
+    logger.info("[MAIN] Daily summary sent: %d trades, P&L=%.2f RUB, WR=%.0f%%",
+                len(trades), total_pnl, win_rate)
+
+
+def _send_weekly_summary(db, notifier, now_msk: datetime) -> None:
+    """Отправить итоги торговой недели всем администраторам (пятница после закрытия)."""
+    if notifier is None:
+        return
+
+    from datetime import timedelta
+
+    # Начало недели (понедельник 00:00 МСК)
+    days_since_monday = now_msk.weekday()
+    week_start_msk = (now_msk - timedelta(days=days_since_monday)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    week_start_utc = week_start_msk.astimezone(timezone.utc)
+
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ticker, direction, pnl, exit_time, exit_reason
+                FROM trades
+                WHERE exit_time >= ?
+                ORDER BY exit_time ASC
+                """,
+                (week_start_utc.isoformat(),),
+            )
+            trades = cur.fetchall()
+    except Exception:
+        logger.exception("[MAIN] weekly_summary: DB query failed")
+        return
+
+    week_label = f"{week_start_msk.strftime('%d.%m')}–{now_msk.strftime('%d.%m.%Y')}"
+
+    if not trades:
+        notifier.send_admin(f"📊 Итоги недели {week_label}: сделок не было.")
+        return
+
+    total_pnl = sum(float(t["pnl"]) for t in trades)
+    wins = sum(1 for t in trades if float(t["pnl"]) > 0)
+    losses = len(trades) - wins
+    win_rate = wins / len(trades) * 100
+
+    # По тикерам
+    ticker_stats: dict[str, dict] = {}
+    for t in trades:
+        tk = t["ticker"]
+        if tk not in ticker_stats:
+            ticker_stats[tk] = {"pnl": 0.0, "total": 0, "wins": 0}
+        ticker_stats[tk]["pnl"] += float(t["pnl"])
+        ticker_stats[tk]["total"] += 1
+        if float(t["pnl"]) > 0:
+            ticker_stats[tk]["wins"] += 1
+
+    # По дням
+    day_pnl: dict[str, float] = {}
+    for t in trades:
+        try:
+            dt = datetime.fromisoformat(t["exit_time"])
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            day_key = dt.astimezone(MSK).strftime("%d.%m %a")
+        except Exception:
+            day_key = "??"
+        day_pnl[day_key] = day_pnl.get(day_key, 0.0) + float(t["pnl"])
+
+    lines = [
+        f"📊 Итоги недели {week_label}",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"Сделок: {len(trades)} | P&L: {total_pnl:+.2f} ₽",
+        f"✅ Прибыльных: {wins} ({win_rate:.0f}%) | ❌ Убыточных: {losses}",
+    ]
+
+    # По дням
+    lines.append("\n📅 По дням:")
+    for day, pnl in day_pnl.items():
+        icon = "✅" if pnl >= 0 else "❌"
+        lines.append(f"  {icon} {day}: {pnl:+.2f} ₽")
+
+    best_day = max(day_pnl.items(), key=lambda x: x[1])
+    worst_day = min(day_pnl.items(), key=lambda x: x[1])
+    lines.append(f"\nЛучший день: {best_day[0]} ({best_day[1]:+.2f} ₽)")
+    lines.append(f"Худший день: {worst_day[0]} ({worst_day[1]:+.2f} ₽)")
+
+    # По тикерам
+    if len(ticker_stats) > 1:
+        lines.append("\n📈 По тикерам:")
+        for tk, s in sorted(ticker_stats.items(), key=lambda x: -x[1]["pnl"]):
+            tk_wr = s["wins"] / s["total"] * 100
+            icon = "✅" if s["pnl"] >= 0 else "❌"
+            lines.append(f"  {icon} {tk}: {s['pnl']:+.2f} ₽ | {s['total']} сд. | WR {tk_wr:.0f}%")
+
+    notifier.send_admin("\n".join(lines))
+    logger.info("[MAIN] Weekly summary sent: %d trades, P&L=%.2f RUB", len(trades), total_pnl)
 
 
 # ---------------------------------------------------------------------------
@@ -568,10 +830,47 @@ def main() -> None:
     # 10. Основной цикл
     last_reconcile = 0.0
     last_refresh = 0.0
+    last_heartbeat = 0.0
+    _market_was_open: bool | None = None   # None = первая итерация
 
     try:
         while not _stop.is_set():
             try:
+                now_msk = datetime.now(timezone.utc).astimezone(MSK)
+                market_open = is_market_open(now_msk)
+
+                # Детектировать открытие рынка → уведомление с балансами
+                if _market_was_open is False and market_open:
+                    logger.info("[MAIN] Market opened at %s MSK", now_msk.strftime("%H:%M"))
+                    if notifier:
+                        lines = [
+                            f"🟢 Рынок открылся ({now_msk.strftime('%H:%M')} МСК)",
+                            f"Активных клиентов в цикле: {len(execs)}",
+                        ]
+                        total_balance = 0.0
+                        for cid, em in execs.items():
+                            client = registry.get_by_id(cid)
+                            name = (client.account_name or client.email or f"#{cid}") if client else f"#{cid}"
+                            try:
+                                bal = em.broker.get_portfolio_balance(em.account_id)
+                                total_balance += bal
+                                lines.append(f"  💼 {name}: {bal:,.2f} ₽")
+                            except Exception:
+                                lines.append(f"  💼 {name}: баланс недоступен")
+                        if execs:
+                            lines.append(f"Итого: {total_balance:,.2f} ₽")
+                        notifier.send_admin("\n".join(lines))
+
+                # Детектировать закрытие рынка → дневная статистика + недельная по пятницам
+                if _market_was_open is True and not market_open:
+                    logger.info("[MAIN] Market closed at %s MSK, sending daily summary",
+                                now_msk.strftime("%H:%M"))
+                    _send_daily_summary(db, notifier, now_msk)
+                    # Пятница → недельный отчёт
+                    if now_msk.weekday() == 4:
+                        _send_weekly_summary(db, notifier, now_msk)
+                _market_was_open = market_open
+
                 # Подтянуть новых клиентов / убрать неактивных
                 # (по таймеру или по сигналу от /reload_clients)
                 if time.time() - last_refresh >= REGISTRY_REFRESH_SEC or reload_event.is_set():
@@ -581,7 +880,12 @@ def main() -> None:
                     sync_execs(execs, registry, config, sqlite_state, multi_journal, notifier)
                     last_refresh = time.time()
 
-                # Периодическая сверка со счётом (per-client)
+                # Вне торговых часов: пропускаем API-вызовы, тихо ждём
+                if not market_open:
+                    _stop.wait(timeout=config.poll_interval_sec)
+                    continue
+
+                # Периодическая сверка со счётом (per-client, только в торговое время)
                 if time.time() - last_reconcile >= RECONCILE_INTERVAL_SEC:
                     for client_id, em in list(execs.items()):
                         try:
@@ -591,9 +895,31 @@ def main() -> None:
                             handle_client_error(client_id, registry, execs, notifier)
                     last_reconcile = time.time()
 
-                now_msk = datetime.now(timezone.utc).astimezone(ZoneInfo("Europe/Moscow"))
-                is_weekend = now_msk.weekday() >= 5
+                # Heartbeat раз в час + проверка связи с API
+                if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+                    if notifier:
+                        open_pos = sum(len(em.positions) for em in execs.values())
+                        pnl_today = _get_today_pnl(db, now_msk)
 
+                        # Проверка связи с T-Bank API (market data broker)
+                        api_ok = False
+                        try:
+                            md_broker.get_account_id()
+                            api_ok = True
+                        except Exception:
+                            logger.warning("[MAIN] Heartbeat: T-Bank API health check failed")
+
+                        api_status = "✅" if api_ok else "⚠️ API!"
+                        notifier.send_admin(
+                            f"{'✅' if api_ok else '⚠️'} {now_msk.strftime('%H:%M')} МСК | "
+                            f"клиентов: {len(execs)} | "
+                            f"позиций: {open_pos} | "
+                            f"P&L: {pnl_today:+.2f} ₽ | "
+                            f"API: {'OK' if api_ok else 'НЕ ОТВЕЧАЕТ'}"
+                        )
+                    last_heartbeat = time.time()
+
+                # Торговый цикл по тикерам
                 for ticker_name, ticker_conf in config.tickers.items():
                     figi = ticker_conf.figi
                     strategy = strategies[ticker_name]
@@ -613,9 +939,7 @@ def main() -> None:
                     last_candle_time = candles["30m"].index[-1].to_pydatetime()
 
                     # Сигнал — ОДИН РАЗ на тикер
-                    shared_setup = None
-                    if not is_weekend:
-                        shared_setup = strategy.find_setup(candles)
+                    shared_setup = strategy.find_setup(candles)
 
                     # Per-client: обновить/открыть позицию
                     for client_id, em in list(execs.items()):
