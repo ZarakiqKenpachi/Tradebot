@@ -122,3 +122,71 @@ class BacktestReport:
                         round(balance, 2),
                     ])
             logger.info("[REPORT] Exported %s (%d trades)", path, len(ticker_trades))
+
+    def export_trade_log(self, output_dir: str) -> None:
+        """Единый лог всех сделок по всем активам, отсортированный по времени.
+
+        Файл trade_log.csv перезаписывается при каждом запуске бэктеста.
+        Используется для анализа и оптимизации торговой стратегии.
+        """
+        if not self.trades:
+            return
+
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "trade_log.csv")
+
+        sorted_trades = sorted(self.trades, key=lambda t: t.entry_time)
+
+        columns = [
+            "ticker", "direction", "entry_time", "exit_time",
+            "entry_price", "exit_price", "stop_price", "target_price",
+            "qty", "pnl", "commission", "pnl_pct",
+            "exit_reason", "entry_reason", "candles_held",
+            "risk", "reward", "rr_actual",
+            "balance_after",
+        ]
+
+        balance = self.initial_balance
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(columns)
+            for t in sorted_trades:
+                balance += t.pnl
+
+                # Рассчитать risk/reward/RR
+                if t.direction.value == "BUY":
+                    risk = t.entry_price - t.stop_price
+                    reward = t.target_price - t.entry_price
+                else:
+                    risk = t.stop_price - t.entry_price
+                    reward = t.entry_price - t.target_price
+
+                rr_actual = abs(t.pnl / (risk * t.qty)) if risk != 0 and t.qty != 0 else 0
+                if t.pnl < 0:
+                    rr_actual = -rr_actual
+
+                pnl_pct = (t.pnl / self.initial_balance) * 100
+
+                writer.writerow([
+                    t.ticker,
+                    t.direction.value,
+                    t.entry_time.strftime("%Y-%m-%d %H:%M"),
+                    t.exit_time.strftime("%Y-%m-%d %H:%M"),
+                    t.entry_price,
+                    t.exit_price,
+                    t.stop_price,
+                    t.target_price,
+                    t.qty,
+                    round(t.pnl, 2),
+                    round(t.commission, 2),
+                    round(pnl_pct, 3),
+                    t.exit_reason,
+                    t.entry_reason,
+                    t.candles_held,
+                    round(risk, 2),
+                    round(reward, 2),
+                    round(rr_actual, 2),
+                    round(balance, 2),
+                ])
+
+        logger.info("[REPORT] Trade log: %s (%d trades)", path, len(sorted_trades))

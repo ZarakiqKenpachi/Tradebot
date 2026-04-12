@@ -217,18 +217,30 @@ class BacktestEngine:
     def _scan_exit(
         self, pos: _VirtualPosition, bar_1m: pd.DataFrame
     ) -> TradeRecord | None:
-        """Пройтись по 1m-свечам, найти первое касание SL или TP."""
+        """Пройтись по 1m-свечам, найти первое касание SL или TP.
+
+        Если свеча гэпнула через уровень (open уже за SL/TP),
+        используем open свечи как реальную цену исполнения (проскальзывание).
+        """
         for ts, c in bar_1m.iterrows():
             if pos.direction == Signal.BUY:
                 if c["low"] <= pos.stop_price:
-                    return self._close(pos, pos.stop_price, "stop_loss", ts)
+                    # Гэп через SL: open ниже stop_price → исполнение по open
+                    price = min(c["open"], pos.stop_price)
+                    return self._close(pos, price, "stop_loss", ts)
                 if c["high"] >= pos.target_price:
-                    return self._close(pos, pos.target_price, "take_profit", ts)
+                    # Гэп через TP: open выше target → исполнение по open
+                    price = max(c["open"], pos.target_price)
+                    return self._close(pos, price, "take_profit", ts)
             else:
                 if c["high"] >= pos.stop_price:
-                    return self._close(pos, pos.stop_price, "stop_loss", ts)
+                    # SHORT: гэп через SL вверх → open выше stop
+                    price = max(c["open"], pos.stop_price)
+                    return self._close(pos, price, "stop_loss", ts)
                 if c["low"] <= pos.target_price:
-                    return self._close(pos, pos.target_price, "take_profit", ts)
+                    # SHORT: гэп через TP вниз → open ниже target
+                    price = min(c["open"], pos.target_price)
+                    return self._close(pos, price, "take_profit", ts)
         return None
 
     def _scan_fill(

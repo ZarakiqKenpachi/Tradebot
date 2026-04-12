@@ -136,9 +136,61 @@ class ExecutionManager:
         logger.info("[EXEC] %s", msg)
         self._notify_trade(msg)  # подписчик не видит выставление лимитки
 
+    def _get_real_exit_price(self, figi: str, fallback_price: float) -> float:
+        """Получить реальную цену из последней сделки по инструменту.
+
+        Стоп-ордер исполняется маркет-ордером, цена может отличаться от заданной.
+        Если не удаётся получить — возвращает fallback.
+        """
+        try:
+            price = self.broker.get_last_price(figi)
+            if price is not None:
+                return price
+        except Exception:
+            logger.debug("[EXEC] Could not get last price for %s, using fallback", figi)
+        return fallback_price
+
+    def _get_portfolio_qty(self, figi: str) -> int | None:
+        """Получить реальное количество бумаги в портфеле. None при ошибке."""
+        try:
+            securities = self.broker.get_positions(self.account_id)
+            for sec in securities:
+                if sec.figi == figi:
+                    return int(sec.balance)
+            return 0
+        except Exception:
+            logger.exception("[EXEC] Failed to get portfolio qty for figi=%s", figi)
+            return None
+
+    def _has_portfolio_position(self, figi: str) -> bool:
+        """Проверить, есть ли бумага в портфеле на счёте."""
+        try:
+            securities = self.broker.get_positions(self.account_id)
+            for sec in securities:
+                if sec.figi == figi and int(sec.balance) != 0:
+                    return True
+        except Exception:
+            logger.exception("[EXEC] Failed to check portfolio for figi=%s", figi)
+        return False
+
     def _activate_position(self, figi: str) -> None:
         """Лимитка исполнена — выставить SL/TP и перевести позицию в active."""
         position = self.positions[figi]
+
+        # Проверить наличие бумаги в портфеле перед выставлением SL/TP
+        if not self._has_portfolio_position(figi):
+            logger.warning(
+                "[EXEC] %s: no position in portfolio, skipping SL/TP placement",
+                position.ticker,
+            )
+            self.state.remove_position(figi)
+            del self.positions[figi]
+            if self.notifier:
+                self.notifier.send_admin(
+                    f"⚠️ {position.ticker}: лимитка исполнена, но бумаги нет в портфеле.\n"
+                    f"Позиция удалена из state. Проверьте счёт вручную."
+                )
+            return
 
         if position.direction == Signal.BUY:
             stop_dir = StopOrderDirection.STOP_ORDER_DIRECTION_SELL
@@ -263,18 +315,24 @@ class ExecutionManager:
 
         if not sl_active and not tp_active:
             # Оба ордера исчезли — позиция закрыта биржей (SL сработал, TP отменился)
-            logger.info("[EXEC] %s: both SL/TP gone, assuming stop_loss", position.ticker)
-            self._close_position(figi, position.stop_price, "stop_loss")
+            exit_price = self._get_real_exit_price(figi, position.stop_price)
+            logger.info("[EXEC] %s: both SL/TP gone, assuming stop_loss, real price=%.2f",
+                        position.ticker, exit_price)
+            self._close_position(figi, exit_price, "stop_loss")
             return
         if not tp_active and sl_active:
             # TP исчез, SL ещё жив — значит TP сработал
-            logger.info("[EXEC] %s: TP filled (SL still active)", position.ticker)
-            self._close_position(figi, position.target_price, "take_profit")
+            exit_price = self._get_real_exit_price(figi, position.target_price)
+            logger.info("[EXEC] %s: TP filled (SL still active), real price=%.2f",
+                        position.ticker, exit_price)
+            self._close_position(figi, exit_price, "take_profit")
             return
         if not sl_active and tp_active:
             # SL исчез, TP ещё жив — значит SL сработал
-            logger.info("[EXEC] %s: SL filled (TP still active)", position.ticker)
-            self._close_position(figi, position.stop_price, "stop_loss")
+            exit_price = self._get_real_exit_price(figi, position.stop_price)
+            logger.info("[EXEC] %s: SL filled (TP still active), real price=%.2f",
+                        position.ticker, exit_price)
+            self._close_position(figi, exit_price, "stop_loss")
             return
 
         if new_candle:
@@ -286,6 +344,15 @@ class ExecutionManager:
 
         # Проверить таймаут
         if position.candles_held >= self.max_candles_timeout:
+            # Перед закрытием убедиться, что бумага ещё в портфеле
+            real_qty = self._get_portfolio_qty(figi)
+            if real_qty is not None and real_qty == 0:
+                logger.warning("[EXEC] %s: timeout but no position in portfolio, cleaning state",
+                               position.ticker)
+                self._cancel_orders_safe(position)
+                exit_price = self._get_real_exit_price(figi, current_price)
+                self._close_position(figi, exit_price, "stop_loss")
+                return
             logger.info("[EXEC] Timeout for %s after %d candles",
                          position.ticker, position.candles_held)
             self._close_position(figi, current_price, "timeout")
@@ -476,7 +543,19 @@ class ExecutionManager:
                 # Проверить, исполнилась ли лимитка пока бот был выключен
                 if self._is_order_filled(position.entry_order_id):
                     logger.info("[EXEC] Recovery: %s pending order filled, activating", position.ticker)
-                    self._activate_position(figi)
+                    try:
+                        self._activate_position(figi)
+                    except Exception as e:
+                        logger.error("[EXEC] Recovery: failed to activate %s: %s", position.ticker, e)
+                        self.state.remove_position(figi)
+                        del self.positions[figi]
+                        if self.notifier:
+                            self.notifier.send_admin(
+                                f"⚠️ Не удалось выставить SL/TP для {position.ticker} "
+                                f"при восстановлении (цена за пределами лимитов).\n"
+                                f"SL: {position.stop_price} | TP: {position.target_price}\n"
+                                f"Закройте позицию вручную!"
+                            )
                 elif self._is_order_cancelled(position.entry_order_id):
                     logger.info("[EXEC] Recovery: %s pending order was cancelled externally, removing",
                                 position.ticker)
@@ -503,13 +582,16 @@ class ExecutionManager:
                 logger.info("[EXEC] Recovery: %s position active, continuing", position.ticker)
                 continue
 
-            # Позиция была закрыта пока бот не работал
+            # Позиция была закрыта пока бот не работал — получить реальную цену
             if not sl_active and tp_active:
-                self._close_position(figi, position.stop_price, "stop_loss")
+                exit_price = self._get_real_exit_price(figi, position.stop_price)
+                self._close_position(figi, exit_price, "stop_loss")
             elif sl_active and not tp_active:
-                self._close_position(figi, position.target_price, "take_profit")
+                exit_price = self._get_real_exit_price(figi, position.target_price)
+                self._close_position(figi, exit_price, "take_profit")
             else:
-                self._close_position(figi, position.stop_price, "stop_loss")
+                exit_price = self._get_real_exit_price(figi, position.stop_price)
+                self._close_position(figi, exit_price, "stop_loss")
 
         self.state.reset_stale_sl_counters()
 

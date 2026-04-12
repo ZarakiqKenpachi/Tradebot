@@ -114,6 +114,7 @@ def main():
     report = BacktestReport(results, config.backtest_initial_balance)
     report.print_summary()
     report.export_csv(config.backtest_output_dir)
+    report.export_trade_log(config.backtest_output_dir)
 
     logger.info("Done. Results in %s/", config.backtest_output_dir)
 

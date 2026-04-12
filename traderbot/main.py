@@ -48,6 +48,8 @@ REGISTRY_REFRESH_SEC = 60
 RECONCILE_INTERVAL_SEC = 300
 # Как часто (сек) отправлять heartbeat в торговое время
 HEARTBEAT_INTERVAL_SEC = 3600
+# Как часто (сек) пытаться переподключить Telegram при ошибке инициализации
+TELEGRAM_RETRY_SEC = 300
 
 # Торговые часы МОEX (МСК)
 MSK = ZoneInfo("Europe/Moscow")
@@ -762,7 +764,10 @@ def main() -> None:
         price_rub=config.subscription.price_rub,
         period_days=config.subscription.period_days,
     )
-    if config.telegram.enabled:
+
+    def _try_init_telegram() -> tuple:
+        """Попытка инициализировать Telegram. Возвращает (tg_bot, notifier) или (None, None)."""
+        nonlocal tg_bot, notifier
         try:
             tg_bot = TelegramBot(
                 token=config.telegram.token,
@@ -778,11 +783,18 @@ def main() -> None:
                 registry=registry,
                 admin_chat_ids=config.telegram.admin_chat_ids,
             )
-            # Установить notifier после его создания (избегаем circular dep)
             tg_bot.set_notifier(notifier)
             tg_bot.start()
+            logger.info("[MAIN] Telegram connected successfully")
+            return tg_bot, notifier
         except Exception:
-            logger.exception("[MAIN] Failed to init Telegram, notifications disabled")
+            logger.exception("[MAIN] Failed to init Telegram, trading continues without notifications")
+            tg_bot = None
+            notifier = None
+            return None, None
+
+    if config.telegram.enabled:
+        _try_init_telegram()
 
     # 9. Инициализировать ExecutionManager для каждого active-клиента
     for client in registry.list_active():
@@ -831,11 +843,23 @@ def main() -> None:
     last_reconcile = 0.0
     last_refresh = 0.0
     last_heartbeat = 0.0
+    last_tg_retry = 0.0
     _market_was_open: bool | None = None   # None = первая итерация
 
     try:
         while not _stop.is_set():
             try:
+                # Переподключение Telegram, если не удалось при старте
+                if config.telegram.enabled and tg_bot is None:
+                    if time.time() - last_tg_retry >= TELEGRAM_RETRY_SEC:
+                        logger.info("[MAIN] Retrying Telegram connection...")
+                        _try_init_telegram()
+                        last_tg_retry = time.time()
+                        # Обновить notifier во всех ExecutionManager
+                        if notifier:
+                            for em in execs.values():
+                                em.notifier = notifier
+
                 now_msk = datetime.now(timezone.utc).astimezone(MSK)
                 market_open = is_market_open(now_msk)
 
