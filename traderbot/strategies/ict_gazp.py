@@ -26,8 +26,15 @@ H4_LOOKBACK = 5          # candles back for bias support check
 
 # ── 1H ──────────────────────────────────────────────────────
 SWEEP_LOOKBACK = 68      # ~4 trading days of H1 (17h/day x 4)
-IMPULSE_MAX_AGE = 10     # max H1 candles back for valid impulse
+IMPULSE_MAX_AGE = 8      # max H1 candles back for valid impulse
 SWEEP_WINDOW = 20        # candles before impulse to look for sweep
+
+# ── Impulse quality (Model B) ────────────────────────────────
+IMPULSE_MIN_BODY_RATIO = 0.50   # каждая свеча пары должна иметь тело >= 50%
+IMPULSE_MIN_BLOCK_ATR  = 0.80   # блок импульса >= 0.8x ATR(14) на 1H
+
+# ── Zone attempt limit ───────────────────────────────────────
+MAX_ZONE_ATTEMPTS = 1
 
 # ── 15m ─────────────────────────────────────────────────────
 RETRACEMENT = 0.50
@@ -55,6 +62,7 @@ class ICTGazpStrategy(BaseStrategy):
         self._pending_setup: Setup | None = None
         self._pending_invalidation: float | None = None
         self._pending_direction: Signal | None = None
+        self._zone_attempts: dict[str, int] = {}
 
     # ── Main entry point ─────────────────────────────────────
 
@@ -123,9 +131,15 @@ class ICTGazpStrategy(BaseStrategy):
             f"15m вход на 50% уровне {setup.entry_price:.2f}"
         )
 
+        zone_key = f"{bias.value}_{impulse.end_time}_{round(impulse.low,1)}_{round(impulse.high,1)}"
+        if self._zone_attempts.get(zone_key, 0) >= MAX_ZONE_ATTEMPTS:
+            logger.debug("[GAZP] zone %s exhausted", zone_key)
+            return None
+
         self._pending_setup = setup
         self._pending_invalidation = invalidation
         self._pending_direction = bias
+        self._pending_zone_key = zone_key
         logger.info("[GAZP] %s setup via %s", bias.value, impulse.model)
         return setup
 
@@ -266,15 +280,39 @@ class ICTGazpStrategy(BaseStrategy):
         return None
 
     def _continuation(self, df: pd.DataFrame, bias: Signal) -> _ImpulseBlock | None:
-        """Model B: 2 consecutive directional H1 candles (no sweep required)."""
+        """Model B: 2 consecutive impulsive directional H1 candles."""
         n = len(df)
+        if n < IMPULSE_MAX_AGE + 15:
+            return None
         start = max(1, n - IMPULSE_MAX_AGE)
+
+        atr = self._atr(df, 14)
+        if atr is None:
+            return None
 
         for i in range(n - 1, start - 1, -1):
             c1, c2 = df.iloc[i - 1], df.iloc[i]
-            if self._is_directional_pair(c1, c2, bias):
-                return self._make_block(df, i, "continuation")
+            if not self._is_directional_pair(c1, c2, bias):
+                continue
+            if not self._is_impulsive(c1) or not self._is_impulsive(c2):
+                continue
+            # блок должен быть достаточно большим
+            block_range = max(c1["high"], c2["high"]) - min(c1["low"], c2["low"])
+            a = atr.get(df.index[i])
+            if a is None or pd.isna(a) or a <= 0:
+                continue
+            if block_range < a * IMPULSE_MIN_BLOCK_ATR:
+                continue
+            return self._make_block(df, i, "continuation")
         return None
+
+    @staticmethod
+    def _is_impulsive(c) -> bool:
+        r = float(c["high"] - c["low"])
+        if r <= 0:
+            return False
+        body = abs(float(c["close"] - c["open"]))
+        return body / r >= IMPULSE_MIN_BODY_RATIO
 
     @staticmethod
     def _is_directional_pair(c1, c2, bias: Signal) -> bool:
@@ -384,12 +422,16 @@ class ICTGazpStrategy(BaseStrategy):
         return last["close"] > self._pending_invalidation
 
     def on_trade_opened(self) -> None:
+        zone_key = getattr(self, "_pending_zone_key", None)
+        if zone_key:
+            self._zone_attempts[zone_key] = self._zone_attempts.get(zone_key, 0) + 1
         self._clear()
 
     def _clear(self):
         self._pending_setup = None
         self._pending_invalidation = None
         self._pending_direction = None
+        self._pending_zone_key = None
 
     # ── Utility ──────────────────────────────────────────────
 

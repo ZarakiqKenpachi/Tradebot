@@ -7,18 +7,32 @@ from traderbot.types import Setup, Signal
 
 logger = logging.getLogger(__name__)
 
-# Параметры стратегии
+# ── Sweep ────────────────────────────────────────────────────
 SWEEP_LOOKBACK = 10
-RISK_REWARD = 2.0
-DISPLACEMENT_MIN_BODY_RATIO = 0.35
-DISPLACEMENT_MIN_ATR_RATIO = 0.70
+
+# ── EMA trend filter ─────────────────────────────────────────
+EMA_FAST = 20
+EMA_SLOW = 50
+
+# ── Displacement quality ─────────────────────────────────────
+DISPLACEMENT_MIN_BODY_RATIO = 0.45
+DISPLACEMENT_MIN_ATR_RATIO  = 0.80
+MAX_DISP_BARS = 10
+MAX_SWEEP_AGE = 1
+
+# ── Entry / Stop / Target ─────────────────────────────────────
 ENTRY_RETRACEMENT = 0.50
-STOP_BUFFER = 0.003
-MIN_SL_DISTANCE = 0.003
+STOP_BUFFER       = 0.003
+MIN_SL_DISTANCE   = 0.003
+RISK_REWARD       = 2.0
 
 
 class ICTStrategyV2Sw10Rr2(BaseStrategy):
-    """ICT V2 — sweep 10 свечей, RR 1:2."""
+    """
+    SBER ICT v2 — sweep 10 свечей 1H, EMA-тренд только, RR 1:2.
+    Trend mode: EMA20/50 фильтр, торгуем строго по тренду.
+    Range mode отключён — он генерировал шум в боковиках.
+    """
 
     required_timeframes = ["30m", "1h"]
 
@@ -28,8 +42,11 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
         self._pending_direction: Signal | None = None
 
     def find_setup(self, candles: dict[str, pd.DataFrame]) -> Setup | None:
-        df_1h = candles["1h"]
+        df_1h  = candles["1h"]
         df_30m = candles["30m"]
+
+        if len(df_1h) < EMA_SLOW + SWEEP_LOOKBACK + 2:
+            return None
 
         if self._pending_setup is not None:
             if self._is_pending_invalidated(df_30m):
@@ -37,34 +54,58 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
             else:
                 return self._pending_setup
 
-        sweep = self._detect_sweep(df_1h)
+        trend = self._ema_trend(df_1h)
+        if trend is None:
+            return None
+
+        sweep = self._detect_sweep(df_1h, trend)
         if sweep is None:
             return None
 
-        direction, sweep_level, sweep_time = sweep
+        direction, sweep_level, sweep_time, sweep_wick = sweep
 
-        setup = self._find_displacement(df_30m, direction, sweep_level, sweep_time)
+        setup = self._find_displacement(df_30m, direction, sweep_level, sweep_time, sweep_wick)
         if setup is not None:
             self._pending_setup = setup
             self._pending_sweep_level = sweep_level
             self._pending_direction = direction
         return setup
 
-    def _detect_sweep(self, df_1h: pd.DataFrame) -> tuple[Signal, float, pd.Timestamp] | None:
-        if len(df_1h) < SWEEP_LOOKBACK + 1:
+    def _ema_trend(self, df_1h: pd.DataFrame) -> Signal | None:
+        ema_fast = df_1h["close"].ewm(span=EMA_FAST, adjust=False).mean()
+        ema_slow = df_1h["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+        ef = float(ema_fast.iloc[-1])
+        es = float(ema_slow.iloc[-1])
+        if pd.isna(ef) or pd.isna(es) or es == 0:
+            return None
+        if ef > es:
+            return Signal.BUY
+        return Signal.SELL
+
+    def _detect_sweep(
+        self, df_1h: pd.DataFrame, trend: Signal
+    ) -> tuple[Signal, float, pd.Timestamp, float] | None:
+        n = len(df_1h)
+        if n < SWEEP_LOOKBACK + 1:
             return None
 
-        sweep_candle = df_1h.iloc[-1]
-        structure = df_1h.iloc[-(SWEEP_LOOKBACK + 1):-1]
-        sweep_time = df_1h.index[-1]
+        for offset in range(MAX_SWEEP_AGE):
+            i = n - 1 - offset
+            if i < SWEEP_LOOKBACK:
+                break
+            sweep_candle = df_1h.iloc[i]
+            structure    = df_1h.iloc[i - SWEEP_LOOKBACK:i]
+            sweep_time   = df_1h.index[i]
 
-        structure_low = structure["low"].min()
-        if sweep_candle["low"] < structure_low and sweep_candle["close"] > structure_low:
-            return Signal.BUY, structure_low, sweep_time
+            if trend == Signal.BUY:
+                structure_low = float(structure["low"].min())
+                if sweep_candle["low"] < structure_low and sweep_candle["close"] > structure_low:
+                    return Signal.BUY, structure_low, sweep_time, float(sweep_candle["low"])
 
-        structure_high = structure["high"].max()
-        if sweep_candle["high"] > structure_high and sweep_candle["close"] < structure_high:
-            return Signal.SELL, structure_high, sweep_time
+            if trend == Signal.SELL:
+                structure_high = float(structure["high"].max())
+                if sweep_candle["high"] > structure_high and sweep_candle["close"] < structure_high:
+                    return Signal.SELL, structure_high, sweep_time, float(sweep_candle["high"])
 
         return None
 
@@ -74,9 +115,10 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
         direction: Signal,
         sweep_level: float,
         sweep_time: pd.Timestamp,
+        sweep_wick: float,
     ) -> Setup | None:
-        after_sweep = df_30m[df_30m.index >= sweep_time]
-        if len(after_sweep) < 1:
+        after_sweep = df_30m[df_30m.index >= sweep_time].iloc[:MAX_DISP_BARS]
+        if after_sweep.empty:
             return None
 
         atr_14 = self._calc_atr(df_30m, 14)
@@ -84,12 +126,11 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
             return None
 
         for idx, candle in after_sweep.iterrows():
-            candle_range = candle["high"] - candle["low"]
+            candle_range = float(candle["high"] - candle["low"])
             if candle_range == 0:
                 continue
 
-            body = abs(candle["close"] - candle["open"])
-
+            body = abs(float(candle["close"] - candle["open"]))
             if body / candle_range < DISPLACEMENT_MIN_BODY_RATIO:
                 continue
 
@@ -100,36 +141,36 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
                 continue
 
             if direction == Signal.BUY and candle["close"] > candle["open"]:
-                entry_price = candle["close"] - ENTRY_RETRACEMENT * body
-                stop_price = sweep_level * (1 - STOP_BUFFER)
+                entry_price = float(candle["close"]) - ENTRY_RETRACEMENT * body
+                stop_price  = sweep_wick * (1 - STOP_BUFFER)
                 risk = entry_price - stop_price
                 if risk > 0 and risk / entry_price >= MIN_SL_DISTANCE:
-                    target_price = entry_price + RISK_REWARD * risk
                     return Setup(
                         direction=Signal.BUY,
                         entry_price=round(entry_price, 4),
                         stop_price=round(stop_price, 4),
-                        target_price=round(target_price, 4),
-                        entry_reason=self._format_reason(
-                            Signal.BUY, sweep_level, sweep_time, idx,
-                            body, candle_range, candle_atr,
+                        target_price=round(entry_price + RISK_REWARD * risk, 4),
+                        entry_reason=(
+                            f"SBER (тренд) 1H свип ниже {sweep_level:.2f} "
+                            f"в {sweep_time.strftime('%H:%M')}; "
+                            f"30m BUY импульс в {idx.strftime('%H:%M')}"
                         ),
                     )
 
             if direction == Signal.SELL and candle["close"] < candle["open"]:
-                entry_price = candle["close"] + ENTRY_RETRACEMENT * body
-                stop_price = sweep_level * (1 + STOP_BUFFER)
+                entry_price = float(candle["close"]) + ENTRY_RETRACEMENT * body
+                stop_price  = sweep_wick * (1 + STOP_BUFFER)
                 risk = stop_price - entry_price
                 if risk > 0 and risk / entry_price >= MIN_SL_DISTANCE:
-                    target_price = entry_price - RISK_REWARD * risk
                     return Setup(
                         direction=Signal.SELL,
                         entry_price=round(entry_price, 4),
                         stop_price=round(stop_price, 4),
-                        target_price=round(target_price, 4),
-                        entry_reason=self._format_reason(
-                            Signal.SELL, sweep_level, sweep_time, idx,
-                            body, candle_range, candle_atr,
+                        target_price=round(entry_price - RISK_REWARD * risk, 4),
+                        entry_reason=(
+                            f"SBER (тренд) 1H свип выше {sweep_level:.2f} "
+                            f"в {sweep_time.strftime('%H:%M')}; "
+                            f"30m SELL импульс в {idx.strftime('%H:%M')}"
                         ),
                     )
 
@@ -138,14 +179,10 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
     def _calc_atr(self, df: pd.DataFrame, period: int) -> pd.Series | None:
         if len(df) < period + 1:
             return None
-        high = df["high"]
-        low = df["low"]
-        prev_close = df["close"].shift(1)
-        tr = pd.concat([
-            high - low,
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ], axis=1).max(axis=1)
+        h  = df["high"]
+        l  = df["low"]
+        pc = df["close"].shift(1)
+        tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
         return tr.rolling(period).mean()
 
     def _is_pending_invalidated(self, df_30m: pd.DataFrame) -> bool:
@@ -155,40 +192,13 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
             return True
         latest = df_30m.iloc[-1]
         if self._pending_direction == Signal.BUY:
-            return latest["low"] < self._pending_sweep_level
-        else:
-            return latest["high"] > self._pending_sweep_level
+            return float(latest["low"]) < self._pending_sweep_level
+        return float(latest["high"]) > self._pending_sweep_level
 
     def on_trade_opened(self) -> None:
         self._clear_pending()
 
     def _clear_pending(self):
-        self._pending_setup = None
+        self._pending_setup       = None
         self._pending_sweep_level = None
-        self._pending_direction = None
-
-    @staticmethod
-    def _format_reason(
-        direction: Signal,
-        sweep_level: float,
-        sweep_time: pd.Timestamp,
-        candle_time: pd.Timestamp,
-        body: float,
-        candle_range: float,
-        atr: float,
-    ) -> str:
-        body_pct = body / candle_range * 100 if candle_range else 0
-        atr_pct = candle_range / atr * 100 if atr else 0
-        is_buy = direction == Signal.BUY
-        sweep_dir = "ниже" if is_buy else "выше"
-        structure_ext = "минимум" if is_buy else "максимум"
-        impulse_dir = "вверх" if is_buy else "вниз"
-        sweep_ts = sweep_time.strftime("%Y-%m-%d %H:%M")
-        candle_ts = candle_time.strftime("%Y-%m-%d %H:%M")
-        return (
-            f"1H свип {sweep_dir} структурного {structure_ext}а {sweep_level:.2f} "
-            f"(глубина {SWEEP_LOOKBACK} свечей, время свипа {sweep_ts}); "
-            f"30m импульсная свеча {impulse_dir} в {candle_ts} "
-            f"(тело {body_pct:.0f}% диапазона, диапазон {atr_pct:.0f}% ATR); "
-            f"вход на {ENTRY_RETRACEMENT*100:.0f}% ретрейсменте импульсной свечи"
-        )
+        self._pending_direction   = None

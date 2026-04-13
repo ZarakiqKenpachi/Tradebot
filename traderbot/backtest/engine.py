@@ -1,6 +1,7 @@
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -25,6 +26,7 @@ class _VirtualPosition:
     lot_size: int   # акций в одном лоте
     entry_time: datetime
     entry_reason: str
+    balance_at_entry: float = 0.0
     candles_held: int = 0
 
 
@@ -89,7 +91,7 @@ class BacktestEngine:
         df_1m = candles_dict.get("1m")
         trades: list[TradeRecord] = []
         position: _VirtualPosition | None = None
-        pending: tuple[Setup, int] | None = None  # (setup, qty) — ожидаем заполнения лимитки
+        pending: tuple[Setup, int, float] | None = None  # (setup, qty, balance) — ожидаем заполнения лимитки
         min_bars = 20
 
         for i in range(min_bars, len(df_entry)):
@@ -120,8 +122,8 @@ class BacktestEngine:
 
             # === Ожидание заполнения лимитного ордера ===
             if pending is not None:
-                setup, qty = pending
-                result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m)
+                setup, qty, pending_balance = pending
+                result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m, pending_balance)
                 if result == "invalidated":
                     pending = None
                     # Сетап аннулирован — ищем новый в этом же баре (ниже)
@@ -159,7 +161,7 @@ class BacktestEngine:
             strategy.on_trade_opened()
 
             # Пробуем заполнить прямо на 1m-свечах текущего бара
-            result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m)
+            result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m, balance)
             if result == "invalidated":
                 pass  # Не вошли
             elif result is not None:
@@ -173,7 +175,7 @@ class BacktestEngine:
                         balance += exit_trade.pnl
                         position = None
             else:
-                pending = (setup, qty)  # Ждём следующих баров
+                pending = (setup, qty, balance)  # Ждём следующих баров
 
         # Закрыть оставшуюся позицию по последней цене
         if position is not None:
@@ -247,6 +249,7 @@ class BacktestEngine:
         ticker: str,
         figi: str,
         bar_1m: pd.DataFrame,
+        balance: float = 0.0,
     ) -> "_VirtualPosition | str | None":
         """
         Ищет заполнение лимитного ордера на 1m-свечах.
@@ -259,16 +262,17 @@ class BacktestEngine:
                     return "invalidated"
                 # Цена откатилась к уровню входа — заполнение
                 if c["low"] <= setup.entry_price:
-                    return self._make_position(setup, qty, lot_size, ticker, figi, ts)
+                    return self._make_position(setup, qty, lot_size, ticker, figi, ts, balance)
             else:
                 if c["high"] >= setup.stop_price:
                     return "invalidated"
                 if c["high"] >= setup.entry_price:
-                    return self._make_position(setup, qty, lot_size, ticker, figi, ts)
+                    return self._make_position(setup, qty, lot_size, ticker, figi, ts, balance)
         return None
 
     def _make_position(
-        self, setup: Setup, qty: int, lot_size: int, ticker: str, figi: str, ts: pd.Timestamp
+        self, setup: Setup, qty: int, lot_size: int, ticker: str, figi: str,
+        ts: pd.Timestamp, balance: float = 0.0,
     ) -> _VirtualPosition:
         entry_dt = ts.to_pydatetime()
         if entry_dt.tzinfo is None:
@@ -284,6 +288,7 @@ class BacktestEngine:
             lot_size=lot_size,
             entry_time=entry_dt,
             entry_reason=setup.entry_reason,
+            balance_at_entry=balance,
         )
 
     def _close(
@@ -301,7 +306,6 @@ class BacktestEngine:
 
         avg_price = (pos.entry_price + exit_price) / 2
         commission = 2 * self.commission_pct * avg_price * shares
-        pnl_net = pnl - commission
 
         if hasattr(exit_time, "to_pydatetime"):
             exit_dt = exit_time.to_pydatetime()
@@ -311,6 +315,14 @@ class BacktestEngine:
             exit_dt = exit_time
         else:
             exit_dt = datetime.now(timezone.utc)
+
+        # Комиссия за перенос маржинальных позиций через ночь (T-Bank тарифы)
+        position_value = pos.entry_price * shares
+        borrowed = max(0.0, position_value - pos.balance_at_entry)
+        overnights = self._count_overnights(pos.entry_time, exit_dt)
+        margin_cost = self._margin_overnight_cost(borrowed) * overnights
+
+        pnl_net = pnl - commission - margin_cost
 
         return TradeRecord(
             ticker=pos.ticker,
@@ -329,3 +341,36 @@ class BacktestEngine:
             exit_reason=reason,
             candles_held=pos.candles_held,
         )
+
+    @staticmethod
+    def _count_overnights(entry_time: datetime, exit_time: datetime) -> int:
+        """Количество пересечений полуночи МСК между входом и выходом."""
+        MSK = ZoneInfo("Europe/Moscow")
+        t_in  = entry_time.astimezone(MSK)
+        t_out = exit_time.astimezone(MSK)
+        # Считаем, сколько раз переходим через полночь
+        day_in  = t_in.date()
+        day_out = t_out.date()
+        return (day_out - day_in).days
+
+    @staticmethod
+    def _margin_overnight_cost(borrowed: float) -> float:
+        """Стоимость переноса маржинальной позиции за одну ночь (T-Bank тарифы, руб.)."""
+        if borrowed <= 5_000:
+            return 0.0
+        elif borrowed <= 50_000:
+            return 42.5
+        elif borrowed <= 100_000:
+            return 85.0
+        elif borrowed <= 250_000:
+            return 210.0
+        elif borrowed <= 500_000:
+            return 420.0
+        elif borrowed <= 1_000_000:
+            return 827.5
+        elif borrowed <= 2_500_000:
+            return 2_037.5
+        elif borrowed <= 5_000_000:
+            return 4_000.0
+        else:
+            return 7_775.0
