@@ -29,6 +29,8 @@ class TelegramBot:
         notifier=None,                      # TelegramNotifier, задаётся после создания
         payment_provider=None,              # ManualProvider или другой
         reload_event: threading.Event = None,  # сигнал для /reload_clients
+        disabled_tickers: set | None = None,   # mutable set отключённых тикеров
+        config=None,                           # AppConfig для списка тикеров
     ):
         self.bot = telebot.TeleBot(token, parse_mode=None)
         self.registry = registry
@@ -38,6 +40,8 @@ class TelegramBot:
         self.notifier = notifier
         self.payment_provider = payment_provider
         self.reload_event = reload_event or threading.Event()
+        self.disabled_tickers = disabled_tickers if disabled_tickers is not None else set()
+        self.config = config
         self._thread: threading.Thread | None = None
         self._register_handlers()
 
@@ -89,6 +93,8 @@ class TelegramBot:
         admin_handlers.register(
             self.bot, self.registry, self.db, self.execs,
             self.fsm, self, self.reload_event,
+            disabled_tickers=self.disabled_tickers,
+            config=self.config,
         )
 
     def send_admin(self, msg: str) -> None:

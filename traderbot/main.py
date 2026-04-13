@@ -752,6 +752,8 @@ def main() -> None:
 
     # 7. execs — сначала пустой dict, затем передаётся в TelegramBot по ссылке
     execs: dict[int, ExecutionManager] = {}
+    # Тикеры, отключённые админом через /disable_ticker (shared mutable set)
+    disabled_tickers: set[str] = set()
 
     # 8. Telegram: бот + notifier (execs уже существует, передаём по ссылке)
     notifier = None
@@ -763,6 +765,7 @@ def main() -> None:
         db=db,
         price_rub=config.subscription.price_rub,
         period_days=config.subscription.period_days,
+        admin_contact="@MakeRFGreatAgain",
     )
 
     def _try_init_telegram() -> tuple:
@@ -777,6 +780,8 @@ def main() -> None:
                 fsm=fsm,
                 payment_provider=payments,
                 reload_event=reload_event,
+                disabled_tickers=disabled_tickers,
+                config=config,
             )
             notifier = TelegramNotifier(
                 bot=tg_bot.bot,
@@ -945,6 +950,8 @@ def main() -> None:
 
                 # Торговый цикл по тикерам
                 for ticker_name, ticker_conf in config.tickers.items():
+                    if ticker_name in disabled_tickers:
+                        continue
                     figi = ticker_conf.figi
                     strategy = strategies[ticker_name]
                     timeframes = list(dict.fromkeys(["30m"] + strategy.required_timeframes))

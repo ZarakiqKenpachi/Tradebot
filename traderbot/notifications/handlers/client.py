@@ -107,8 +107,6 @@ def register(
             return
 
         if payment_provider is not None:
-            from traderbot.config import SubscriptionConfig
-            # Получаем параметры из провайдера напрямую
             text = payment_provider.create_invoice(
                 client.id,
                 payment_provider.price_rub,
@@ -140,7 +138,7 @@ def register(
             bot.reply_to(
                 message,
                 "Команда /setup доступна после подтверждения оплаты администратором.\n"
-                "Если вы уже оплатили — напишите /pay или свяжитесь с администратором.",
+                "Если вы уже оплатили — напишите /pay или свяжитесь с администратором: @MakeRFGreatAgain",
             )
             return
 
@@ -380,7 +378,7 @@ def register(
         if client.paid_until and client.paid_until < datetime.now(timezone.utc):
             bot.reply_to(
                 message,
-                "❌ Подписка истекла. Продление через /pay или обратитесь к администратору.",
+                "❌ Подписка истекла. Продление через /pay или обратитесь к администратору: @MakeRFGreatAgain",
             )
             return
 
@@ -487,7 +485,7 @@ def _status_hint(status: ClientStatus) -> str:
 def _client_help_text(status: ClientStatus) -> str:
     base = (
         "Доступные команды:\n"
-        "  /start — регистрация\n"
+        "  /start — начало работы\n"
         "  /pay — оформить/продлить подписку\n"
         "  /setup — настроить торговый токен\n"
         "  /nickname — изменить никнейм\n"

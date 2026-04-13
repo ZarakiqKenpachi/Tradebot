@@ -18,6 +18,9 @@
 /balance_all    — балансы всех активных клиентов
 /export_trades <chat_id> — выгрузить сделки клиента в CSV
 /reload_clients — форсировать sync_execs
+/tickers        — список тикеров со статусом (вкл/выкл)
+/disable_ticker <TICKER> — отключить торговлю по тикеру
+/enable_ticker <TICKER>  — включить торговлю по тикеру
 """
 from __future__ import annotations
 
@@ -46,6 +49,8 @@ def register(
     fsm: FSM,
     notifier,           # TelegramNotifier
     reload_event: threading.Event,
+    disabled_tickers: set | None = None,
+    config=None,        # AppConfig
 ) -> None:
     """Зарегистрировать все admin-хендлеры."""
 
@@ -966,6 +971,104 @@ def register(
         lines.append(f"  commission_pct: {trading.get('commission_pct', '—')}")
 
         _send_long(bot, message.chat.id, "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # /logs [N] — последние строки лога
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # /tickers — список тикеров с их статусом (вкл/выкл)
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["tickers"])
+    def handle_tickers(message):
+        if not require_admin(message):
+            return
+
+        if config is None:
+            bot.reply_to(message, "Конфигурация недоступна.")
+            return
+
+        lines = ["📋 Тикеры\n"]
+        for name, tc in config.tickers.items():
+            is_disabled = disabled_tickers is not None and name in disabled_tickers
+            icon = "🔴" if is_disabled else "🟢"
+            status = "ВЫКЛ" if is_disabled else "ВКЛ"
+            lines.append(f"  {icon} {name} — {tc.strategy} [{status}]")
+
+        if disabled_tickers:
+            lines.append(f"\nОтключено: {len(disabled_tickers)} из {len(config.tickers)}")
+        lines.append("\nУправление: /disable_ticker <TICKER> | /enable_ticker <TICKER>")
+        bot.reply_to(message, "\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # /disable_ticker <TICKER> — отключить торговлю по тикеру
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["disable_ticker"])
+    def handle_disable_ticker(message):
+        if not require_admin(message):
+            return
+
+        if disabled_tickers is None or config is None:
+            bot.reply_to(message, "Функция недоступна.")
+            return
+
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Использование: /disable_ticker <TICKER>\nПример: /disable_ticker SBER")
+            return
+
+        ticker = parts[1].upper()
+        if ticker not in config.tickers:
+            available = ", ".join(config.tickers.keys())
+            bot.reply_to(message, f"Тикер «{ticker}» не найден.\nДоступные: {available}")
+            return
+
+        if ticker in disabled_tickers:
+            bot.reply_to(message, f"🔴 {ticker} уже отключён.")
+            return
+
+        disabled_tickers.add(ticker)
+        logger.info("[ADMIN] Ticker %s disabled by admin (chat_id=%d)", ticker, message.chat.id)
+        bot.reply_to(
+            message,
+            f"🔴 Торговля по {ticker} отключена.\n"
+            f"Новые позиции открываться не будут.\n"
+            f"Включить обратно: /enable_ticker {ticker}",
+        )
+
+    # ------------------------------------------------------------------
+    # /enable_ticker <TICKER> — включить торговлю по тикеру
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["enable_ticker"])
+    def handle_enable_ticker(message):
+        if not require_admin(message):
+            return
+
+        if disabled_tickers is None or config is None:
+            bot.reply_to(message, "Функция недоступна.")
+            return
+
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "Использование: /enable_ticker <TICKER>\nПример: /enable_ticker SBER")
+            return
+
+        ticker = parts[1].upper()
+        if ticker not in config.tickers:
+            available = ", ".join(config.tickers.keys())
+            bot.reply_to(message, f"Тикер «{ticker}» не найден.\nДоступные: {available}")
+            return
+
+        if ticker not in disabled_tickers:
+            bot.reply_to(message, f"🟢 {ticker} уже включён.")
+            return
+
+        disabled_tickers.discard(ticker)
+        logger.info("[ADMIN] Ticker %s enabled by admin (chat_id=%d)", ticker, message.chat.id)
+        bot.reply_to(message, f"🟢 Торговля по {ticker} включена.")
 
     # ------------------------------------------------------------------
     # /logs [N] — последние строки лога
