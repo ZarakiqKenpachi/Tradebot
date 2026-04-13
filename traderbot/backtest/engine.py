@@ -79,12 +79,17 @@ class BacktestEngine:
         df_entry: pd.DataFrame,
         balance: float,
     ) -> list[TradeRecord]:
-        """Симуляция для одного тикера с 1m-точностью входа/выхода."""
+        """Симуляция для одного тикера с 1m-точностью входа/выхода.
+
+        Ключевые принципы (аналогично live):
+        - Стратегия получает окно данных = последние 3 дня (как feed.get_candles(days=3))
+        - Нет блокировки повторного входа в тот же сетап (в live её нет)
+        - Одна позиция за раз на тикер
+        """
         df_1m = candles_dict.get("1m")
         trades: list[TradeRecord] = []
         position: _VirtualPosition | None = None
         pending: tuple[Setup, int] | None = None  # (setup, qty) — ожидаем заполнения лимитки
-        used_setup_key: tuple | None = None  # блокировка повторного входа в тот же сетап
         min_bars = 20
 
         for i in range(min_bars, len(df_entry)):
@@ -99,7 +104,6 @@ class BacktestEngine:
                 if exit_trade:
                     trades.append(exit_trade)
                     balance += exit_trade.pnl
-                    used_setup_key = (position.direction, position.entry_price, position.stop_price)
                     position = None
                 elif position.candles_held >= self.max_candles_timeout:
                     if not bar_1m.empty:
@@ -111,7 +115,6 @@ class BacktestEngine:
                     trade = self._close(position, exit_price, "timeout", exit_ts)
                     trades.append(trade)
                     balance += trade.pnl
-                    used_setup_key = None  # таймаут — разрешаем переоткрытие
                     position = None
                 continue
 
@@ -132,7 +135,6 @@ class BacktestEngine:
                         if exit_trade:
                             trades.append(exit_trade)
                             balance += exit_trade.pnl
-                            used_setup_key = (position.direction, position.entry_price, position.stop_price)
                             position = None
                     continue
                 else:
@@ -144,17 +146,12 @@ class BacktestEngine:
             if current_time_msk.weekday() >= 5:  # Сб=5, Вс=6
                 continue
 
+            # Все данные до текущего момента (стратегия сама решает сколько смотреть)
             window = {tf: df[df.index <= current_time] for tf, df in candles_dict.items() if tf != "1m"}
             setup = strategy.find_setup(window)
             if setup is None:
-                used_setup_key = None  # сетап сменился — снимаем блокировку
                 continue
 
-            # Пропустить сетап, если это тот же, по которому уже был SL/TP
-            setup_key = (setup.direction, setup.entry_price, setup.stop_price)
-            if used_setup_key == setup_key:
-                continue
-            used_setup_key = None  # новый сетап — сбрасываем
             qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price, lot_size)
             if qty < 1:
                 continue
@@ -174,7 +171,6 @@ class BacktestEngine:
                     if exit_trade:
                         trades.append(exit_trade)
                         balance += exit_trade.pnl
-                        used_setup_key = (position.direction, position.entry_price, position.stop_price)
                         position = None
             else:
                 pending = (setup, qty)  # Ждём следующих баров

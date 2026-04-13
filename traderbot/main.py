@@ -957,8 +957,10 @@ def main() -> None:
                     timeframes = list(dict.fromkeys(["30m"] + strategy.required_timeframes))
 
                     # Свечи — ОДИН РАЗ через market-data брокер
+                    # Стратегии с D1 таймфреймом требуют больше истории для определения тренда
+                    candle_days = 15 if "1d" in strategy.required_timeframes else 3
                     try:
-                        candles = feed.get_candles(figi=figi, timeframes=timeframes, days=3)
+                        candles = feed.get_candles(figi=figi, timeframes=timeframes, days=candle_days)
                     except Exception:
                         logger.exception("[MAIN] feed error for %s", ticker_name)
                         continue
