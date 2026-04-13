@@ -87,10 +87,9 @@ def main():
         ticker_conf.lot_size = lot_size
         logger.info("  %s: lot_size=%d", ticker_name, lot_size)
 
-        # Всегда загружаем 1m для точного времени входа/выхода в бэктесте
-        timeframes = list(strategy.required_timeframes)
-        if "1m" not in timeframes:
-            timeframes = ["1m"] + timeframes
+        # Всегда загружаем 1m (точность входа/выхода) и 30m (candles_held, pending timeout)
+        # как в live main.py: timeframes = list(dict.fromkeys(["30m"] + strategy.required_timeframes))
+        timeframes = list(dict.fromkeys(["1m", "30m"] + list(strategy.required_timeframes)))
         data = feed.get_candles_history(
             figi=ticker_conf.figi,
             timeframes=timeframes,

@@ -13,6 +13,9 @@ from traderbot.types import Setup, Signal, TradeRecord
 
 logger = logging.getLogger(__name__)
 
+# Таймаут ожидания лимитного ордера — как в live ExecutionManager
+PENDING_TIMEOUT_CANDLES = 20  # 30m-свечей
+
 
 @dataclass
 class _VirtualPosition:
@@ -28,6 +31,7 @@ class _VirtualPosition:
     entry_reason: str
     balance_at_entry: float = 0.0
     candles_held: int = 0
+    last_30m_time: pd.Timestamp | None = None  # для счёта в 30m-свечах (как в live)
 
 
 class BacktestEngine:
@@ -38,6 +42,7 @@ class BacktestEngine:
         self.risk = RiskManager(config.risk_pct, config.max_position_pct, config.backtest_initial_balance)
         self.commission_pct = config.commission_pct
         self.max_candles_timeout = config.max_candles_timeout
+        self.max_consecutive_sl = config.max_consecutive_sl
 
     def run(self, all_data: dict[str, dict[str, pd.DataFrame]]) -> list[TradeRecord]:
         """
@@ -83,29 +88,51 @@ class BacktestEngine:
     ) -> list[TradeRecord]:
         """Симуляция для одного тикера с 1m-точностью входа/выхода.
 
-        Ключевые принципы (аналогично live):
-        - Стратегия получает окно данных = последние 3 дня (как feed.get_candles(days=3))
-        - Нет блокировки повторного входа в тот же сетап (в live её нет)
-        - Одна позиция за раз на тикер
+        Механизм идентичен live:
+        - Скользящее окно данных: 3 дня (или 15 для D1-стратегий), как в main.py
+        - candles_held считается в 30m-свечах, как в ExecutionManager.update()
+        - Блокировка тикера после max_consecutive_sl стопов за день
+        - Таймаут ожидания лимитки: PENDING_TIMEOUT_CANDLES 30m-свечей
         """
+        MSK = ZoneInfo("Europe/Moscow")
         df_1m = candles_dict.get("1m")
+        df_30m = candles_dict.get("30m")
+
+        # Размер скользящего окна для стратегии (как в main.py)
+        # 15 дней нужны всем: EMA50 на 1H ~62 свечи, на 4H ~50 свечей (~200ч)
+        days_limit = 15
+
         trades: list[TradeRecord] = []
         position: _VirtualPosition | None = None
-        pending: tuple[Setup, int, float] | None = None  # (setup, qty, balance) — ожидаем заполнения лимитки
+        pending: tuple[Setup, int, float] | None = None  # (setup, qty, balance)
+        pending_30m_count: int = 0
+        pending_last_30m: pd.Timestamp | None = None
+
+        # Счётчики consecutive SL (как в SqliteStateStore + ExecutionManager)
+        consecutive_sl: dict[str, int] = {ticker: 0}
+        sl_date: dict[str, str] = {ticker: ""}
+
         min_bars = 20
 
         for i in range(min_bars, len(df_entry)):
             current_time = df_entry.index[i]
             bar_1m = self._get_1m_slice(df_1m, df_entry, i)
+            current_30m = self._get_30m_bar_at(df_30m, current_time)
 
             # === Управление открытой позицией ===
             if position is not None:
-                position.candles_held += 1
+                # Инкремент candles_held только при появлении новой 30m-свечи (как в live)
+                if current_30m is not None and current_30m != position.last_30m_time:
+                    position.candles_held += 1
+                    position.last_30m_time = current_30m
 
                 exit_trade = self._scan_exit(position, bar_1m)
                 if exit_trade:
                     trades.append(exit_trade)
                     balance += exit_trade.pnl
+                    self._update_consecutive_sl(
+                        exit_trade.exit_reason, ticker, consecutive_sl, sl_date, exit_trade.exit_time, MSK
+                    )
                     position = None
                 elif position.candles_held >= self.max_candles_timeout:
                     if not bar_1m.empty:
@@ -117,39 +144,70 @@ class BacktestEngine:
                     trade = self._close(position, exit_price, "timeout", exit_ts)
                     trades.append(trade)
                     balance += trade.pnl
+                    self._update_consecutive_sl(
+                        "timeout", ticker, consecutive_sl, sl_date, trade.exit_time, MSK
+                    )
                     position = None
                 continue
 
             # === Ожидание заполнения лимитного ордера ===
             if pending is not None:
-                setup, qty, pending_balance = pending
-                result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m, pending_balance)
-                if result == "invalidated":
+                # Таймаут pending в 30m-свечах (как ExecutionManager.PENDING_TIMEOUT_CANDLES)
+                if current_30m is not None and current_30m != pending_last_30m:
+                    pending_30m_count += 1
+                    pending_last_30m = current_30m
+
+                if pending_30m_count >= PENDING_TIMEOUT_CANDLES:
+                    # Лимитка не заполнилась — отменяем (как ExecutionManager._cancel_pending)
+                    logger.debug("[BACKTEST] %s pending timeout after %d 30m candles", ticker, pending_30m_count)
                     pending = None
-                    # Сетап аннулирован — ищем новый в этом же баре (ниже)
-                elif result is not None:
-                    position = result
-                    pending = None
-                    # Проверить оставшиеся 1m-свечи того же бара после точки входа
-                    remaining = self._remaining_1m(bar_1m, result.entry_time)
-                    if not remaining.empty:
-                        exit_trade = self._scan_exit(position, remaining)
-                        if exit_trade:
-                            trades.append(exit_trade)
-                            balance += exit_trade.pnl
-                            position = None
-                    continue
+                    pending_30m_count = 0
+                    pending_last_30m = None
+                    # Ищем новый сетап в этом же баре (ниже)
                 else:
-                    continue  # Ещё ждём заполнения
+                    setup, qty, pending_balance = pending
+                    result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m, pending_balance)
+                    if result == "invalidated":
+                        pending = None
+                        pending_30m_count = 0
+                        pending_last_30m = None
+                        # Сетап аннулирован — ищем новый в этом же баре (ниже)
+                    elif result is not None:
+                        result.last_30m_time = current_30m
+                        position = result
+                        pending = None
+                        pending_30m_count = 0
+                        pending_last_30m = None
+                        remaining = self._remaining_1m(bar_1m, result.entry_time)
+                        if not remaining.empty:
+                            exit_trade = self._scan_exit(position, remaining)
+                            if exit_trade:
+                                trades.append(exit_trade)
+                                balance += exit_trade.pnl
+                                self._update_consecutive_sl(
+                                    exit_trade.exit_reason, ticker, consecutive_sl, sl_date, exit_trade.exit_time, MSK
+                                )
+                                position = None
+                        continue
+                    else:
+                        continue  # Ещё ждём заполнения
 
             # === Поиск нового сетапа ===
-            # Не искать точки входа в выходные дни (МСК)
-            current_time_msk = current_time.tz_convert("Europe/Moscow")
+            current_time_msk = current_time.tz_convert(MSK)
             if current_time_msk.weekday() >= 5:  # Сб=5, Вс=6
                 continue
 
-            # Все данные до текущего момента (стратегия сама решает сколько смотреть)
-            window = {tf: df[df.index <= current_time] for tf, df in candles_dict.items() if tf != "1m"}
+            # Блокировка тикера после серии стопов (как ExecutionManager.is_ticker_blocked)
+            today_msk = current_time_msk.date().isoformat()
+            if sl_date[ticker] == today_msk and consecutive_sl[ticker] >= self.max_consecutive_sl:
+                continue
+
+            # Скользящее окно данных — идентично live (main.py:961)
+            window_start = current_time - timedelta(days=days_limit)
+            window = {
+                tf: df[(df.index > window_start) & (df.index <= current_time)]
+                for tf, df in candles_dict.items() if tf != "1m"
+            }
             setup = strategy.find_setup(window)
             if setup is None:
                 continue
@@ -165,17 +223,22 @@ class BacktestEngine:
             if result == "invalidated":
                 pass  # Не вошли
             elif result is not None:
+                result.last_30m_time = current_30m
                 position = result
-                # Проверить оставшиеся 1m-свечи того же бара после точки входа
                 remaining = self._remaining_1m(bar_1m, result.entry_time)
                 if not remaining.empty:
                     exit_trade = self._scan_exit(position, remaining)
                     if exit_trade:
                         trades.append(exit_trade)
                         balance += exit_trade.pnl
+                        self._update_consecutive_sl(
+                            exit_trade.exit_reason, ticker, consecutive_sl, sl_date, exit_trade.exit_time, MSK
+                        )
                         position = None
             else:
-                pending = (setup, qty, balance)  # Ждём следующих баров
+                pending = (setup, qty, balance)
+                pending_30m_count = 0
+                pending_last_30m = current_30m
 
         # Закрыть оставшуюся позицию по последней цене
         if position is not None:
@@ -192,6 +255,32 @@ class BacktestEngine:
         return trades
 
     # ── Вспомогательные методы ──────────────────────────────────────────────
+
+    @staticmethod
+    def _update_consecutive_sl(
+        reason: str,
+        ticker: str,
+        consecutive_sl: dict[str, int],
+        sl_date: dict[str, str],
+        exit_time: datetime,
+        tz,
+    ) -> None:
+        """Обновить счётчик consecutive SL — идентично ExecutionManager._close_position."""
+        if reason == "stop_loss":
+            consecutive_sl[ticker] = consecutive_sl.get(ticker, 0) + 1
+            sl_date[ticker] = exit_time.astimezone(tz).date().isoformat()
+        elif reason in ("take_profit", "timeout"):
+            consecutive_sl[ticker] = 0
+
+    @staticmethod
+    def _get_30m_bar_at(
+        df_30m: pd.DataFrame | None, current_time: pd.Timestamp
+    ) -> pd.Timestamp | None:
+        """Последний закрытый 30m-бар на момент current_time."""
+        if df_30m is None or df_30m.empty:
+            return None
+        bars = df_30m[df_30m.index <= current_time]
+        return bars.index[-1] if not bars.empty else None
 
     def _remaining_1m(
         self, bar_1m: pd.DataFrame, entry_time: datetime
@@ -223,20 +312,16 @@ class BacktestEngine:
         for ts, c in bar_1m.iterrows():
             if pos.direction == Signal.BUY:
                 if c["low"] <= pos.stop_price:
-                    # Гэп через SL: open ниже stop_price → исполнение по open
                     price = min(c["open"], pos.stop_price)
                     return self._close(pos, price, "stop_loss", ts)
                 if c["high"] >= pos.target_price:
-                    # Гэп через TP: open выше target → исполнение по open
                     price = max(c["open"], pos.target_price)
                     return self._close(pos, price, "take_profit", ts)
             else:
                 if c["high"] >= pos.stop_price:
-                    # SHORT: гэп через SL вверх → open выше stop
                     price = max(c["open"], pos.stop_price)
                     return self._close(pos, price, "stop_loss", ts)
                 if c["low"] <= pos.target_price:
-                    # SHORT: гэп через TP вниз → open ниже target
                     price = min(c["open"], pos.target_price)
                     return self._close(pos, price, "take_profit", ts)
         return None
@@ -257,10 +342,8 @@ class BacktestEngine:
         """
         for ts, c in bar_1m.iterrows():
             if setup.direction == Signal.BUY:
-                # SL пробит до входа — аннулируем
                 if c["low"] <= setup.stop_price:
                     return "invalidated"
-                # Цена откатилась к уровню входа — заполнение
                 if c["low"] <= setup.entry_price:
                     return self._make_position(setup, qty, lot_size, ticker, figi, ts, balance)
             else:
@@ -348,7 +431,6 @@ class BacktestEngine:
         MSK = ZoneInfo("Europe/Moscow")
         t_in  = entry_time.astimezone(MSK)
         t_out = exit_time.astimezone(MSK)
-        # Считаем, сколько раз переходим через полночь
         day_in  = t_in.date()
         day_out = t_out.date()
         return (day_out - day_in).days

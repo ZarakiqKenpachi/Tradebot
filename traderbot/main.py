@@ -957,8 +957,8 @@ def main() -> None:
                     timeframes = list(dict.fromkeys(["30m"] + strategy.required_timeframes))
 
                     # Свечи — ОДИН РАЗ через market-data брокер
-                    # Стратегии с D1 таймфреймом требуют больше истории для определения тренда
-                    candle_days = 15 if "1d" in strategy.required_timeframes else 3
+                    # 15 дней нужны всем: EMA50 на 1H требует ~62 свечи, на 4H ~50 свечей (~200ч)
+                    candle_days = 15
                     try:
                         candles = feed.get_candles(figi=figi, timeframes=timeframes, days=candle_days)
                     except Exception:
