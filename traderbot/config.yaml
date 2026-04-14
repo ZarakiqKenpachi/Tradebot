@@ -79,3 +79,4 @@ backtest:
   initial_balance: 100000.0
   days: 30
   output_dir: "backtest/results"
+  slippage_pct: 0.0005   # проскальзывание рыночных ордеров (SL, timeout): 0.05%

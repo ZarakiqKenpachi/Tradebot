@@ -1,10 +1,11 @@
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from traderbot.broker.tbank import round_to_step
 from traderbot.config import AppConfig
 from traderbot.risk.manager import RiskManager
 from traderbot.strategies.base import BaseStrategy
@@ -15,6 +16,8 @@ logger = logging.getLogger(__name__)
 
 # Таймаут ожидания лимитного ордера — как в live ExecutionManager
 PENDING_TIMEOUT_CANDLES = 20  # 30m-свечей
+_DAYS_LIMIT = 15               # скользящее окно данных для стратегий
+_MIN_BARS = 20                 # минимум баров для разогрева
 
 
 @dataclass
@@ -34,6 +37,27 @@ class _VirtualPosition:
     last_30m_time: pd.Timestamp | None = None  # для счёта в 30m-свечах (как в live)
 
 
+@dataclass
+class _TickerState:
+    """Мутабельное состояние одного тикера в процессе симуляции."""
+    ticker: str
+    figi: str
+    lot_size: int
+    price_step: float
+    strategy: BaseStrategy
+    candles_dict: dict
+    df_entry: pd.DataFrame
+    df_1m: pd.DataFrame | None
+    df_30m: pd.DataFrame | None
+    # мутабельное
+    position: _VirtualPosition | None = None
+    pending: tuple | None = None              # (setup, qty, balance_at_signal)
+    pending_30m_count: int = 0
+    pending_last_30m: pd.Timestamp | None = None
+    consecutive_sl: dict = field(default_factory=dict)
+    sl_date: dict = field(default_factory=dict)
+
+
 class BacktestEngine:
     """Движок симуляции бэктеста."""
 
@@ -43,216 +67,258 @@ class BacktestEngine:
         self.commission_pct = config.commission_pct
         self.max_candles_timeout = config.max_candles_timeout
         self.max_consecutive_sl = config.max_consecutive_sl
+        self.slippage_pct = config.backtest_slippage_pct
 
-    def run(self, all_data: dict[str, dict[str, pd.DataFrame]]) -> list[TradeRecord]:
+    def run(
+        self,
+        all_data: dict[str, dict[str, pd.DataFrame]],
+        trading_schedule: dict | None = None,
+    ) -> list[TradeRecord]:
         """
         Прогнать симуляцию по историческим данным.
 
         all_data: {ticker_name: {timeframe: DataFrame}}
+        trading_schedule: {date: TradingDay} из TBankBroker.get_trading_schedule()
+
+        Все тикеры обрабатываются в едином хронологическом порядке,
+        поэтому баланс обновляется сразу после каждой закрытой сделки
+        и влияет на размер следующих позиций по любому тикеру.
         """
         trades: list[TradeRecord] = []
         balance = self.config.backtest_initial_balance
 
+        # Инициализировать состояние для каждого тикера
+        states: dict[str, _TickerState] = {}
         for ticker_name, ticker_conf in self.config.tickers.items():
             if ticker_name not in all_data:
                 continue
-
             candles_dict = all_data[ticker_name]
             strategy = get_strategy(ticker_conf.strategy)
             min_tf = strategy.required_timeframes[0]
-
             if min_tf not in candles_dict or candles_dict[min_tf].empty:
                 continue
-
-            df_entry = candles_dict[min_tf]
-            ticker_trades = self._simulate_ticker(
-                ticker_name, ticker_conf.figi, ticker_conf.lot_size,
-                strategy, candles_dict, df_entry, balance
+            states[ticker_name] = _TickerState(
+                ticker=ticker_name,
+                figi=ticker_conf.figi,
+                lot_size=ticker_conf.lot_size,
+                price_step=ticker_conf.price_step,
+                strategy=strategy,
+                candles_dict=candles_dict,
+                df_entry=candles_dict[min_tf],
+                df_1m=candles_dict.get("1m"),
+                df_30m=candles_dict.get("30m"),
+                consecutive_sl={ticker_name: 0},
+                sl_date={ticker_name: ""},
             )
-            trades.extend(ticker_trades)
 
-            for t in ticker_trades:
-                balance += t.pnl
+        if not states:
+            return trades
+
+        # Собрать единый хронологический список событий (timestamp, ticker, bar_index)
+        events: list[tuple] = []
+        for ticker_name, state in states.items():
+            for i in range(_MIN_BARS, len(state.df_entry)):
+                events.append((state.df_entry.index[i], ticker_name, i))
+        events.sort(key=lambda e: e[0])
+
+        # Обработать все события с общим балансом
+        for ts, ticker_name, i in events:
+            new_trades, balance = self._process_bar(
+                states[ticker_name], i, balance, trading_schedule
+            )
+            trades.extend(new_trades)
+
+        # Закрыть оставшиеся позиции по последней цене
+        for ticker_name, state in states.items():
+            if state.position is not None:
+                if state.df_1m is not None and not state.df_1m.empty:
+                    exit_price = state.df_1m.iloc[-1]["close"]
+                    exit_ts = state.df_1m.index[-1]
+                else:
+                    exit_price = state.df_entry.iloc[-1]["close"]
+                    exit_ts = state.df_entry.index[-1]
+                trade = self._close(state.position, exit_price, "end_of_data", exit_ts)
+                trades.append(trade)
+                balance += trade.pnl
+
+            ticker_count = sum(1 for t in trades if t.ticker == ticker_name)
+            logger.info("[BACKTEST] %s: %d trades", ticker_name, ticker_count)
 
         return trades
 
-    def _simulate_ticker(
+    def _process_bar(
         self,
-        ticker: str,
-        figi: str,
-        lot_size: int,
-        strategy: BaseStrategy,
-        candles_dict: dict[str, pd.DataFrame],
-        df_entry: pd.DataFrame,
+        state: _TickerState,
+        i: int,
         balance: float,
-    ) -> list[TradeRecord]:
-        """Симуляция для одного тикера с 1m-точностью входа/выхода.
-
-        Механизм идентичен live:
-        - Скользящее окно данных: 3 дня (или 15 для D1-стратегий), как в main.py
-        - candles_held считается в 30m-свечах, как в ExecutionManager.update()
-        - Блокировка тикера после max_consecutive_sl стопов за день
-        - Таймаут ожидания лимитки: PENDING_TIMEOUT_CANDLES 30m-свечей
-        """
+        trading_schedule: dict | None,
+    ) -> tuple[list[TradeRecord], float]:
+        """Обработать один бар df_entry[i] для тикера. Возвращает сделки + обновлённый баланс."""
         MSK = ZoneInfo("Europe/Moscow")
-        df_1m = candles_dict.get("1m")
-        df_30m = candles_dict.get("30m")
-
-        # Размер скользящего окна для стратегии (как в main.py)
-        # 15 дней нужны всем: EMA50 на 1H ~62 свечи, на 4H ~50 свечей (~200ч)
-        days_limit = 15
-
         trades: list[TradeRecord] = []
-        position: _VirtualPosition | None = None
-        pending: tuple[Setup, int, float] | None = None  # (setup, qty, balance)
-        pending_30m_count: int = 0
-        pending_last_30m: pd.Timestamp | None = None
 
-        # Счётчики consecutive SL (как в SqliteStateStore + ExecutionManager)
-        consecutive_sl: dict[str, int] = {ticker: 0}
-        sl_date: dict[str, str] = {ticker: ""}
+        current_time = state.df_entry.index[i]
+        bar_1m = self._get_1m_slice(state.df_1m, state.df_entry, i)
+        current_30m = self._get_30m_bar_at(state.df_30m, current_time)
 
-        min_bars = 20
+        # === Управление открытой позицией ===
+        if state.position is not None:
+            # Инкремент candles_held только при появлении новой 30m-свечи (как в live)
+            if current_30m is not None and current_30m != state.position.last_30m_time:
+                state.position.candles_held += 1
+                state.position.last_30m_time = current_30m
 
-        for i in range(min_bars, len(df_entry)):
-            current_time = df_entry.index[i]
-            bar_1m = self._get_1m_slice(df_1m, df_entry, i)
-            current_30m = self._get_30m_bar_at(df_30m, current_time)
+            exit_trade = self._scan_exit(state.position, bar_1m)
+            if exit_trade:
+                trades.append(exit_trade)
+                balance += exit_trade.pnl
+                self._update_consecutive_sl(
+                    exit_trade.exit_reason, state.ticker,
+                    state.consecutive_sl, state.sl_date, exit_trade.exit_time, MSK,
+                )
+                state.position = None
+                return trades, balance
 
-            # === Управление открытой позицией ===
-            if position is not None:
-                # Инкремент candles_held только при появлении новой 30m-свечи (как в live)
-                if current_30m is not None and current_30m != position.last_30m_time:
-                    position.candles_held += 1
-                    position.last_30m_time = current_30m
+            if state.position.candles_held >= self.max_candles_timeout:
+                if not bar_1m.empty:
+                    exit_price = self._apply_slippage(bar_1m.iloc[-1]["close"], state.position.direction)
+                    exit_ts = bar_1m.index[-1]
+                else:
+                    exit_price = self._apply_slippage(state.df_entry.iloc[i]["close"], state.position.direction)
+                    exit_ts = current_time
+                trade = self._close(state.position, exit_price, "timeout", exit_ts)
+                trades.append(trade)
+                balance += trade.pnl
+                self._update_consecutive_sl(
+                    "timeout", state.ticker,
+                    state.consecutive_sl, state.sl_date, trade.exit_time, MSK,
+                )
+                state.position = None
 
-                exit_trade = self._scan_exit(position, bar_1m)
+            return trades, balance  # позиция открыта или только что закрыта по таймауту
+
+        # === Ожидание заполнения лимитного ордера ===
+        if state.pending is not None:
+            if current_30m is not None and current_30m != state.pending_last_30m:
+                state.pending_30m_count += 1
+                state.pending_last_30m = current_30m
+
+            if state.pending_30m_count >= PENDING_TIMEOUT_CANDLES:
+                logger.debug("[BACKTEST] %s pending timeout after %d 30m candles",
+                             state.ticker, state.pending_30m_count)
+                state.pending = None
+                state.pending_30m_count = 0
+                state.pending_last_30m = None
+                # Fall through to setup search
+            else:
+                setup, qty, pending_balance = state.pending
+                result = self._scan_fill(setup, qty, state.lot_size, state.ticker, state.figi,
+                                         bar_1m, pending_balance)
+                if result == "invalidated":
+                    state.pending = None
+                    state.pending_30m_count = 0
+                    state.pending_last_30m = None
+                    # Fall through to setup search
+                elif result is not None:
+                    result.last_30m_time = current_30m
+                    state.position = result
+                    state.pending = None
+                    state.pending_30m_count = 0
+                    state.pending_last_30m = None
+                    remaining = self._remaining_1m(bar_1m, result.entry_time)
+                    if not remaining.empty:
+                        exit_trade = self._scan_exit(state.position, remaining)
+                        if exit_trade:
+                            trades.append(exit_trade)
+                            balance += exit_trade.pnl
+                            self._update_consecutive_sl(
+                                exit_trade.exit_reason, state.ticker,
+                                state.consecutive_sl, state.sl_date, exit_trade.exit_time, MSK,
+                            )
+                            state.position = None
+                    return trades, balance  # лимитка заполнена, следующий бар управляет позицией
+                else:
+                    return trades, balance  # ещё ждём заполнения
+
+        # === Поиск нового сетапа ===
+        current_time_msk = current_time.tz_convert(MSK)
+        current_time_utc = current_time.to_pydatetime()
+        if current_time_utc.tzinfo is None:
+            current_time_utc = current_time_utc.replace(tzinfo=timezone.utc)
+
+        # Фильтр торгового расписания (праздники + торговые часы)
+        if trading_schedule is not None:
+            day_info = trading_schedule.get(current_time_msk.date())
+            if day_info is None or not day_info.is_trading_day:
+                return trades, balance
+            in_main = bool(
+                day_info.start_time and day_info.end_time
+                and day_info.start_time <= current_time_utc <= day_info.end_time
+            )
+            in_evening = bool(
+                day_info.evening_start_time and day_info.evening_end_time
+                and day_info.evening_start_time <= current_time_utc <= day_info.evening_end_time
+            )
+            if not in_main and not in_evening:
+                return trades, balance
+        else:
+            if current_time_msk.weekday() >= 5:  # Сб=5, Вс=6
+                return trades, balance
+
+        # Блокировка тикера после серии стопов (как ExecutionManager.is_ticker_blocked)
+        today_msk = current_time_msk.date().isoformat()
+        if (state.sl_date[state.ticker] == today_msk
+                and state.consecutive_sl[state.ticker] >= self.max_consecutive_sl):
+            return trades, balance
+
+        # Скользящее окно данных — идентично live (main.py)
+        window_start = current_time - timedelta(days=_DAYS_LIMIT)
+        window = {
+            tf: df[(df.index > window_start) & (df.index <= current_time)]
+            for tf, df in state.candles_dict.items() if tf != "1m"
+        }
+        setup = state.strategy.find_setup(window)
+        if setup is None:
+            return trades, balance
+
+        # Округлить цены до шага инструмента (как round_to_step в live ExecutionManager)
+        if state.price_step > 0:
+            setup = dc_replace(
+                setup,
+                entry_price=round_to_step(setup.entry_price, state.price_step),
+                stop_price=round_to_step(setup.stop_price, state.price_step),
+                target_price=round_to_step(setup.target_price, state.price_step),
+            )
+
+        qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price, state.lot_size)
+        if qty < 1:
+            return trades, balance
+
+        state.strategy.on_trade_opened()
+
+        result = self._scan_fill(setup, qty, state.lot_size, state.ticker, state.figi, bar_1m, balance)
+        if result == "invalidated":
+            pass
+        elif result is not None:
+            result.last_30m_time = current_30m
+            state.position = result
+            remaining = self._remaining_1m(bar_1m, result.entry_time)
+            if not remaining.empty:
+                exit_trade = self._scan_exit(state.position, remaining)
                 if exit_trade:
                     trades.append(exit_trade)
                     balance += exit_trade.pnl
                     self._update_consecutive_sl(
-                        exit_trade.exit_reason, ticker, consecutive_sl, sl_date, exit_trade.exit_time, MSK
+                        exit_trade.exit_reason, state.ticker,
+                        state.consecutive_sl, state.sl_date, exit_trade.exit_time, MSK,
                     )
-                    position = None
-                elif position.candles_held >= self.max_candles_timeout:
-                    if not bar_1m.empty:
-                        exit_price = bar_1m.iloc[-1]["close"]
-                        exit_ts = bar_1m.index[-1]
-                    else:
-                        exit_price = df_entry.iloc[i]["close"]
-                        exit_ts = current_time
-                    trade = self._close(position, exit_price, "timeout", exit_ts)
-                    trades.append(trade)
-                    balance += trade.pnl
-                    self._update_consecutive_sl(
-                        "timeout", ticker, consecutive_sl, sl_date, trade.exit_time, MSK
-                    )
-                    position = None
-                continue
+                    state.position = None
+        else:
+            state.pending = (setup, qty, balance)
+            state.pending_30m_count = 0
+            state.pending_last_30m = current_30m
 
-            # === Ожидание заполнения лимитного ордера ===
-            if pending is not None:
-                # Таймаут pending в 30m-свечах (как ExecutionManager.PENDING_TIMEOUT_CANDLES)
-                if current_30m is not None and current_30m != pending_last_30m:
-                    pending_30m_count += 1
-                    pending_last_30m = current_30m
-
-                if pending_30m_count >= PENDING_TIMEOUT_CANDLES:
-                    # Лимитка не заполнилась — отменяем (как ExecutionManager._cancel_pending)
-                    logger.debug("[BACKTEST] %s pending timeout after %d 30m candles", ticker, pending_30m_count)
-                    pending = None
-                    pending_30m_count = 0
-                    pending_last_30m = None
-                    # Ищем новый сетап в этом же баре (ниже)
-                else:
-                    setup, qty, pending_balance = pending
-                    result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m, pending_balance)
-                    if result == "invalidated":
-                        pending = None
-                        pending_30m_count = 0
-                        pending_last_30m = None
-                        # Сетап аннулирован — ищем новый в этом же баре (ниже)
-                    elif result is not None:
-                        result.last_30m_time = current_30m
-                        position = result
-                        pending = None
-                        pending_30m_count = 0
-                        pending_last_30m = None
-                        remaining = self._remaining_1m(bar_1m, result.entry_time)
-                        if not remaining.empty:
-                            exit_trade = self._scan_exit(position, remaining)
-                            if exit_trade:
-                                trades.append(exit_trade)
-                                balance += exit_trade.pnl
-                                self._update_consecutive_sl(
-                                    exit_trade.exit_reason, ticker, consecutive_sl, sl_date, exit_trade.exit_time, MSK
-                                )
-                                position = None
-                        continue
-                    else:
-                        continue  # Ещё ждём заполнения
-
-            # === Поиск нового сетапа ===
-            current_time_msk = current_time.tz_convert(MSK)
-            if current_time_msk.weekday() >= 5:  # Сб=5, Вс=6
-                continue
-
-            # Блокировка тикера после серии стопов (как ExecutionManager.is_ticker_blocked)
-            today_msk = current_time_msk.date().isoformat()
-            if sl_date[ticker] == today_msk and consecutive_sl[ticker] >= self.max_consecutive_sl:
-                continue
-
-            # Скользящее окно данных — идентично live (main.py:961)
-            window_start = current_time - timedelta(days=days_limit)
-            window = {
-                tf: df[(df.index > window_start) & (df.index <= current_time)]
-                for tf, df in candles_dict.items() if tf != "1m"
-            }
-            setup = strategy.find_setup(window)
-            if setup is None:
-                continue
-
-            qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price, lot_size)
-            if qty < 1:
-                continue
-
-            strategy.on_trade_opened()
-
-            # Пробуем заполнить прямо на 1m-свечах текущего бара
-            result = self._scan_fill(setup, qty, lot_size, ticker, figi, bar_1m, balance)
-            if result == "invalidated":
-                pass  # Не вошли
-            elif result is not None:
-                result.last_30m_time = current_30m
-                position = result
-                remaining = self._remaining_1m(bar_1m, result.entry_time)
-                if not remaining.empty:
-                    exit_trade = self._scan_exit(position, remaining)
-                    if exit_trade:
-                        trades.append(exit_trade)
-                        balance += exit_trade.pnl
-                        self._update_consecutive_sl(
-                            exit_trade.exit_reason, ticker, consecutive_sl, sl_date, exit_trade.exit_time, MSK
-                        )
-                        position = None
-            else:
-                pending = (setup, qty, balance)
-                pending_30m_count = 0
-                pending_last_30m = current_30m
-
-        # Закрыть оставшуюся позицию по последней цене
-        if position is not None:
-            if df_1m is not None and not df_1m.empty:
-                exit_price = df_1m.iloc[-1]["close"]
-                exit_ts = df_1m.index[-1]
-            else:
-                exit_price = df_entry.iloc[-1]["close"]
-                exit_ts = df_entry.index[-1]
-            trade = self._close(position, exit_price, "end_of_data", exit_ts)
-            trades.append(trade)
-
-        logger.info("[BACKTEST] %s: %d trades", ticker, len(trades))
-        return trades
+        return trades, balance
 
     # ── Вспомогательные методы ──────────────────────────────────────────────
 
@@ -282,14 +348,25 @@ class BacktestEngine:
         bars = df_30m[df_30m.index <= current_time]
         return bars.index[-1] if not bars.empty else None
 
-    def _remaining_1m(
-        self, bar_1m: pd.DataFrame, entry_time: datetime
-    ) -> pd.DataFrame:
+    def _remaining_1m(self, bar_1m: pd.DataFrame, entry_time: datetime) -> pd.DataFrame:
         """1m-свечи в том же баре, строго после момента входа."""
         if bar_1m is None or bar_1m.empty:
             return pd.DataFrame()
         entry_ts = pd.Timestamp(entry_time)
         return bar_1m[bar_1m.index > entry_ts]
+
+    def _apply_slippage(self, price: float, direction: Signal) -> float:
+        """Ухудшить цену на slippage_pct для рыночного ордера (SL, timeout).
+
+        BUY-позиция закрывается продажей → цена ниже.
+        SELL-позиция закрывается покупкой → цена выше.
+        """
+        if self.slippage_pct == 0.0:
+            return price
+        if direction == Signal.BUY:
+            return price * (1.0 - self.slippage_pct)
+        else:
+            return price * (1.0 + self.slippage_pct)
 
     def _get_1m_slice(
         self, df_1m: pd.DataFrame | None, df_entry: pd.DataFrame, i: int
@@ -312,17 +389,17 @@ class BacktestEngine:
         for ts, c in bar_1m.iterrows():
             if pos.direction == Signal.BUY:
                 if c["low"] <= pos.stop_price:
-                    price = min(c["open"], pos.stop_price)
+                    price = self._apply_slippage(min(c["open"], pos.stop_price), pos.direction)
                     return self._close(pos, price, "stop_loss", ts)
                 if c["high"] >= pos.target_price:
-                    price = max(c["open"], pos.target_price)
+                    price = max(c["open"], pos.target_price)  # лимитный TP — без проскальзывания
                     return self._close(pos, price, "take_profit", ts)
             else:
                 if c["high"] >= pos.stop_price:
-                    price = max(c["open"], pos.stop_price)
+                    price = self._apply_slippage(max(c["open"], pos.stop_price), pos.direction)
                     return self._close(pos, price, "stop_loss", ts)
                 if c["low"] <= pos.target_price:
-                    price = min(c["open"], pos.target_price)
+                    price = min(c["open"], pos.target_price)  # лимитный TP — без проскальзывания
                     return self._close(pos, price, "take_profit", ts)
         return None
 

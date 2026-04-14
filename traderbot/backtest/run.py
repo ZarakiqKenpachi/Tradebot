@@ -7,6 +7,7 @@ import argparse
 import logging
 import os
 import sys
+from datetime import date, timedelta
 
 from traderbot.broker.tbank import TBankBroker
 from traderbot.config import load_config
@@ -79,13 +80,14 @@ def main():
         strategy = get_strategy(ticker_conf.strategy)
         logger.info("  Loading %s...", ticker_name)
 
-        # Получить размер лота из API
-        lot_size, _ = broker.get_instrument_info(ticker_conf.figi)
+        # Получить размер лота и шаг цены из API
+        lot_size, price_step = broker.get_instrument_info(ticker_conf.figi)
         if lot_size < 1:
             logger.warning("  Invalid lot_size=%d for %s, defaulting to 1", lot_size, ticker_name)
             lot_size = 1
         ticker_conf.lot_size = lot_size
-        logger.info("  %s: lot_size=%d", ticker_name, lot_size)
+        ticker_conf.price_step = price_step
+        logger.info("  %s: lot_size=%d price_step=%.6f", ticker_name, lot_size, price_step)
 
         # Всегда загружаем 1m (точность входа/выхода) и 30m (candles_held, pending timeout)
         # как в live main.py: timeframes = list(dict.fromkeys(["30m"] + strategy.required_timeframes))
@@ -104,10 +106,23 @@ def main():
         logger.error("No data loaded")
         sys.exit(1)
 
+    # Загрузить торговый календарь MOEX для фильтрации праздников и торговых часов
+    logger.info("Loading MOEX trading schedule...")
+    try:
+        trading_schedule = broker.get_trading_schedule(
+            "MOEX",
+            date.today() - timedelta(days=days + 1),
+            date.today(),
+        )
+        logger.info("  Loaded %d trading days", sum(1 for d in trading_schedule.values() if d.is_trading_day))
+    except Exception as e:
+        logger.warning("  Could not load trading schedule: %s. Falling back to weekday filter.", e)
+        trading_schedule = None
+
     # Запустить симуляцию
     logger.info("Running backtest...")
     engine = BacktestEngine(config)
-    results = engine.run(all_data)
+    results = engine.run(all_data, trading_schedule=trading_schedule)
 
     # Вывести отчёт
     report = BacktestReport(results, config.backtest_initial_balance)

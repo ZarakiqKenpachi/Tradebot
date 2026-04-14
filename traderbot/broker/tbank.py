@@ -1,6 +1,6 @@
 import logging
 import uuid
-from datetime import timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 from t_tech.invest import (
@@ -234,6 +234,23 @@ class TBankBroker:
         if not candles:
             return None
         return _quotation_to_float(candles[-1].close)
+
+    def get_trading_schedule(self, exchange: str, from_date: date, to_date: date) -> dict:
+        """Получить торговый календарь биржи. Возвращает {date: TradingDay}."""
+        from_dt = datetime.combine(from_date, datetime.min.time()).replace(tzinfo=timezone.utc)
+        to_dt = datetime.combine(to_date, datetime.max.time()).replace(tzinfo=timezone.utc)
+        with self._client() as client:
+            resp = client.instruments.trading_schedules(
+                exchange=exchange,
+                from_=from_dt,
+                to=to_dt,
+            )
+        result = {}
+        for schedule in resp.exchanges:
+            if schedule.exchange == exchange:
+                for day in schedule.days:
+                    result[day.date.date()] = day
+        return result
 
     # ------------------------------------------------------------------
     # Песочница

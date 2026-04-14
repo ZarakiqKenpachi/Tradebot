@@ -42,6 +42,7 @@ class TickerConfig:
     figi: str
     strategy: str
     lot_size: int = 1
+    price_step: float = 0.0
 
 
 @dataclass
@@ -69,6 +70,7 @@ class AppConfig:
     backtest_initial_balance: float
     backtest_days: int
     backtest_output_dir: str
+    backtest_slippage_pct: float
 
 
 def load_config(path: str = "config.yaml") -> AppConfig:
@@ -168,4 +170,5 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         backtest_initial_balance=bt["initial_balance"],
         backtest_days=bt["days"],
         backtest_output_dir=bt["output_dir"],
+        backtest_slippage_pct=bt.get("slippage_pct", 0.0),
     )
