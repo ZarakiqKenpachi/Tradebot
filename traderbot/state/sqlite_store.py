@@ -12,9 +12,12 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from traderbot.clients.db import Database
 from traderbot.types import Position, Signal
+
+_MSK = ZoneInfo("Europe/Moscow")
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +144,7 @@ class SqliteStateStore:
     # ------------------------------------------------------------------
 
     def increment_consecutive_sl(self, client_id: int, ticker: str) -> None:
-        today = date.today().isoformat()
+        today = datetime.now(_MSK).date().isoformat()
         with self.db.write() as cur:
             cur.execute(
                 """
@@ -176,9 +179,39 @@ class SqliteStateStore:
             return 0, None
         return int(row["count"]), row["last_sl_date"]
 
+    def get_daily_sl_count(self, client_id: int) -> int:
+        """Количество стоп-лоссов клиента за сегодня (UTC-дата)."""
+        today = datetime.now(_MSK).date().isoformat()
+        with self.db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM trades
+                WHERE client_id = ? AND exit_reason = 'stop_loss'
+                  AND substr(exit_time, 1, 10) = ?
+                """,
+                (client_id, today),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def get_daily_sl_count_for_ticker(self, client_id: int, ticker: str) -> int:
+        """Количество стоп-лоссов клиента по конкретному тикеру за сегодня."""
+        today = datetime.now(_MSK).date().isoformat()
+        with self.db.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM trades
+                WHERE client_id = ? AND ticker = ? AND exit_reason = 'stop_loss'
+                  AND substr(exit_time, 1, 10) = ?
+                """,
+                (client_id, ticker, today),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
     def reset_stale_sl_counters(self, client_id: int) -> None:
         """Сбросить счётчики SL у тикеров, где last_sl_date < сегодня."""
-        today = date.today().isoformat()
+        today = datetime.now(_MSK).date().isoformat()
         with self.db.write() as cur:
             cur.execute(
                 """

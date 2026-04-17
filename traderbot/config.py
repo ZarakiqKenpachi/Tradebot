@@ -53,6 +53,13 @@ class TelegramConfig:
 
 
 @dataclass
+class PaperTradingConfig:
+    token: str
+    initial_balance: float
+    database_path: str
+
+
+@dataclass
 class AppConfig:
     database: DatabaseConfig
     market_data: MarketDataConfig
@@ -61,6 +68,7 @@ class AppConfig:
     risk_pct: float
     max_position_pct: float
     max_consecutive_sl: int
+    max_daily_sl: int
     tickers: dict[str, TickerConfig]
     telegram: TelegramConfig
     journal_path: str
@@ -71,6 +79,7 @@ class AppConfig:
     backtest_days: int
     backtest_output_dir: str
     backtest_slippage_pct: float
+    paper_trading: PaperTradingConfig | None = None
 
 
 def load_config(path: str = "config.yaml") -> AppConfig:
@@ -153,6 +162,18 @@ def load_config(path: str = "config.yaml") -> AppConfig:
     # Backtest
     bt = raw["backtest"]
 
+    # Paper trading (sandbox)
+    paper_trading = None
+    pt_raw = raw.get("paper_trading")
+    if pt_raw:
+        pt_token = os.environ.get(pt_raw.get("token_env", ""), "")
+        if pt_token:
+            paper_trading = PaperTradingConfig(
+                token=pt_token,
+                initial_balance=pt_raw.get("initial_balance", 100000.0),
+                database_path=pt_raw.get("database_path", "data/paper_trading.db"),
+            )
+
     return AppConfig(
         database=db_cfg,
         market_data=market_data,
@@ -161,6 +182,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         risk_pct=risk["risk_pct"],
         max_position_pct=risk["max_position_pct"],
         max_consecutive_sl=risk["max_consecutive_sl"],
+        max_daily_sl=risk.get("max_daily_sl", 5),
         tickers=tickers,
         telegram=telegram,
         journal_path=raw["journal"]["path"],
@@ -171,4 +193,5 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         backtest_days=bt["days"],
         backtest_output_dir=bt["output_dir"],
         backtest_slippage_pct=bt.get("slippage_pct", 0.0),
+        paper_trading=paper_trading,
     )

@@ -31,6 +31,7 @@ from traderbot.journal.sqlite_writer import SqliteTradeJournal
 from traderbot.journal.writer import TradeJournal
 from traderbot.notifications.bot import TelegramBot
 from traderbot.notifications.fsm import FSM
+from traderbot.notifications.handlers.admin import _build_daily_report
 from traderbot.notifications.telegram import TelegramNotifier
 from traderbot.payments.manual import ManualProvider
 from traderbot.risk.manager import RiskManager
@@ -116,109 +117,17 @@ def _get_today_pnl(db, now_msk: datetime) -> float:
         return 0.0
 
 
-def _send_daily_summary(db, notifier, now_msk: datetime) -> None:
+def _send_daily_summary(db, registry, notifier, now_msk: datetime) -> None:
     """Отправить итоги торгового дня всем администраторам."""
     if notifier is None:
         return
-
-    today_start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_start_utc = today_start_msk.astimezone(timezone.utc)
-
     try:
-        with db.cursor() as cur:
-            cur.execute(
-                """
-                SELECT ticker, direction, entry_price, exit_price, stop_price, target_price,
-                       qty, pnl, commission, entry_time, exit_time,
-                       entry_reason, exit_reason, candles_held, client_id
-                FROM trades
-                WHERE exit_time >= ?
-                ORDER BY exit_time ASC
-                """,
-                (today_start_utc.isoformat(),),
-            )
-            trades = cur.fetchall()
+        text = _build_daily_report(db, registry, now_msk)
     except Exception:
-        logger.exception("[MAIN] daily_summary: DB query failed")
+        logger.exception("[MAIN] daily_summary: failed to build report")
         return
-
-    date_str = now_msk.strftime("%d.%m.%Y")
-
-    if not trades:
-        notifier.send_admin(f"📊 Итоги дня {date_str}: сделок не было.")
-        return
-
-    total_pnl = sum(float(t["pnl"]) for t in trades)
-    wins = sum(1 for t in trades if float(t["pnl"]) > 0)
-    losses = len(trades) - wins
-    win_rate = wins / len(trades) * 100
-
-    _exit_labels = {
-        "stop_loss": "стоп-лосс",
-        "take_profit": "тейк-профит",
-        "timeout": "таймаут",
-        "revoked": "принудительно",
-    }
-
-    # Разбивка по тикерам
-    ticker_stats: dict[str, dict] = {}
-    for t in trades:
-        tk = t["ticker"]
-        if tk not in ticker_stats:
-            ticker_stats[tk] = {"pnl": 0.0, "total": 0, "wins": 0}
-        ticker_stats[tk]["pnl"] += float(t["pnl"])
-        ticker_stats[tk]["total"] += 1
-        if float(t["pnl"]) > 0:
-            ticker_stats[tk]["wins"] += 1
-
-    lines = [
-        f"📊 Итоги торгового дня {date_str}",
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"Сделок: {len(trades)} | P&L: {total_pnl:+.2f} ₽",
-        f"✅ Прибыльных: {wins} ({win_rate:.0f}%) | ❌ Убыточных: {losses}",
-    ]
-
-    if len(ticker_stats) > 1:
-        lines.append("\n📈 По тикерам:")
-        for tk, s in sorted(ticker_stats.items(), key=lambda x: -x[1]["pnl"]):
-            tk_wr = s["wins"] / s["total"] * 100
-            icon = "✅" if s["pnl"] >= 0 else "❌"
-            lines.append(
-                f"  {icon} {tk}: {s['pnl']:+.2f} ₽ | {s['total']} сд. | WR {tk_wr:.0f}%"
-            )
-
-    lines.append("\n📋 Сделки:")
-
-    for i, t in enumerate(trades, 1):
-        pnl = float(t["pnl"])
-        icon = "✅" if pnl >= 0 else "❌"
-        try:
-            entry_dt = datetime.fromisoformat(t["entry_time"])
-            if entry_dt.tzinfo is None:
-                entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-            entry_msk = entry_dt.astimezone(MSK).strftime("%H:%M")
-        except Exception:
-            entry_msk = "??"
-        try:
-            exit_dt = datetime.fromisoformat(t["exit_time"])
-            if exit_dt.tzinfo is None:
-                exit_dt = exit_dt.replace(tzinfo=timezone.utc)
-            exit_msk = exit_dt.astimezone(MSK).strftime("%H:%M")
-        except Exception:
-            exit_msk = "??"
-
-        exit_label = _exit_labels.get(t["exit_reason"], t["exit_reason"] or "—")
-        lines.append(
-            f"\n{i}. {icon} {t['ticker']} {t['direction']} | P&L: {pnl:+.2f} ₽\n"
-            f"   Вход {entry_msk} @ {t['entry_price']:.2f} → Выход {exit_msk} @ {t['exit_price']:.2f}\n"
-            f"   SL: {t['stop_price']:.2f} | TP: {t['target_price']:.2f}\n"
-            f"   Причина входа: {t['entry_reason'] or '—'}\n"
-            f"   Выход по: {exit_label} | Длительность: {t['candles_held']} свечей"
-        )
-
-    notifier.send_admin("\n".join(lines))
-    logger.info("[MAIN] Daily summary sent: %d trades, P&L=%.2f RUB, WR=%.0f%%",
-                len(trades), total_pnl, win_rate)
+    notifier.send_admin(text)
+    logger.info("[MAIN] Daily summary sent")
 
 
 def _send_weekly_summary(db, notifier, now_msk: datetime) -> None:
@@ -510,6 +419,7 @@ def _build_exec(client, config: AppConfig, sqlite_state: SqliteStateStore,
         commission_pct=config.commission_pct,
         max_candles_timeout=config.max_candles_timeout,
         max_consecutive_sl=config.max_consecutive_sl,
+        max_daily_sl=config.max_daily_sl,
         client_id=client.id,
         is_admin=(client.role == ClientRole.ADMIN),
     )
@@ -641,8 +551,9 @@ def sync_execs(
         if client_id in active_ids:
             continue
         em = execs[client_id]
-        # Если флаг _revoked и есть открытые позиции — оставляем для сопровождения
-        if em._revoked and em.positions:
+        # Если клиент отозван или достигнут дневной лимит SL — оставляем
+        # для сопровождения открытых позиций до SL/TP
+        if (em._revoked or em._daily_sl_limit_reached) and em.positions:
             continue
         # Иначе убираем
         del execs[client_id]
@@ -670,6 +581,44 @@ def handle_client_error(
             notifier.send_admin(
                 f"⚠️ Клиент {client_id} автоматически приостановлен "
                 f"после {errors} ошибок подряд."
+            )
+
+
+# ---------------------------------------------------------------------------
+# handle_daily_sl_limit: пауза клиента при достижении дневного лимита SL
+# ---------------------------------------------------------------------------
+
+def handle_daily_sl_limit(
+    client_id: int,
+    registry: ClientRegistry,
+    execs: dict,
+    notifier,
+) -> None:
+    """Поставить клиента на паузу из-за дневного лимита стоп-лоссов.
+
+    Статус в БД → PAUSED. Если у клиента ещё есть открытые позиции,
+    em остаётся в execs со флагом _daily_sl_limit_reached (не открывает новых,
+    сопровождает существующие до SL/TP). Когда позиций не останется —
+    sync_execs уберёт em сам.
+    """
+    registry.update_status(client_id, ClientStatus.PAUSED)
+    em = execs.get(client_id)
+    ticker = em._daily_sl_limit_ticker if em else None
+    if em and not em.positions:
+        execs.pop(client_id, None)
+    ticker_info = f" по {ticker}" if ticker else ""
+    logger.warning(
+        "[MAIN] Client %d paused: daily SL limit reached%s", client_id, ticker_info
+    )
+    if notifier:
+        notifier.send_admin(
+            f"🛑 Клиент {client_id} приостановлен: достигнут дневной лимит стоп-лоссов{ticker_info}."
+        )
+        if em:
+            notifier.send_to_client(
+                client_id,
+                f"🛑 Торговля приостановлена: достигнут дневной лимит стоп-лоссов{ticker_info}.\n"
+                "Для возобновления используйте /resume или обратитесь к администратору.",
             )
 
 
@@ -894,7 +843,7 @@ def main() -> None:
                 if _market_was_open is True and not market_open:
                     logger.info("[MAIN] Market closed at %s MSK, sending daily summary",
                                 now_msk.strftime("%H:%M"))
-                    _send_daily_summary(db, notifier, now_msk)
+                    _send_daily_summary(db, registry, notifier, now_msk)
                     # Пятница → недельный отчёт
                     if now_msk.weekday() == 4:
                         _send_weekly_summary(db, notifier, now_msk)
@@ -927,8 +876,33 @@ def main() -> None:
                 # Heartbeat раз в час + проверка связи с API
                 if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                     if notifier:
-                        open_pos = sum(len(em.positions) for em in execs.values())
+                        active_pos = sum(
+                            sum(1 for p in em.positions.values() if p.status == "active")
+                            for em in execs.values()
+                        )
+                        pending_pos = sum(
+                            sum(1 for p in em.positions.values() if p.status == "pending")
+                            for em in execs.values()
+                        )
                         pnl_today = _get_today_pnl(db, now_msk)
+
+                        # Нереализованный P&L по открытым активным позициям
+                        floating_pnl = 0.0
+                        for em in execs.values():
+                            for figi_hb, pos in em.positions.items():
+                                if pos.status != "active":
+                                    continue
+                                try:
+                                    price = em.broker.get_last_price(figi_hb)
+                                    if price is None:
+                                        continue
+                                    shares = pos.qty * pos.lot_size
+                                    if pos.direction.value == "BUY":
+                                        floating_pnl += (price - pos.entry_price) * shares
+                                    else:
+                                        floating_pnl += (pos.entry_price - price) * shares
+                                except Exception:
+                                    pass
 
                         # Проверка связи с T-Bank API (market data broker)
                         api_ok = False
@@ -938,17 +912,23 @@ def main() -> None:
                         except Exception:
                             logger.warning("[MAIN] Heartbeat: T-Bank API health check failed")
 
-                        api_status = "✅" if api_ok else "⚠️ API!"
+                        floating_str = f" | float: {floating_pnl:+.2f} ₽" if active_pos > 0 else ""
                         notifier.send_admin(
                             f"{'✅' if api_ok else '⚠️'} {now_msk.strftime('%H:%M')} МСК | "
                             f"клиентов: {len(execs)} | "
-                            f"позиций: {open_pos} | "
-                            f"P&L: {pnl_today:+.2f} ₽ | "
+                            f"позиций: {active_pos} | лимиток: {pending_pos} | "
+                            f"P&L: {pnl_today:+.2f} ₽{floating_str} | "
                             f"API: {'OK' if api_ok else 'НЕ ОТВЕЧАЕТ'}"
                         )
                     last_heartbeat = time.time()
 
                 # Торговый цикл по тикерам
+                # Клиенты, у которых хотя бы один тикер прошёл без исключения
+                successful_clients: set[int] = set()
+
+                # Клиенты, которых нужно поставить на паузу по дневному лимиту SL
+                daily_sl_triggered: set[int] = set()
+
                 for ticker_name, ticker_conf in config.tickers.items():
                     if ticker_name in disabled_tickers:
                         continue
@@ -976,8 +956,8 @@ def main() -> None:
 
                     # Per-client: обновить/открыть позицию
                     for client_id, em in list(execs.items()):
-                        # Если revoked — только сопровождаем, не открываем
-                        can_open = not em._revoked
+                        # Если revoked или достигнут дневной лимит SL — только сопровождаем
+                        can_open = not em._revoked and not em._daily_sl_limit_reached
                         try:
                             if em.has_position(figi):
                                 em.update(figi, current_price, last_candle_time)
@@ -986,12 +966,31 @@ def main() -> None:
                                     del execs[client_id]
                                     logger.info("[MAIN] Revoked client %d: all positions closed, removed",
                                                 client_id)
-                            elif can_open and not em.is_ticker_blocked(ticker_name):
+                            elif can_open:
                                 if shared_setup is not None:
-                                    em.open_position(ticker_name, figi, shared_setup)
+                                    if em.is_ticker_blocked(ticker_name):
+                                        em.notify_ticker_blocked(ticker_name)
+                                    else:
+                                        em.open_position(ticker_name, figi, shared_setup)
                         except Exception:
                             logger.exception("[MAIN] client %d tick error on %s", client_id, ticker_name)
                             handle_client_error(client_id, registry, execs, notifier)
+                        else:
+                            successful_clients.add(client_id)
+
+                        # Запомнить для обработки после цикла тикеров (не вызываем повторно)
+                        if em._daily_sl_limit_reached and client_id not in daily_sl_triggered:
+                            daily_sl_triggered.add(client_id)
+
+                # Пауза по дневному лимиту SL — один раз на клиента после всех тикеров
+                for client_id in daily_sl_triggered:
+                    if client_id in execs:
+                        handle_daily_sl_limit(client_id, registry, execs, notifier)
+
+                # Сбросить счётчик ошибок для клиентов, у которых цикл прошёл без исключений
+                for client_id in successful_clients:
+                    if client_id in execs:
+                        registry.reset_errors(client_id)
 
                 # Ждём poll_interval или раньше если пришёл сигнал остановки
                 _stop.wait(timeout=config.poll_interval_sec)

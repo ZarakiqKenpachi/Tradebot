@@ -28,7 +28,7 @@ class RiskManager:
         risk_amount = balance * self.risk_pct
         qty = math.floor(risk_amount / risk_per_lot)
 
-        max_qty = math.floor(self.deposit * self.max_position_pct / (entry_price * lot_size))
+        max_qty = math.floor(balance * self.max_position_pct / (entry_price * lot_size))
 
         result = min(qty, max_qty)
         return result if result >= 1 else 0

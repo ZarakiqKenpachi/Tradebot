@@ -235,6 +235,48 @@ class TBankBroker:
             return None
         return _quotation_to_float(candles[-1].close)
 
+    def get_executed_price(self, account_id: str, figi: str, minutes_back: int = 60) -> float | None:
+        """Получить реальную цену исполнения из истории операций по инструменту.
+
+        Ищет последнюю сделку (покупку/продажу) за последние minutes_back минут.
+        Возвращает средневзвешенную цену по трейдам или None.
+        """
+        try:
+            with self._client() as client:
+                resp = client.operations.get_operations(
+                    account_id=account_id,
+                    from_=now() - timedelta(minutes=minutes_back),
+                    to=now(),
+                    figi=figi,
+                )
+            for op in reversed(resp.operations):
+                if op.quantity <= 0:
+                    continue
+                if op.trades:
+                    total_qty = sum(t.quantity for t in op.trades)
+                    if total_qty > 0:
+                        weighted = sum(
+                            _quotation_to_float(t.price) * t.quantity
+                            for t in op.trades
+                        )
+                        return weighted / total_qty
+                price = _quotation_to_float(op.price)
+                if price > 0:
+                    return price
+        except Exception:
+            logger.debug("[BROKER] get_executed_price failed for figi=%s", figi)
+        return None
+
+    def get_order_fill_price(self, account_id: str, order_id: str) -> float | None:
+        """Получить среднюю цену исполнения конкретного ордера."""
+        try:
+            state = self.get_order_state(account_id, order_id)
+            if state.average_position_price:
+                return _quotation_to_float(state.average_position_price)
+        except Exception:
+            logger.debug("[BROKER] get_order_fill_price failed for %s", order_id)
+        return None
+
     def get_trading_schedule(self, exchange: str, from_date: date, to_date: date) -> dict:
         """Получить торговый календарь биржи. Возвращает {date: TradingDay}."""
         from_dt = datetime.combine(from_date, datetime.min.time()).replace(tzinfo=timezone.utc)

@@ -1,5 +1,7 @@
 import logging
+import time as _time
 from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 from t_tech.invest import OrderDirection, StopOrderDirection
 
@@ -9,6 +11,8 @@ from traderbot.risk.manager import RiskManager
 from traderbot.types import Position, Setup, Signal, TradeRecord
 
 logger = logging.getLogger(__name__)
+
+_MSK = ZoneInfo("Europe/Moscow")
 
 
 class ExecutionManager:
@@ -27,6 +31,7 @@ class ExecutionManager:
         commission_pct: float,
         max_candles_timeout: int,
         max_consecutive_sl: int = 3,
+        max_daily_sl: int = 5,
         client_id: int = 0,
         is_admin: bool = False,
     ):
@@ -39,22 +44,55 @@ class ExecutionManager:
         self.commission_pct = commission_pct
         self.max_candles_timeout = max_candles_timeout
         self.max_consecutive_sl = max_consecutive_sl
+        self.max_daily_sl = max_daily_sl
         self.client_id = client_id
         self.is_admin = is_admin
         # В памяти: figi → Position
         self.positions: dict[str, Position] = {}
         # Флаг: клиент отозван, но позиции ещё сопровождаются до SL/TP
         self._revoked: bool = False
+        # Флаг: достигнут дневной лимит стоп-лоссов; main.py поставит клиента на паузу
+        self._daily_sl_limit_reached: bool = False
+        # Тикер, по которому сработал дневной лимит SL
+        self._daily_sl_limit_ticker: str | None = None
+        # Кэш стоп-ордеров (одинаков для всех тикеров одного клиента за цикл)
+        self._stop_orders_cache: set[str] = set()
+        self._stop_orders_cache_time: float = 0.0
+        # Тикеры, о блокировке которых уже уведомлён админ (ticker, date)
+        self._blocked_notified: set[tuple[str, str]] = set()
 
     def has_position(self, figi: str) -> bool:
         return figi in self.positions
 
     def is_ticker_blocked(self, ticker: str) -> bool:
         """Проверить, заблокирован ли тикер из-за серии SL."""
+        today_msk = datetime.now(_MSK).date().isoformat()
         count, last_date = self.state.get_consecutive_sl(ticker)
-        if last_date == date.today().isoformat() and count >= self.max_consecutive_sl:
+        if last_date == today_msk and count >= self.max_consecutive_sl:
             return True
         return False
+
+    def notify_ticker_blocked(self, ticker: str) -> None:
+        """Уведомить о блокировке тикера (однократно за день)."""
+        today_msk = datetime.now(_MSK).date().isoformat()
+        key = (ticker, today_msk)
+        if key in self._blocked_notified:
+            return
+        self._blocked_notified.add(key)
+        count, _ = self.state.get_consecutive_sl(ticker)
+        logger.warning(
+            "[EXEC] Client %d: ticker %s blocked after %d consecutive SLs",
+            self.client_id, ticker, count,
+        )
+        if self.notifier:
+            admin_msg = (
+                f"🚫 {ticker} заблокирован для клиента {self.client_id}: "
+                f"{count} стоп-лоссов подряд (лимит {self.max_consecutive_sl})."
+            )
+            if not self.is_admin:
+                self.notifier.send_admin(admin_msg)
+            else:
+                self.notifier.send_admin(admin_msg)
 
     # ------------------------------------------------------------------
     # Уведомления
@@ -137,18 +175,38 @@ class ExecutionManager:
         self._notify_trade(msg)  # подписчик не видит выставление лимитки
 
     def _get_real_exit_price(self, figi: str, fallback_price: float) -> float:
-        """Получить реальную цену из последней сделки по инструменту.
+        """Получить реальную цену закрытия из истории операций.
 
-        Стоп-ордер исполняется маркет-ордером, цена может отличаться от заданной.
-        Если не удаётся получить — возвращает fallback.
+        Сначала ищет фактическую цену исполнения в операциях T-Bank,
+        если не найдено — последнюю рыночную цену, иначе — fallback.
         """
+        try:
+            price = self.broker.get_executed_price(self.account_id, figi)
+            if price is not None:
+                return price
+        except Exception:
+            logger.debug("[EXEC] get_executed_price failed for %s", figi)
         try:
             price = self.broker.get_last_price(figi)
             if price is not None:
                 return price
         except Exception:
-            logger.debug("[EXEC] Could not get last price for %s, using fallback", figi)
+            logger.debug("[EXEC] get_last_price failed for %s, using fallback", figi)
         return fallback_price
+
+    def _get_stop_orders_cached(self) -> set[str]:
+        """Получить ID активных стоп-ордеров (с кэшем на 30 сек)."""
+        now = _time.time()
+        if self._stop_orders_cache_time and now - self._stop_orders_cache_time < 30:
+            return self._stop_orders_cache
+        try:
+            orders = self.broker.get_stop_orders(self.account_id)
+            self._stop_orders_cache = {so.stop_order_id for so in orders}
+        except Exception:
+            logger.exception("[EXEC] Failed to get stop orders for cache")
+            # Вернуть старый кэш, если есть
+        self._stop_orders_cache_time = now
+        return self._stop_orders_cache
 
     def _get_portfolio_qty(self, figi: str) -> int | None:
         """Получить реальное количество бумаги в портфеле. None при ошибке."""
@@ -229,6 +287,21 @@ class ExecutionManager:
             self.broker.cancel_order(self.account_id, position.entry_order_id)
         except Exception:
             logger.debug("[EXEC] Could not cancel entry order %s", position.entry_order_id)
+            # Race condition: лимитка могла исполниться между проверкой и отменой
+            if self._is_order_filled(position.entry_order_id):
+                logger.info("[EXEC] %s: order filled during cancel — activating", position.ticker)
+                try:
+                    self._activate_position(figi)
+                except Exception as e:
+                    logger.error("[EXEC] %s: failed to activate after race: %s", position.ticker, e)
+                    self.state.remove_position(figi)
+                    del self.positions[figi]
+                    if self.notifier:
+                        self.notifier.send_admin(
+                            f"⚠️ {position.ticker}: лимитка исполнилась в момент отмены, "
+                            f"но не удалось выставить SL/TP. Закройте вручную!"
+                        )
+                return
 
         self.state.remove_position(figi)
         del self.positions[figi]
@@ -308,29 +381,65 @@ class ExecutionManager:
 
         # status == "active"
         # Проверить, не закрылась ли позиция по SL/TP на бирже
-        active_stop_orders = self.broker.get_stop_orders(self.account_id)
-        active_stop_ids = {so.stop_order_id for so in active_stop_orders}
+        active_stop_ids = self._get_stop_orders_cached()
         sl_active = position.sl_order_id in active_stop_ids
         tp_active = position.tp_order_id in active_stop_ids
 
         if not sl_active and not tp_active:
-            # Оба ордера исчезли — позиция закрыта биржей (SL сработал, TP отменился)
+            # Оба ордера исчезли — проверяем портфель перед закрытием
+            if self._has_portfolio_position(figi):
+                # Позиция ещё на счёте, но стоп-ордеров нет — отменены вручную
+                logger.warning(
+                    "[EXEC] %s: both SL/TP gone but position still in portfolio "
+                    "— stop orders may have been cancelled manually",
+                    position.ticker,
+                )
+                if self.notifier:
+                    self.notifier.send_admin(
+                        f"⚠️ {position.ticker}: оба стоп-ордера исчезли, "
+                        f"но позиция ещё в портфеле.\n"
+                        f"Возможно, стоп-ордера отменены вручную через терминал.\n"
+                        f"SL: {position.stop_price} | TP: {position.target_price}"
+                    )
+                return  # Не закрываем state — ждём ручного вмешательства
             exit_price = self._get_real_exit_price(figi, position.stop_price)
-            logger.info("[EXEC] %s: both SL/TP gone, assuming stop_loss, real price=%.2f",
-                        position.ticker, exit_price)
+            logger.info("[EXEC] %s: both SL/TP gone, portfolio confirms closed, "
+                        "stop_loss, price=%.2f", position.ticker, exit_price)
             self._close_position(figi, exit_price, "stop_loss")
             return
         if not tp_active and sl_active:
-            # TP исчез, SL ещё жив — значит TP сработал
+            # TP исчез, SL ещё жив — проверяем портфель
+            if self._has_portfolio_position(figi):
+                logger.warning(
+                    "[EXEC] %s: TP gone but position still in portfolio — unexpected",
+                    position.ticker,
+                )
+                if self.notifier:
+                    self.notifier.send_admin(
+                        f"⚠️ {position.ticker}: тейк-профит исчез, "
+                        f"но позиция ещё в портфеле. Проверьте счёт."
+                    )
+                return
             exit_price = self._get_real_exit_price(figi, position.target_price)
-            logger.info("[EXEC] %s: TP filled (SL still active), real price=%.2f",
+            logger.info("[EXEC] %s: TP filled, portfolio confirmed, price=%.2f",
                         position.ticker, exit_price)
             self._close_position(figi, exit_price, "take_profit")
             return
         if not sl_active and tp_active:
-            # SL исчез, TP ещё жив — значит SL сработал
+            # SL исчез, TP ещё жив — проверяем портфель
+            if self._has_portfolio_position(figi):
+                logger.warning(
+                    "[EXEC] %s: SL gone but position still in portfolio — unexpected",
+                    position.ticker,
+                )
+                if self.notifier:
+                    self.notifier.send_admin(
+                        f"⚠️ {position.ticker}: стоп-лосс исчез, "
+                        f"но позиция ещё в портфеле. Проверьте счёт."
+                    )
+                return
             exit_price = self._get_real_exit_price(figi, position.stop_price)
-            logger.info("[EXEC] %s: SL filled (TP still active), real price=%.2f",
+            logger.info("[EXEC] %s: SL filled, portfolio confirmed, price=%.2f",
                         position.ticker, exit_price)
             self._close_position(figi, exit_price, "stop_loss")
             return
@@ -369,10 +478,17 @@ class ExecutionManager:
                         if position.direction == Signal.BUY
                         else OrderDirection.ORDER_DIRECTION_BUY)
             try:
-                self.broker.place_market_order(
+                order_id = self.broker.place_market_order(
                     self.account_id, figi, position.qty, exit_dir
                 )
-                logger.info("[EXEC] %s: market exit placed for timeout", position.ticker)
+                # Получить реальную цену исполнения рыночного ордера
+                fill_price = self.broker.get_order_fill_price(self.account_id, order_id)
+                if fill_price is None:
+                    fill_price = self.broker.get_executed_price(self.account_id, figi)
+                if fill_price is not None:
+                    exit_price = fill_price
+                logger.info("[EXEC] %s: market exit placed, fill_price=%.2f",
+                            position.ticker, exit_price)
             except Exception:
                 logger.exception(
                     "[EXEC] %s: FAILED to place market exit on timeout — position still open!",
@@ -386,7 +502,24 @@ class ExecutionManager:
                 # Не удаляем позицию из state — будет повторная попытка.
                 return
 
-        # 1b. Отменить оставшиеся ордера
+        # 1b. "deleted": клиент удалён — оставляем SL/TP на бирже, только чистим state
+        if reason == "deleted":
+            self.state.remove_position(figi)
+            del self.positions[figi]
+            logger.info(
+                "[EXEC] %s: client deleted, position left on exchange "
+                "(SL: %s, TP: %s)",
+                position.ticker, position.stop_price, position.target_price,
+            )
+            if self.notifier:
+                self.notifier.send_admin(
+                    f"ℹ️ {position.ticker} {position.direction.value}: позиция оставлена "
+                    f"на счёте со стоп-ордерами "
+                    f"(SL: {position.stop_price}, TP: {position.target_price})"
+                )
+            return
+
+        # 1c. Отменить оставшиеся ордера (stop_loss, take_profit)
         self._cancel_orders_safe(position)
 
         # 2. Рассчитать PnL (qty — в лотах, умножаем на lot_size для перевода в акции)
@@ -427,6 +560,14 @@ class ExecutionManager:
         # 5. Обновить счётчик SL
         if reason == "stop_loss":
             self.state.increment_consecutive_sl(position.ticker)
+            daily_sl = self.state.get_daily_sl_count_for_ticker(position.ticker)
+            if daily_sl >= self.max_daily_sl:
+                self._daily_sl_limit_reached = True
+                self._daily_sl_limit_ticker = position.ticker
+                logger.warning(
+                    "[EXEC] Client %d: daily SL limit reached for %s (%d/%d), signalling pause",
+                    self.client_id, position.ticker, daily_sl, self.max_daily_sl,
+                )
         elif reason in ("take_profit", "timeout"):
             self.state.reset_consecutive_sl(position.ticker)
 
@@ -436,6 +577,7 @@ class ExecutionManager:
             "take_profit": "тейк-профит",
             "timeout": "по времени",
             "revoked": "принудительно",
+            "deleted": "удаление клиента",
         }
         msg = (
             f"\U0001f534 Закрыта позиция {position.ticker} {position.direction.value}\n"
@@ -475,6 +617,43 @@ class ExecutionManager:
             if figi in tracked_figis:
                 continue
             orphans.append((known_tickers_by_figi[figi], figi, balance))
+
+        # Обратная проверка: позиции, которые бот отслеживает, но их нет в портфеле
+        broker_figis = {sec.figi for sec in securities if int(sec.balance) != 0}
+        active_stop_ids = self._get_stop_orders_cached()
+        for figi, position in list(self.positions.items()):
+            if position.status != "active":
+                continue
+            if figi not in broker_figis:
+                # Определить причину: SL/TP сработал или закрыта вручную
+                sl_gone = position.sl_order_id not in active_stop_ids
+                tp_gone = position.tp_order_id not in active_stop_ids
+                if sl_gone and not tp_gone:
+                    reason = "stop_loss"
+                    cause = "сработал стоп-лосс"
+                elif tp_gone and not sl_gone:
+                    reason = "take_profit"
+                    cause = "сработал тейк-профит"
+                elif sl_gone and tp_gone:
+                    reason = "stop_loss"
+                    cause = "оба ордера исчезли (вероятно стоп-лосс)"
+                else:
+                    reason = "stop_loss"
+                    cause = "закрыта вручную через терминал"
+
+                fallback = position.target_price if reason == "take_profit" else position.stop_price
+                exit_price = self._get_real_exit_price(figi, fallback)
+                logger.warning(
+                    "[EXEC] Reconcile: %s not in portfolio — %s, closing in bot (price=%.2f)",
+                    position.ticker, cause, exit_price,
+                )
+                self._close_position(figi, exit_price, reason)
+                if self.notifier:
+                    self.notifier.send_admin(
+                        f"⚠️ Reconcile: {position.ticker} отсутствует в портфеле.\n"
+                        f"Причина: {cause}.\n"
+                        f"Позиция закрыта в боте, P&L записан в журнал."
+                    )
 
         if not orphans:
             logger.info("[EXEC] Reconcile: OK (tracked=%d)", len(tracked_figis))
@@ -538,6 +717,9 @@ class ExecutionManager:
             self.state.reset_stale_sl_counters()
             return
 
+        found_total = len(self.positions)
+        closed_during_downtime = 0
+
         for figi, position in list(self.positions.items()):
             if position.status == "pending":
                 # Проверить, исполнилась ли лимитка пока бот был выключен
@@ -582,7 +764,25 @@ class ExecutionManager:
                 logger.info("[EXEC] Recovery: %s position active, continuing", position.ticker)
                 continue
 
-            # Позиция была закрыта пока бот не работал — получить реальную цену
+            # Позиция была закрыта пока бот не работал — проверить портфель
+            if self._has_portfolio_position(figi):
+                # Стоп-ордера изменились, но бумага всё ещё на счёте
+                logger.warning(
+                    "[EXEC] Recovery: %s stop orders changed but position still in portfolio "
+                    "— stop orders may have been cancelled manually while bot was down",
+                    position.ticker,
+                )
+                if self.notifier:
+                    self.notifier.send_admin(
+                        f"⚠️ Recovery: {position.ticker} — стоп-ордера исчезли, "
+                        f"но позиция ещё в портфеле.\n"
+                        f"Возможно, стоп-ордера отменены вручную.\n"
+                        f"SL: {position.stop_price} | TP: {position.target_price}\n"
+                        f"Бот продолжит отслеживать позицию."
+                    )
+                continue  # Оставляем в self.positions, продолжаем мониторинг
+
+            closed_during_downtime += 1
             if not sl_active and tp_active:
                 exit_price = self._get_real_exit_price(figi, position.stop_price)
                 self._close_position(figi, exit_price, "stop_loss")
@@ -597,10 +797,16 @@ class ExecutionManager:
 
         pending_count = sum(1 for p in self.positions.values() if p.status == "pending")
         active_count = sum(1 for p in self.positions.values() if p.status == "active")
-        logger.info("[EXEC] Recovery complete. Active: %d, Pending: %d", active_count, pending_count)
+        logger.info(
+            "[EXEC] Recovery complete. Found: %d, closed during downtime: %d, "
+            "still active: %d, pending: %d",
+            found_total, closed_during_downtime, active_count, pending_count,
+        )
         if self.notifier:
             self.notifier.send_admin(
-                f"Бот перезапущен. Активных: {active_count}, ожидающих: {pending_count}"
+                f"Бот перезапущен. Найдено позиций: {found_total} "
+                f"(закрыто пока стоял: {closed_during_downtime}). "
+                f"Активных: {active_count}, ожидающих: {pending_count}"
             )
 
     def _cancel_orders_safe(self, position: Position) -> None:

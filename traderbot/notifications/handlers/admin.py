@@ -83,7 +83,8 @@ def register(
         for c in subscribers:
             by_status[c.status.value] = by_status.get(c.status.value, 0) + 1
 
-        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        MSK = ZoneInfo("Europe/Moscow")
+        today_start = datetime.now(MSK).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         week_start = today_start - timedelta(days=6)
         pnl_today = _pnl_since(db, today_start)
         pnl_week = _pnl_since(db, week_start)
@@ -603,9 +604,18 @@ def register(
             return
 
         registry.update_status(client.id, ClientStatus.PAUSED)
-        execs.pop(client.id, None)
+        em = execs.get(client.id)
+        if em:
+            if em.positions:
+                em._revoked = True  # сопровождаем открытые позиции до SL/TP
+            else:
+                del execs[client.id]
 
-        bot.reply_to(message, f"⏸ Клиент #{client.id} приостановлен.")
+        bot.reply_to(
+            message,
+            f"⏸ Клиент #{client.id} приостановлен. "
+            f"Открытые позиции сопровождаются до SL/TP.",
+        )
         try:
             bot.send_message(client.tg_chat_id,
                              "⏸ Ваша торговля приостановлена администратором.")
@@ -670,7 +680,11 @@ def register(
                       "day": 1, "week": 7, "month": 30}
         days = period_map.get(period, 1)
 
-        since = datetime.now(timezone.utc) - timedelta(days=days)
+        MSK_tz = ZoneInfo("Europe/Moscow")
+        if days == 1:
+            since = datetime.now(MSK_tz).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+        else:
+            since = datetime.now(MSK_tz).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc) - timedelta(days=days - 1)
         period_label = {1: "сегодня", 7: "неделя", 30: "месяц"}.get(days, f"{days}д")
 
         rows = _pnl_by_client(db, since)
@@ -1472,6 +1486,7 @@ def _build_daily_report(db: Database, registry, now_msk: datetime) -> str:
         "take_profit": "тейк-профит",
         "timeout": "таймаут",
         "revoked": "принудительно",
+        "deleted": "удаление клиента",
     }
 
     # Разбивка по тикерам

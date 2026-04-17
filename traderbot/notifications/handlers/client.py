@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import telebot
+
+_MSK = ZoneInfo("Europe/Moscow")
 
 from traderbot.clients.db import Database
 from traderbot.clients.models import ClientRole, ClientStatus
@@ -347,14 +350,17 @@ def register(
             return
 
         registry.update_status(client.id, ClientStatus.PAUSED)
-        # Убрать из цикла (sync_execs подхватит на следующей итерации,
-        # но убираем сразу чтобы не открывались новые позиции)
-        if client.id in execs:
-            del execs[client.id]
+        em = execs.get(client.id)
+        if em:
+            if em.positions:
+                # Есть открытые позиции — оставляем em для сопровождения до SL/TP
+                em._revoked = True
+            else:
+                del execs[client.id]
 
         bot.reply_to(
             message,
-            "⏸ Торговля приостановлена. Открытые позиции будут закрыты по SL/TP.\n"
+            "⏸ Торговля приостановлена. Открытые позиции сопровождаются до SL/TP.\n"
             "Для возобновления — /resume",
         )
         logger.info("[BOT] /pause: client %d paused", client.id)
@@ -396,8 +402,8 @@ def register(
 # ---------------------------------------------------------------------------
 
 def _get_today_pnl(db: Database, client_id: int) -> float | None:
-    """P&L клиента за сегодня (UTC day)."""
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    """P&L клиента за сегодня (МСК-день)."""
+    today_start = datetime.now(_MSK).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     with db.cursor() as cur:
         cur.execute(
             "SELECT COALESCE(SUM(pnl), 0) AS total, COUNT(*) AS cnt "

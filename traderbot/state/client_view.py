@@ -50,5 +50,11 @@ class ClientStateView:
     def get_consecutive_sl(self, ticker: str) -> tuple[int, str | None]:
         return self._store.get_consecutive_sl(self._client_id, ticker)
 
+    def get_daily_sl_count(self) -> int:
+        return self._store.get_daily_sl_count(self._client_id)
+
+    def get_daily_sl_count_for_ticker(self, ticker: str) -> int:
+        return self._store.get_daily_sl_count_for_ticker(self._client_id, ticker)
+
     def reset_stale_sl_counters(self) -> None:
         self._store.reset_stale_sl_counters(self._client_id)

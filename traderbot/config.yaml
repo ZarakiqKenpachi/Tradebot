@@ -32,6 +32,7 @@ risk:
   risk_pct: 0.10
   max_position_pct: 1.50
   max_consecutive_sl: 3
+  max_daily_sl: 3
 
 # === Торговые инструменты ===
 tickers:
@@ -80,3 +81,9 @@ backtest:
   days: 30
   output_dir: "backtest/results"
   slippage_pct: 0.0005   # проскальзывание рыночных ордеров (SL, timeout): 0.05%
+
+# === Paper trading (sandbox) ===
+paper_trading:
+  token_env: "TBANK_SANDBOX_TOKEN"
+  initial_balance: 100000.0
+  database_path: "data/paper_trading.db"
