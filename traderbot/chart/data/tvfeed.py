@@ -304,6 +304,8 @@ class TvDatafeedProvider:
                         "[TVFEED] Connection lost fetching %s:%s %s (attempt %d/%d), reconnecting...",
                         exchange, symbol, timeframe, attempt, self.MAX_RETRIES,
                     )
+                    import time
+                    time.sleep(attempt * 2)  # backoff: 2s, 4s
                     self._reconnect()
                     continue
                 logger.exception("[TVFEED] Failed to fetch %s:%s %s", exchange, symbol, timeframe)

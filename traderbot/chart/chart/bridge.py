@@ -54,6 +54,15 @@ class ChartBridge(QObject):
         except Exception:
             pass  # High frequency, don't spam logs
 
+    @pyqtSlot(str)
+    def onLineDrawn(self, json_data: str):
+        """Called by JS when user draws a horizontal line."""
+        try:
+            data = json.loads(json_data)
+            logger.info("[BRIDGE] Line drawn at price %.2f", data.get("price", 0))
+        except Exception:
+            pass
+
     # ── Python → JS calls ────────────────────────────────
 
     def _run_js(self, script: str) -> None:
@@ -103,6 +112,22 @@ class ChartBridge(QObject):
 
     def fit_content(self) -> None:
         self._run_js("fitContent()")
+
+    def set_crosshair_mode(self, mode: str) -> None:
+        """Set crosshair mode: 'normal' or 'magnet'."""
+        self._run_js(f"setCrosshairMode('{mode}')")
+
+    def toggle_drawing_mode(self, enabled: bool) -> None:
+        self._run_js(f"toggleDrawingMode({'true' if enabled else 'false'})")
+
+    def add_horizontal_line(self, price: float, color: str = "#787b86", title: str = "") -> None:
+        self._run_js(f"addHorizontalLine({price}, '{color}', '{self._escape(title)}')")
+
+    def remove_all_user_lines(self) -> None:
+        self._run_js("removeAllUserLines()")
+
+    def remove_last_user_line(self) -> None:
+        self._run_js("removeLastUserLine()")
 
     @staticmethod
     def _escape(s: str) -> str:

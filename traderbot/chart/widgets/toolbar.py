@@ -1,10 +1,10 @@
 """Main toolbar — symbol search, timeframe buttons, indicators toggle."""
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal, Qt
+from PyQt6.QtCore import pyqtSignal, Qt, QStringListModel, QTimer
 from PyQt6.QtWidgets import (
     QToolBar, QPushButton, QLineEdit, QButtonGroup, QWidget, QHBoxLayout,
-    QCheckBox, QComboBox, QLabel,
+    QCheckBox, QComboBox, QLabel, QCompleter,
 )
 
 from traderbot.chart.config import TIMEFRAMES
@@ -15,25 +15,54 @@ class MainToolbar(QToolBar):
 
     # Signals
     symbol_search_requested = pyqtSignal(str)   # search query
+    symbol_quick_selected = pyqtSignal(str, str) # symbol, exchange
     timeframe_changed = pyqtSignal(str)          # "1h", "4h", etc.
     ema_toggled = pyqtSignal(bool)               # show/hide EMA
     auto_refresh_toggled = pyqtSignal(bool)      # auto-refresh on/off
     theme_toggle_requested = pyqtSignal()        # switch dark/light
     strategy_run_requested = pyqtSignal(str)     # strategy name
     fit_requested = pyqtSignal()                 # fit chart to content
+    crosshair_mode_changed = pyqtSignal(str)     # "normal" or "magnet"
+    drawing_mode_toggled = pyqtSignal(bool)      # drawing mode on/off
+    clear_lines_requested = pyqtSignal()         # clear user-drawn lines
 
     def __init__(self, parent=None):
         super().__init__("Main Toolbar", parent)
         self.setMovable(False)
         self.setFloatable(False)
+        self._symbol_map: dict[str, str] = {}  # "MOEX:SBER" → exchange
 
-        # ── Symbol search ────────────────────────────────
+        # ── Quick ticker selector ────────────────────────
+        self._ticker_combo = QComboBox()
+        self._ticker_combo.setFixedWidth(120)
+        self._ticker_combo.addItem("Tickers...", "")
+        self._ticker_combo.currentIndexChanged.connect(self._on_ticker_combo_changed)
+        self.addWidget(self._ticker_combo)
+
+        # ── Symbol search with autocomplete ──────────────
         self._symbol_input = QLineEdit()
         self._symbol_input.setPlaceholderText("Symbol (SBER, BTCUSDT...)")
         self._symbol_input.setFixedWidth(200)
         self._symbol_input.returnPressed.connect(
             lambda: self.symbol_search_requested.emit(self._symbol_input.text())
         )
+
+        # Autocomplete model — updated dynamically as user types
+        self._completer_model = QStringListModel()
+        self._completer = QCompleter(self._completer_model, self)
+        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._completer.setMaxVisibleItems(12)
+        self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._completer.activated.connect(self._on_completer_activated)
+        self._symbol_input.setCompleter(self._completer)
+
+        # Debounce timer for live search
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self._on_search_debounced)
+        self._symbol_input.textChanged.connect(lambda _: self._search_timer.start())
+
         self.addWidget(self._symbol_input)
 
         search_btn = QPushButton("Search")
@@ -95,10 +124,34 @@ class MainToolbar(QToolBar):
 
         self.addSeparator()
 
+        # ── Chart tools ──────────────────────────────────
+        self.addWidget(QLabel(" Tools: "))
+
+        self._crosshair_btn = QPushButton("Crosshair")
+        self._crosshair_btn.setCheckable(True)
+        self._crosshair_btn.setFixedWidth(75)
+        self._crosshair_btn.setToolTip("Toggle magnet crosshair")
+        self._crosshair_btn.toggled.connect(self._on_crosshair_toggle)
+        self.addWidget(self._crosshair_btn)
+
+        self._draw_btn = QPushButton("H-Line")
+        self._draw_btn.setCheckable(True)
+        self._draw_btn.setFixedWidth(55)
+        self._draw_btn.setToolTip("Click on chart to draw horizontal line")
+        self._draw_btn.toggled.connect(self.drawing_mode_toggled.emit)
+        self.addWidget(self._draw_btn)
+
+        self._clear_lines_btn = QPushButton("Clear")
+        self._clear_lines_btn.setFixedWidth(45)
+        self._clear_lines_btn.setToolTip("Remove all user-drawn lines")
+        self._clear_lines_btn.clicked.connect(self.clear_lines_requested.emit)
+        self.addWidget(self._clear_lines_btn)
+
+        self.addSeparator()
+
         # ── Controls ─────────────────────────────────────
-        # Spacer
         spacer = QWidget()
-        spacer.setFixedWidth(20)
+        spacer.setFixedWidth(10)
         self.addWidget(spacer)
 
         self._refresh_check = QCheckBox("Auto-refresh")
@@ -152,7 +205,77 @@ class MainToolbar(QToolBar):
     def get_selected_days(self) -> int:
         return self._days_combo.currentData() or 14
 
+    def set_ticker_list(self, tickers: list[tuple[str, str, str]]) -> None:
+        """Populate quick ticker combo and autocomplete.
+
+        Args:
+            tickers: [(symbol, exchange, description), ...]
+        """
+        self._ticker_combo.blockSignals(True)
+        self._ticker_combo.clear()
+        self._ticker_combo.addItem("Tickers...", "")
+        self._symbol_map.clear()
+
+        completions = []
+        for symbol, exchange, desc in tickers:
+            label = f"{symbol}" if not desc else f"{symbol} — {desc}"
+            key = f"{exchange}:{symbol}"
+            self._ticker_combo.addItem(label, key)
+            self._symbol_map[key] = exchange
+            completions.append(f"{exchange}:{symbol}  {desc}")
+            completions.append(symbol)
+
+        self._completer_model.setStringList(completions)
+        self._ticker_combo.blockSignals(False)
+
+    def set_search_service(self, search_service) -> None:
+        """Set search service for live autocomplete."""
+        self._search_service = search_service
+
     # ── Private ──────────────────────────────────────────
+
+    def _on_ticker_combo_changed(self, index: int) -> None:
+        key = self._ticker_combo.currentData()
+        if not key:
+            return
+        parts = key.split(":", 1)
+        if len(parts) == 2:
+            exchange, symbol = parts
+            self._symbol_input.setText(symbol)
+            self.symbol_quick_selected.emit(symbol, exchange)
+
+    def _on_completer_activated(self, text: str) -> None:
+        """User selected an autocomplete suggestion."""
+        # Parse "MOEX:SBER  Sberbank" or just "SBER"
+        part = text.split("  ")[0].strip()
+        if ":" in part:
+            exchange, symbol = part.split(":", 1)
+            self._symbol_input.setText(symbol)
+            self.symbol_quick_selected.emit(symbol, exchange)
+        else:
+            self._symbol_input.setText(part)
+            self.symbol_search_requested.emit(part)
+
+    def _on_search_debounced(self) -> None:
+        """Live autocomplete: update suggestions as user types."""
+        text = self._symbol_input.text().strip()
+        if len(text) < 2:
+            return
+        svc = getattr(self, "_search_service", None)
+        if svc is None:
+            return
+        try:
+            results = svc.search(text, limit=12)
+            completions = []
+            for info in results:
+                completions.append(f"{info.exchange}:{info.symbol}  {info.description}")
+            self._completer_model.setStringList(completions)
+        except Exception:
+            pass
+
+    def _on_crosshair_toggle(self, checked: bool) -> None:
+        mode = "magnet" if checked else "normal"
+        self.crosshair_mode_changed.emit(mode)
 
     def _on_tf_clicked(self, button: QPushButton) -> None:
         tf = button.property("timeframe")

@@ -179,6 +179,18 @@ class ChartWidget(QWidget):
         if self._chart_ready:
             self._bridge.fit_content()
 
+    def set_crosshair_mode(self, mode: str) -> None:
+        if self._chart_ready:
+            self._bridge.set_crosshair_mode(mode)
+
+    def toggle_drawing_mode(self, enabled: bool) -> None:
+        if self._chart_ready:
+            self._bridge.toggle_drawing_mode(enabled)
+
+    def clear_user_lines(self) -> None:
+        if self._chart_ready:
+            self._bridge.remove_all_user_lines()
+
     def get_candle_df(self) -> pd.DataFrame:
         """Return current candle DataFrame for strategy testing."""
         return self._candle_df.copy()

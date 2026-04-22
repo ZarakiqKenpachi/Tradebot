@@ -92,12 +92,12 @@ REFRESH_INTERVALS = {
     "1m": 10,
     "5m": 15,
     "15m": 30,
-    "30m": 30,
-    "1h": 60,
-    "2h": 60,
-    "4h": 120,
-    "1d": 300,
-    "1w": 600,
+    "30m": 60,
+    "1h": 120,
+    "2h": 180,
+    "4h": 300,
+    "1d": 600,
+    "1w": 900,
 
     # Simulation scan TF — the granularity used for SL/TP checking in strategy runner
     # 15S gives sub-minute precision for fills and exits

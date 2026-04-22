@@ -369,10 +369,103 @@ function fitContent() {
     chart.timeScale().fitContent();
 }
 
+// ── Drawing tools ──────────────────────────────────────
+
+let userPriceLines = [];
+let isDrawingMode = false;
+let measureStart = null;
+
+function setCrosshairMode(mode) {
+    // mode: "normal" or "magnet"
+    if (mode === "magnet") {
+        chart.applyOptions({
+            crosshair: { mode: LightweightCharts.CrosshairMode.Magnet },
+        });
+    } else {
+        chart.applyOptions({
+            crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+        });
+    }
+}
+
+function toggleDrawingMode(enabled) {
+    isDrawingMode = enabled;
+    document.getElementById("chart-container").style.cursor = enabled ? "crosshair" : "default";
+}
+
+function addHorizontalLine(price, color, title) {
+    if (!candleSeries) return;
+    const pl = candleSeries.createPriceLine({
+        price: price,
+        color: color || "#787b86",
+        lineWidth: 1,
+        lineStyle: 2,
+        axisLabelVisible: true,
+        title: title || "",
+    });
+    userPriceLines.push(pl);
+}
+
+function removeAllUserLines() {
+    for (const pl of userPriceLines) {
+        candleSeries.removePriceLine(pl);
+    }
+    userPriceLines = [];
+}
+
+function removeLastUserLine() {
+    if (userPriceLines.length > 0) {
+        const pl = userPriceLines.pop();
+        candleSeries.removePriceLine(pl);
+    }
+}
+
+// Measure tool state
+let measureLine = null;
+
+function startMeasure(price1, time1) {
+    measureStart = { price: price1, time: time1 };
+}
+
+function showMeasureResult(price1, price2, time1, time2) {
+    const diff = price2 - price1;
+    const pct = ((diff / price1) * 100).toFixed(2);
+    const sign = diff >= 0 ? "+" : "";
+    const text = sign + diff.toFixed(2) + " (" + sign + pct + "%)";
+
+    // Show as watermark temporarily
+    const el = document.getElementById("measure-info");
+    if (el) {
+        el.textContent = text;
+        el.style.display = "block";
+        setTimeout(() => { el.style.display = "none"; }, 5000);
+    }
+}
+
 // ── Init with QWebChannel bridge ────────────────────────
 
 function init() {
     initChart();
+
+    // Drawing mode: click to add horizontal line at price
+    chart.subscribeClick(param => {
+        if (!param.point || !param.time) return;
+
+        if (isDrawingMode && param.seriesData) {
+            const candleData = param.seriesData.get(candleSeries);
+            if (candleData) {
+                const price = candleData.close;
+                addHorizontalLine(price, "#787b86", price.toFixed(2));
+                if (bridge) bridge.onLineDrawn(JSON.stringify({price: price}));
+            }
+        }
+
+        // Trade marker click (original behavior)
+        const clickedMarker = findMarkerAtTime(param.time);
+        if (clickedMarker && bridge) {
+            bridge.onMarkerClicked(JSON.stringify(clickedMarker));
+        }
+    });
 
     if (typeof QWebChannel !== "undefined") {
         new QWebChannel(qt.webChannelTransport, function(channel) {

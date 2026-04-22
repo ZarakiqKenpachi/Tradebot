@@ -171,6 +171,10 @@ class StrategyRunner:
             # Get 15S (or scan_df) slice for this bar: (prev_close, current_close]
             bar_scan = _get_scan_slice(scan_df, prev_time, current_time)
 
+            # Fallback: if no scan data for this bar, synthesize from primary bar OHLC
+            if bar_scan.empty:
+                bar_scan = _synthesize_scan_bar(primary_df, i, current_time)
+
             # Current 30m bar for candle counting
             current_30m = _get_30m_at(df_30m, current_time)
 
@@ -258,6 +262,8 @@ class StrategyRunner:
 
                         # Check SL/TP on remaining scan candles after fill
                         remaining = _get_scan_slice(scan_df, fill_time, current_time)
+                        if remaining.empty:
+                            remaining = bar_scan[bar_scan.index > fill_time]
                         if not remaining.empty:
                             exit_trade = _scan_exit(position, remaining, cfg)
                             if exit_trade is not None:
@@ -337,6 +343,8 @@ class StrategyRunner:
                 )
                 # Check immediate exit
                 remaining = _get_scan_slice(scan_df, fill_time, current_time)
+                if remaining.empty:
+                    remaining = bar_scan[bar_scan.index > fill_time]
                 if not remaining.empty:
                     exit_trade = _scan_exit(position, remaining, cfg)
                     if exit_trade is not None:
@@ -384,7 +392,48 @@ class StrategyRunner:
         return result
 
 
-# ── Helper functions ─────────────────���───────────────────────
+# ── Helper functions ──────────────────────────────────────────
+
+def _synthesize_scan_bar(primary_df: pd.DataFrame, i: int, current_time) -> pd.DataFrame:
+    """Create synthetic scan data from a primary bar's OHLC.
+
+    Generates 4 micro-bars simulating intra-bar price movement:
+    Open → High → Low → Close (bullish bar) or Open → Low → High → Close (bearish).
+    This allows fill/exit logic to work when high-resolution data is unavailable.
+    """
+    row = primary_df.iloc[i]
+    o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+    vol = float(row.get("volume", 0)) / 4
+
+    is_bullish = c >= o
+    if is_bullish:
+        # Open → Low → High → Close (typical bullish: dip then rally)
+        prices = [
+            (o, o, l, l),   # open → low
+            (l, h, l, h),   # low → high
+            (h, h, c, c),   # high → close
+        ]
+    else:
+        # Open → High → Low → Close (typical bearish: rally then drop)
+        prices = [
+            (o, h, o, h),   # open → high
+            (h, h, l, l),   # high → low
+            (l, c, l, c),   # low → close
+        ]
+
+    ts = current_time
+    records = []
+    for j, (po, ph, pl, pc) in enumerate(prices):
+        records.append({
+            "open": po, "high": ph, "low": pl, "close": pc, "volume": vol,
+        })
+
+    df = pd.DataFrame(records, index=[ts] * len(records))
+    # Deduplicate index by adding microsecond offsets
+    new_idx = [ts + pd.Timedelta(microseconds=j) for j in range(len(records))]
+    df.index = new_idx
+    return df
+
 
 def _get_scan_slice(
     scan_df: pd.DataFrame | None, start: pd.Timestamp, end: pd.Timestamp,

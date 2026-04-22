@@ -49,12 +49,29 @@
         pointer-events: none;
         user-select: none;
     }
+    /* Measure info overlay */
+    #measure-info {
+        display: none;
+        position: absolute;
+        top: 60px;
+        left: 12px;
+        z-index: 20;
+        padding: 6px 12px;
+        background: rgba(30, 34, 45, 0.9);
+        border: 1px solid #363a45;
+        border-radius: 4px;
+        color: #d1d4dc;
+        font-size: 14px;
+        font-weight: bold;
+        pointer-events: none;
+    }
 </style>
 </head>
 <body>
 <div id="chart-container">
     <div id="watermark"></div>
     <div id="tooltip"></div>
+    <div id="measure-info"></div>
 </div>
 
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>

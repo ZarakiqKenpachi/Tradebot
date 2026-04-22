@@ -72,6 +72,8 @@ class MainWindow(QMainWindow):
             self._strategy_runner.get_strategy_names(),
             strategy_tickers=self._load_strategy_tickers(),
         )
+        self._toolbar.set_search_service(self._search_service)
+        self._populate_ticker_list()
         self.addToolBar(self._toolbar)
 
         # ── Central widget ─────────────���─────────────────
@@ -118,12 +120,16 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         # Toolbar
         self._toolbar.symbol_search_requested.connect(self._on_symbol_search)
+        self._toolbar.symbol_quick_selected.connect(self._load_symbol)
         self._toolbar.timeframe_changed.connect(self._on_timeframe_changed)
         self._toolbar.ema_toggled.connect(self._chart.toggle_ema)
         self._toolbar.auto_refresh_toggled.connect(self._chart.set_auto_refresh)
         self._toolbar.theme_toggle_requested.connect(self._toggle_theme)
         self._toolbar.strategy_run_requested.connect(self._on_strategy_run)
         self._toolbar.fit_requested.connect(self._chart.fit_content)
+        self._toolbar.crosshair_mode_changed.connect(self._chart.set_crosshair_mode)
+        self._toolbar.drawing_mode_toggled.connect(self._chart.toggle_drawing_mode)
+        self._toolbar.clear_lines_requested.connect(self._chart.clear_user_lines)
 
         # Chart
         self._chart.status_changed.connect(self._statusbar.set_status)
@@ -134,6 +140,7 @@ class MainWindow(QMainWindow):
         # Trades table
         self._trades_panel.trade_selected.connect(self._on_trade_selected)
         self._trades_panel.trade_double_clicked.connect(self._on_trade_double_clicked)
+        self._trades_panel.scroll_to_trade.connect(self._on_scroll_to_trade)
 
     # ── Event handlers ───────────���───────────────────────
 
@@ -204,6 +211,10 @@ class MainWindow(QMainWindow):
         dialog = TradeDetailDialog(trade, self)
         dialog.exec()
 
+    def _on_scroll_to_trade(self, trade: dict) -> None:
+        """Right-click → Show on chart: scroll + highlight SL/TP lines."""
+        self._chart.highlight_trade(trade)
+
     def _on_strategy_run(self, strategy_name: str) -> None:
         """Run full strategy simulation with 15S precision."""
         df = self._chart.get_candle_df()
@@ -213,6 +224,20 @@ class MainWindow(QMainWindow):
 
         sim_days = self._toolbar.get_selected_days()
         self._statusbar.set_status(f"Running '{strategy_name}' for {sim_days} days...")
+
+        try:
+            self._run_strategy_inner(strategy_name, df, sim_days)
+        except Exception:
+            logger.exception("[APP] Strategy run failed")
+            QMessageBox.critical(self, "Error", f"Strategy run failed:\n{logger.name}")
+            import traceback
+            QMessageBox.critical(self, "Strategy Error", traceback.format_exc()[-500:])
+            self._statusbar.set_status("Strategy run failed — see error dialog")
+
+    def _run_strategy_inner(self, strategy_name: str, df, sim_days: int) -> None:
+        """Inner logic for strategy run (separated so errors are caught)."""
+        import pandas as pd
+        from datetime import timedelta
 
         # 1. Build candle dict with all required timeframes
         strategy_cls = self._strategy_runner._registry.get(strategy_name)
@@ -247,7 +272,6 @@ class MainWindow(QMainWindow):
             return
 
         # Trim candles to selected number of days
-        from datetime import timedelta
         cutoff = pd.Timestamp.now(tz="UTC") - timedelta(days=sim_days)
         for tf_key in list(candles.keys()):
             candles[tf_key] = candles[tf_key].loc[candles[tf_key].index >= cutoff]
@@ -327,6 +351,37 @@ class MainWindow(QMainWindow):
             self._trades_panel.set_trades(trades)
             trade_dicts = [t.to_dict() for t in trades]
             self._chart.set_trade_markers(trade_dicts)
+
+    def _populate_ticker_list(self) -> None:
+        """Fill quick ticker combo with config tickers + known MOEX tickers."""
+        from traderbot.chart.data.symbol_search import _KNOWN_MOEX
+
+        tickers: list[tuple[str, str, str]] = []
+        seen = set()
+
+        # 1. Tickers from config.yaml (trading tickers first)
+        config_path = PROJECT_ROOT / "traderbot" / "config.yaml"
+        if config_path.exists():
+            try:
+                import yaml
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f)
+                for ticker_name in cfg.get("tickers", {}):
+                    if ticker_name not in seen:
+                        exchange = _KNOWN_MOEX.get(ticker_name, ("MOEX",))[0]
+                        desc = _KNOWN_MOEX.get(ticker_name, ("", ""))[1] if ticker_name in _KNOWN_MOEX else ""
+                        tickers.append((ticker_name, exchange, desc))
+                        seen.add(ticker_name)
+            except Exception:
+                pass
+
+        # 2. All known MOEX tickers
+        for sym, (exch, desc, _) in _KNOWN_MOEX.items():
+            if sym not in seen:
+                tickers.append((sym, exch, desc))
+                seen.add(sym)
+
+        self._toolbar.set_ticker_list(tickers)
 
     @staticmethod
     def _load_strategy_tickers() -> dict[str, list[str]]:
