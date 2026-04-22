@@ -1,5 +1,7 @@
 # Environment — NEVER commit real tokens
 .env
+passes_tv.env
+traderbot/passes_tv.env
 
 # Python
 __pycache__/
@@ -39,6 +41,11 @@ backups/
 # Backtest results
 backtest/results/
 traderbot/backtest/results/
+
+# Chart Analyzer local data (cache, simulation journal)
+data/chart_cache.db
+data/sim_journal.db
+data/symbol_history.json
 
 # Claude Code internals
 .claude/

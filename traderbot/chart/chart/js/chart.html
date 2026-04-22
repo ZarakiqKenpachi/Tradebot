@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg-color, #131722);
+        font-family: "Segoe UI", sans-serif;
+    }
+    #chart-container {
+        width: 100%;
+        height: 100%;
+        position: relative;
+    }
+    /* Tooltip for markers */
+    #tooltip {
+        display: none;
+        position: absolute;
+        z-index: 1000;
+        padding: 8px 12px;
+        background: rgba(30, 34, 45, 0.95);
+        border: 1px solid #363a45;
+        border-radius: 4px;
+        color: #d1d4dc;
+        font-size: 12px;
+        line-height: 1.5;
+        pointer-events: none;
+        max-width: 350px;
+        white-space: pre-wrap;
+    }
+    #tooltip .tt-title { font-weight: bold; margin-bottom: 4px; }
+    #tooltip .tt-buy { color: #26a69a; }
+    #tooltip .tt-sell { color: #ef5350; }
+    #tooltip .tt-pnl-pos { color: #26a69a; }
+    #tooltip .tt-pnl-neg { color: #ef5350; }
+    /* Watermark */
+    #watermark {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        z-index: 10;
+        color: rgba(120, 123, 134, 0.3);
+        font-size: 48px;
+        font-weight: bold;
+        pointer-events: none;
+        user-select: none;
+    }
+</style>
+</head>
+<body>
+<div id="chart-container">
+    <div id="watermark"></div>
+    <div id="tooltip"></div>
+</div>
+
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="lightweight-charts.standalone.production.js"></script>
+<script src="chart.js"></script>
+</body>
+</html>

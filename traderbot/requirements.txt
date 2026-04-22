@@ -6,3 +6,9 @@ pyyaml
 requests
 pyTelegramBotAPI
 matplotlib
+
+# Chart Analyzer GUI
+PyQt6
+PyQt6-WebEngine
+tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
+tradingview-websocket
