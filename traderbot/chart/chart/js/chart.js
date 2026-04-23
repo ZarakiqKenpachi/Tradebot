@@ -833,6 +833,10 @@ function fitContent() {
     chart.timeScale().fitContent();
 }
 
+function scrollToRealTime() {
+    chart.timeScale().scrollToRealTime();
+}
+
 function setCrosshairMode(mode) {
     chart.applyOptions({
         crosshair: { mode: mode === "magnet"

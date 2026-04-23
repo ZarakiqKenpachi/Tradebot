@@ -544,8 +544,9 @@ class MainWindow(QMainWindow):
         self._pb_idx += 1
         candle_time = candle["time"]
 
-        # Append candle to chart
+        # Append candle to chart and keep it in view
         self._chart._bridge.append_candles(json.dumps([candle]))
+        self._chart._bridge.scroll_to_realtime()
 
         # Check trade entries
         while self._pb_trade_ptr < len(self._pb_trades):

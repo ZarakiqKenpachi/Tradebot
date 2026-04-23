@@ -154,6 +154,9 @@ class ChartBridge(QObject):
     def fit_content(self) -> None:
         self._run_js("fitContent()")
 
+    def scroll_to_realtime(self) -> None:
+        self._run_js("scrollToRealTime()")
+
     def take_screenshot(self) -> None:
         self._run_js("takeScreenshot()")
 
