@@ -191,6 +191,90 @@ class ChartWidget(QWidget):
         if self._chart_ready:
             self._bridge.remove_all_user_lines()
 
+    # ── Drawing tools ───────────────────────────────────
+
+    def set_active_tool(self, tool: str) -> None:
+        if self._chart_ready:
+            self._bridge.set_active_tool(tool)
+
+    def undo_drawing(self) -> None:
+        if self._chart_ready:
+            self._bridge.undo_drawing()
+
+    def clear_all_drawings(self) -> None:
+        if self._chart_ready:
+            self._bridge.clear_all_drawings()
+
+    def set_price_scale_mode(self, mode: str) -> None:
+        if self._chart_ready:
+            self._bridge.set_price_scale_mode(mode)
+
+    def take_screenshot(self) -> None:
+        if self._chart_ready:
+            self._bridge.take_screenshot()
+
+    # ── Indicators ──────────────────────────────────────
+
+    def set_rsi(self, period: int = 14, visible: bool = True) -> None:
+        if self._candle_df.empty or not self._chart_ready:
+            return
+        if not visible:
+            self._bridge.remove_rsi()
+            return
+        close = self._candle_df["close"]
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(period).mean()
+        loss = (-delta.clip(upper=0)).rolling(period).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        rsi = 100 - (100 / (1 + rs))
+        self._bridge.set_rsi_data(self._series_to_json(rsi))
+
+    def set_macd(self, fast: int = 12, slow: int = 26, signal: int = 9, visible: bool = True) -> None:
+        if self._candle_df.empty or not self._chart_ready:
+            return
+        if not visible:
+            self._bridge.remove_macd()
+            return
+        close = self._candle_df["close"]
+        ema_fast = close.ewm(span=fast, adjust=False).mean()
+        ema_slow = close.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast - ema_slow
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        histogram = macd_line - signal_line
+
+        # Histogram needs color
+        hist_data = []
+        for ts, val in histogram.items():
+            if pd.notna(val):
+                hist_data.append({
+                    "time": int(ts.timestamp()),
+                    "value": round(float(val), 4),
+                    "color": "#26a69a80" if val >= 0 else "#ef535080",
+                })
+
+        self._bridge.set_macd_data(
+            self._series_to_json(macd_line),
+            self._series_to_json(signal_line),
+            json.dumps(hist_data),
+        )
+
+    def set_bollinger(self, period: int = 20, std_dev: float = 2.0, visible: bool = True) -> None:
+        if self._candle_df.empty or not self._chart_ready:
+            return
+        if not visible:
+            self._bridge.remove_bollinger()
+            return
+        close = self._candle_df["close"]
+        sma = close.rolling(period).mean()
+        std = close.rolling(period).std()
+        upper = sma + std_dev * std
+        lower = sma - std_dev * std
+        self._bridge.set_bollinger_data(
+            self._series_to_json(upper),
+            self._series_to_json(sma),
+            self._series_to_json(lower),
+        )
+
     def get_candle_df(self) -> pd.DataFrame:
         """Return current candle DataFrame for strategy testing."""
         return self._candle_df.copy()

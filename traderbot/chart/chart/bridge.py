@@ -1,4 +1,4 @@
-"""Python ↔ JavaScript bridge via QWebChannel."""
+"""Python <-> JavaScript bridge via QWebChannel."""
 from __future__ import annotations
 
 import json
@@ -10,115 +10,115 @@ logger = logging.getLogger(__name__)
 
 
 class ChartBridge(QObject):
-    """Bridge object exposed to JavaScript via QWebChannel.
+    """Bridge object exposed to JavaScript via QWebChannel."""
 
-    JS calls methods on this object; Python emits signals to JS.
-    """
-
-    # Signals from JS → Python
+    # Signals from JS -> Python
     chart_ready = pyqtSignal()
-    marker_clicked = pyqtSignal(dict)       # trade marker data
-    crosshair_moved = pyqtSignal(dict)      # OHLCV data at cursor
+    marker_clicked = pyqtSignal(dict)
+    crosshair_moved = pyqtSignal(dict)
+    tool_deactivated = pyqtSignal()  # JS cancelled active tool (Escape/RMB)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._page = None
 
     def set_page(self, page) -> None:
-        """Set the QWebEnginePage for calling JS."""
         self._page = page
 
-    # ── JS → Python slots ────────────────────────────────
+    # ── JS -> Python slots ───────────────────────────────
 
     @pyqtSlot()
     def chartReady(self):
-        """Called by JS when chart is initialized."""
         logger.info("[BRIDGE] Chart ready")
         self.chart_ready.emit()
 
     @pyqtSlot(str)
     def onMarkerClicked(self, json_data: str):
-        """Called by JS when user clicks a trade marker."""
         try:
-            data = json.loads(json_data)
-            self.marker_clicked.emit(data)
+            self.marker_clicked.emit(json.loads(json_data))
         except Exception:
-            logger.exception("[BRIDGE] Failed to parse marker click data")
+            logger.exception("[BRIDGE] Failed to parse marker click")
 
     @pyqtSlot(str)
     def onCrosshairMove(self, json_data: str):
-        """Called by JS on crosshair move — OHLCV at cursor."""
         try:
-            data = json.loads(json_data)
-            self.crosshair_moved.emit(data)
-        except Exception:
-            pass  # High frequency, don't spam logs
-
-    @pyqtSlot(str)
-    def onLineDrawn(self, json_data: str):
-        """Called by JS when user draws a horizontal line."""
-        try:
-            data = json.loads(json_data)
-            logger.info("[BRIDGE] Line drawn at price %.2f", data.get("price", 0))
+            self.crosshair_moved.emit(json.loads(json_data))
         except Exception:
             pass
 
-    # ── Python → JS calls ────────────────────────────────
+    @pyqtSlot(str)
+    def onLineDrawn(self, json_data: str):
+        pass
+
+    @pyqtSlot()
+    def onToolDeactivated(self):
+        """JS cancelled active tool via Escape or right-click."""
+        self.tool_deactivated.emit()
+
+    # ── Python -> JS calls ───────────────────────────────
 
     def _run_js(self, script: str) -> None:
-        """Execute JavaScript in the chart page."""
         if self._page:
             self._page.runJavaScript(script)
 
-    def set_candles(self, candles_json: str) -> None:
-        """Send candle data to chart."""
-        self._run_js(f"setCandles('{self._escape(candles_json)}')")
+    # Data
+    def set_candles(self, j: str) -> None:
+        self._run_js(f"setCandles('{self._escape(j)}')")
 
-    def update_candle(self, candle_json: str) -> None:
-        """Update/append a single candle."""
-        self._run_js(f"updateCandle('{self._escape(candle_json)}')")
+    def update_candle(self, j: str) -> None:
+        self._run_js(f"updateCandle('{self._escape(j)}')")
 
-    def append_candles(self, candles_json: str) -> None:
-        """Append new candles."""
-        self._run_js(f"appendCandles('{self._escape(candles_json)}')")
+    def append_candles(self, j: str) -> None:
+        self._run_js(f"appendCandles('{self._escape(j)}')")
 
-    def set_ema_data(self, fast_json: str, slow_json: str) -> None:
-        """Send EMA overlay data."""
-        self._run_js(f"setEmaData('{self._escape(fast_json)}', '{self._escape(slow_json)}')")
+    # Overlays
+    def set_ema_data(self, fast: str, slow: str) -> None:
+        self._run_js(f"setEmaData('{self._escape(fast)}', '{self._escape(slow)}')")
 
     def toggle_ema(self, visible: bool) -> None:
         self._run_js(f"toggleEma({'true' if visible else 'false'})")
 
-    def set_trade_markers(self, markers_json: str) -> None:
-        """Set trade entry/exit markers on the chart."""
-        self._run_js(f"setTradeMarkers('{self._escape(markers_json)}')")
+    def set_rsi_data(self, j: str) -> None:
+        self._run_js(f"setRsiData('{self._escape(j)}')")
 
-    def set_price_lines(self, lines_json: str) -> None:
-        """Draw horizontal price lines (SL/TP levels)."""
-        self._run_js(f"setPriceLines('{self._escape(lines_json)}')")
+    def remove_rsi(self) -> None:
+        self._run_js("removeRsi()")
+
+    def set_macd_data(self, line: str, signal: str, hist: str) -> None:
+        self._run_js(f"setMacdData('{self._escape(line)}','{self._escape(signal)}','{self._escape(hist)}')")
+
+    def remove_macd(self) -> None:
+        self._run_js("removeMacd()")
+
+    def set_bollinger_data(self, upper: str, middle: str, lower: str) -> None:
+        self._run_js(f"setBollingerData('{self._escape(upper)}','{self._escape(middle)}','{self._escape(lower)}')")
+
+    def remove_bollinger(self) -> None:
+        self._run_js("removeBollinger()")
+
+    # Markers & price lines
+    def set_trade_markers(self, j: str) -> None:
+        self._run_js(f"setTradeMarkers('{self._escape(j)}')")
+
+    def set_price_lines(self, j: str) -> None:
+        self._run_js(f"setPriceLines('{self._escape(j)}')")
 
     def clear_price_lines(self) -> None:
         self._run_js("clearPriceLines()")
 
-    def apply_theme(self, theme_json: str) -> None:
-        """Apply color theme to chart."""
-        self._run_js(f"applyTheme('{self._escape(theme_json)}')")
+    # Drawing tools
+    def set_active_tool(self, tool: str) -> None:
+        """Set active drawing tool: trendline, hray, fib, rect, measure, or empty to deactivate."""
+        if tool:
+            self._run_js(f"setActiveTool('{tool}')")
+        else:
+            self._run_js("setActiveTool(null)")
 
-    def set_watermark(self, text: str) -> None:
-        self._run_js(f"setWatermark('{self._escape(text)}')")
+    def undo_drawing(self) -> None:
+        self._run_js("undoDrawing()")
 
-    def scroll_to_time(self, timestamp: int) -> None:
-        self._run_js(f"scrollToTime({timestamp})")
-
-    def fit_content(self) -> None:
-        self._run_js("fitContent()")
-
-    def set_crosshair_mode(self, mode: str) -> None:
-        """Set crosshair mode: 'normal' or 'magnet'."""
-        self._run_js(f"setCrosshairMode('{mode}')")
-
-    def toggle_drawing_mode(self, enabled: bool) -> None:
-        self._run_js(f"toggleDrawingMode({'true' if enabled else 'false'})")
+    def clear_all_drawings(self) -> None:
+        self._run_js("clearAllDrawings()")
 
     def add_horizontal_line(self, price: float, color: str = "#787b86", title: str = "") -> None:
         self._run_js(f"addHorizontalLine({price}, '{color}', '{self._escape(title)}')")
@@ -129,7 +129,33 @@ class ChartBridge(QObject):
     def remove_last_user_line(self) -> None:
         self._run_js("removeLastUserLine()")
 
+    # Navigation
+    def set_crosshair_mode(self, mode: str) -> None:
+        self._run_js(f"setCrosshairMode('{mode}')")
+
+    def set_price_scale_mode(self, mode: str) -> None:
+        self._run_js(f"setPriceScaleMode('{mode}')")
+
+    def scroll_to_time(self, timestamp: int) -> None:
+        self._run_js(f"scrollToTime({timestamp})")
+
+    def fit_content(self) -> None:
+        self._run_js("fitContent()")
+
+    def take_screenshot(self) -> None:
+        self._run_js("takeScreenshot()")
+
+    # Theme
+    def apply_theme(self, j: str) -> None:
+        self._run_js(f"applyTheme('{self._escape(j)}')")
+
+    def set_watermark(self, text: str) -> None:
+        self._run_js(f"setWatermark('{self._escape(text)}')")
+
+    # Legacy compat
+    def toggle_drawing_mode(self, enabled: bool) -> None:
+        self.set_active_tool("hray" if enabled else "")
+
     @staticmethod
     def _escape(s: str) -> str:
-        """Escape string for JS single-quote context."""
         return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")

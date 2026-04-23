@@ -23,8 +23,15 @@ class MainToolbar(QToolBar):
     strategy_run_requested = pyqtSignal(str)     # strategy name
     fit_requested = pyqtSignal()                 # fit chart to content
     crosshair_mode_changed = pyqtSignal(str)     # "normal" or "magnet"
-    drawing_mode_toggled = pyqtSignal(bool)      # drawing mode on/off
-    clear_lines_requested = pyqtSignal()         # clear user-drawn lines
+    tool_changed = pyqtSignal(str)               # drawing tool name or ""
+    undo_drawing_requested = pyqtSignal()
+    clear_drawings_requested = pyqtSignal()
+    screenshot_requested = pyqtSignal()
+    price_scale_changed = pyqtSignal(str)        # "normal", "log", "percentage"
+    # Indicators
+    bollinger_toggled = pyqtSignal(bool)
+    rsi_toggled = pyqtSignal(bool)
+    macd_toggled = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__("Main Toolbar", parent)
@@ -95,79 +102,123 @@ class MainToolbar(QToolBar):
         self.addSeparator()
 
         # ── Indicators ───────────────────────────────────
-        self._ema_check = QCheckBox("EMA 20/50")
+        self._ema_check = QCheckBox("EMA")
         self._ema_check.setChecked(True)
         self._ema_check.toggled.connect(self.ema_toggled.emit)
         self.addWidget(self._ema_check)
 
+        self._bb_check = QCheckBox("BB")
+        self._bb_check.setToolTip("Bollinger Bands (20, 2)")
+        self._bb_check.toggled.connect(self.bollinger_toggled.emit)
+        self.addWidget(self._bb_check)
+
+        self._rsi_check = QCheckBox("RSI")
+        self._rsi_check.setToolTip("RSI (14)")
+        self._rsi_check.toggled.connect(self.rsi_toggled.emit)
+        self.addWidget(self._rsi_check)
+
+        self._macd_check = QCheckBox("MACD")
+        self._macd_check.setToolTip("MACD (12, 26, 9)")
+        self._macd_check.toggled.connect(self.macd_toggled.emit)
+        self.addWidget(self._macd_check)
+
+        self.addSeparator()
+
+        # ── Drawing tools ────────────────────────────────
+        self._tool_buttons: dict[str, QPushButton] = {}
+        self._tool_group = QButtonGroup(self)
+        self._tool_group.setExclusive(False)
+
+        tools = [
+            ("trendline", "Trend", "Trend line (two clicks)"),
+            ("hray", "H-Ray", "Horizontal ray (one click)"),
+            ("fib", "Fib", "Fibonacci retracement (two clicks)"),
+            ("rect", "Rect", "Rectangle zone (two clicks)"),
+            ("measure", "Ruler", "Measure distance (two clicks)"),
+        ]
+        for key, label, tip in tools:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedWidth(50)
+            btn.setToolTip(tip)
+            btn.setProperty("tool_key", key)
+            self._tool_group.addButton(btn)
+            self._tool_buttons[key] = btn
+            self.addWidget(btn)
+
+        self._tool_group.buttonClicked.connect(self._on_tool_clicked)
+
+        undo_btn = QPushButton("Undo")
+        undo_btn.setFixedWidth(42)
+        undo_btn.setToolTip("Undo last drawing (Ctrl+Z)")
+        undo_btn.clicked.connect(self.undo_drawing_requested.emit)
+        self.addWidget(undo_btn)
+
+        clear_btn = QPushButton("X")
+        clear_btn.setFixedWidth(24)
+        clear_btn.setToolTip("Clear all drawings")
+        clear_btn.clicked.connect(self.clear_drawings_requested.emit)
+        self.addWidget(clear_btn)
+
         self.addSeparator()
 
         # ── Strategy selector ────────────────────────────
-        self.addWidget(QLabel(" Strategy: "))
         self._strategy_combo = QComboBox()
         self._strategy_combo.setFixedWidth(180)
         self._strategy_combo.addItem("(none)", "")
         self.addWidget(self._strategy_combo)
 
-        self.addWidget(QLabel(" Days: "))
         self._days_combo = QComboBox()
-        self._days_combo.setFixedWidth(70)
+        self._days_combo.setFixedWidth(60)
         for d in [3, 7, 14, 30, 60, 90, 180, 365]:
             self._days_combo.addItem(f"{d}d", d)
-        self._days_combo.setCurrentIndex(2)  # default 14 days
+        self._days_combo.setCurrentIndex(2)
         self.addWidget(self._days_combo)
 
         run_btn = QPushButton("Run")
-        run_btn.setFixedWidth(50)
+        run_btn.setFixedWidth(40)
         run_btn.clicked.connect(self._on_strategy_run)
         self.addWidget(run_btn)
 
         self.addSeparator()
 
-        # ── Chart tools ──────────────────────────────────
-        self.addWidget(QLabel(" Tools: "))
-
-        self._crosshair_btn = QPushButton("Crosshair")
+        # ── Controls ─────────────────────────────────────
+        # Crosshair mode
+        self._crosshair_btn = QPushButton("Magnet")
         self._crosshair_btn.setCheckable(True)
-        self._crosshair_btn.setFixedWidth(75)
-        self._crosshair_btn.setToolTip("Toggle magnet crosshair")
+        self._crosshair_btn.setFixedWidth(55)
+        self._crosshair_btn.setToolTip("Magnet crosshair")
         self._crosshair_btn.toggled.connect(self._on_crosshair_toggle)
         self.addWidget(self._crosshair_btn)
 
-        self._draw_btn = QPushButton("H-Line")
-        self._draw_btn.setCheckable(True)
-        self._draw_btn.setFixedWidth(55)
-        self._draw_btn.setToolTip("Click on chart to draw horizontal line")
-        self._draw_btn.toggled.connect(self.drawing_mode_toggled.emit)
-        self.addWidget(self._draw_btn)
+        # Price scale mode
+        self._scale_combo = QComboBox()
+        self._scale_combo.setFixedWidth(55)
+        self._scale_combo.addItem("Auto", "normal")
+        self._scale_combo.addItem("Log", "log")
+        self._scale_combo.addItem("%", "percentage")
+        self._scale_combo.currentIndexChanged.connect(self._on_scale_changed)
+        self.addWidget(self._scale_combo)
 
-        self._clear_lines_btn = QPushButton("Clear")
-        self._clear_lines_btn.setFixedWidth(45)
-        self._clear_lines_btn.setToolTip("Remove all user-drawn lines")
-        self._clear_lines_btn.clicked.connect(self.clear_lines_requested.emit)
-        self.addWidget(self._clear_lines_btn)
-
-        self.addSeparator()
-
-        # ── Controls ─────────────────────────────────────
-        spacer = QWidget()
-        spacer.setFixedWidth(10)
-        self.addWidget(spacer)
-
-        self._refresh_check = QCheckBox("Auto-refresh")
+        self._refresh_check = QCheckBox("Live")
         self._refresh_check.setChecked(True)
+        self._refresh_check.setToolTip("Auto-refresh candles")
         self._refresh_check.toggled.connect(self.auto_refresh_toggled.emit)
         self.addWidget(self._refresh_check)
 
         fit_btn = QPushButton("Fit")
-        fit_btn.setFixedWidth(40)
-        fit_btn.setToolTip("Fit chart to content")
+        fit_btn.setFixedWidth(32)
         fit_btn.clicked.connect(self.fit_requested.emit)
         self.addWidget(fit_btn)
 
+        screenshot_btn = QPushButton("Snap")
+        screenshot_btn.setFixedWidth(38)
+        screenshot_btn.setToolTip("Save chart screenshot")
+        screenshot_btn.clicked.connect(self.screenshot_requested.emit)
+        self.addWidget(screenshot_btn)
+
         theme_btn = QPushButton("Theme")
-        theme_btn.setFixedWidth(55)
-        theme_btn.setToolTip("Toggle dark/light theme")
+        theme_btn.setFixedWidth(50)
         theme_btn.clicked.connect(self.theme_toggle_requested.emit)
         self.addWidget(theme_btn)
 
@@ -274,8 +325,27 @@ class MainToolbar(QToolBar):
             pass
 
     def _on_crosshair_toggle(self, checked: bool) -> None:
-        mode = "magnet" if checked else "normal"
-        self.crosshair_mode_changed.emit(mode)
+        self.crosshair_mode_changed.emit("magnet" if checked else "normal")
+
+    def _on_scale_changed(self, _index: int) -> None:
+        mode = self._scale_combo.currentData() or "normal"
+        self.price_scale_changed.emit(mode)
+
+    def _on_tool_clicked(self, button: QPushButton) -> None:
+        key = button.property("tool_key")
+        if button.isChecked():
+            # Uncheck all other tool buttons
+            for k, b in self._tool_buttons.items():
+                if k != key:
+                    b.setChecked(False)
+            self.tool_changed.emit(key)
+        else:
+            self.tool_changed.emit("")
+
+    def deactivate_tools(self) -> None:
+        """Called when JS cancels tool (Escape/RMB)."""
+        for b in self._tool_buttons.values():
+            b.setChecked(False)
 
     def _on_tf_clicked(self, button: QPushButton) -> None:
         tf = button.property("timeframe")

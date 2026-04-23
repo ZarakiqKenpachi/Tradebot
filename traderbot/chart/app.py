@@ -128,14 +128,21 @@ class MainWindow(QMainWindow):
         self._toolbar.strategy_run_requested.connect(self._on_strategy_run)
         self._toolbar.fit_requested.connect(self._chart.fit_content)
         self._toolbar.crosshair_mode_changed.connect(self._chart.set_crosshair_mode)
-        self._toolbar.drawing_mode_toggled.connect(self._chart.toggle_drawing_mode)
-        self._toolbar.clear_lines_requested.connect(self._chart.clear_user_lines)
+        self._toolbar.tool_changed.connect(self._chart.set_active_tool)
+        self._toolbar.undo_drawing_requested.connect(self._chart.undo_drawing)
+        self._toolbar.clear_drawings_requested.connect(self._chart.clear_all_drawings)
+        self._toolbar.screenshot_requested.connect(self._chart.take_screenshot)
+        self._toolbar.price_scale_changed.connect(self._chart.set_price_scale_mode)
+        self._toolbar.bollinger_toggled.connect(lambda v: self._chart.set_bollinger(visible=v))
+        self._toolbar.rsi_toggled.connect(lambda v: self._chart.set_rsi(visible=v))
+        self._toolbar.macd_toggled.connect(lambda v: self._chart.set_macd(visible=v))
 
         # Chart
         self._chart.status_changed.connect(self._statusbar.set_status)
         self._chart.crosshair_data.connect(self._statusbar.set_ohlcv)
         self._chart.trade_marker_clicked.connect(self._on_marker_clicked)
         self._chart.candles_loaded.connect(self._on_candles_loaded)
+        self._chart._bridge.tool_deactivated.connect(self._toolbar.deactivate_tools)
 
         # Trades table
         self._trades_panel.trade_selected.connect(self._on_trade_selected)
@@ -194,8 +201,14 @@ class MainWindow(QMainWindow):
         self._chart.change_timeframe(tf)
 
     def _on_candles_loaded(self, count: int) -> None:
-        """After candles load, compute and show EMA."""
-        self._chart.set_ema(20, 50, visible=True)
+        """After candles load, recompute all active indicators."""
+        self._chart.set_ema(20, 50, visible=self._toolbar._ema_check.isChecked())
+        if self._toolbar._bb_check.isChecked():
+            self._chart.set_bollinger(visible=True)
+        if self._toolbar._rsi_check.isChecked():
+            self._chart.set_rsi(visible=True)
+        if self._toolbar._macd_check.isChecked():
+            self._chart.set_macd(visible=True)
 
     def _on_marker_clicked(self, marker_data: dict) -> None:
         """Show trade detail when marker clicked on chart."""
