@@ -17,6 +17,8 @@ class ChartBridge(QObject):
     marker_clicked = pyqtSignal(dict)
     crosshair_moved = pyqtSignal(dict)
     tool_deactivated = pyqtSignal()  # JS cancelled active tool (Escape/RMB)
+    playback_pause = pyqtSignal()    # Space key — toggle pause
+    playback_step = pyqtSignal()     # Right arrow — step forward
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -54,6 +56,16 @@ class ChartBridge(QObject):
     def onToolDeactivated(self):
         """JS cancelled active tool via Escape or right-click."""
         self.tool_deactivated.emit()
+
+    @pyqtSlot()
+    def onPlaybackPause(self):
+        """Space pressed — toggle playback pause."""
+        self.playback_pause.emit()
+
+    @pyqtSlot()
+    def onPlaybackStep(self):
+        """Right arrow pressed — step forward one candle."""
+        self.playback_step.emit()
 
     # ── Python -> JS calls ───────────────────────────────
 

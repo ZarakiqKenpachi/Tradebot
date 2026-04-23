@@ -547,11 +547,23 @@ function initKeyboard() {
         if (e.key === "End") {
             chart.timeScale().scrollToRealTime();
         }
+        // Space — pause/resume playback
+        if (e.key === " " || e.code === "Space") {
+            e.preventDefault();
+            if (bridge) bridge.onPlaybackPause();
+            return;
+        }
         // Arrow keys
         if (e.key === "ArrowLeft") {
             chart.timeScale().scrollToPosition(chart.timeScale().scrollPosition() - 5, false);
         }
         if (e.key === "ArrowRight") {
+            if (e.shiftKey && bridge) {
+                // Shift+Right — step one candle forward
+                e.preventDefault();
+                bridge.onPlaybackStep();
+                return;
+            }
             chart.timeScale().scrollToPosition(chart.timeScale().scrollPosition() + 5, false);
         }
     });

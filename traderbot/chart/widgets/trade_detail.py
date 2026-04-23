@@ -15,11 +15,13 @@ class TradeDetailDialog(QDialog):
         super().__init__(parent)
         self._trade = trade
         self.setWindowTitle("Trade Details")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(380)
+        self.setMaximumWidth(500)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
+        layout.setSpacing(8)
         t = self._trade
 
         direction = t.get("direction", "?")
@@ -28,75 +30,95 @@ class TradeDetailDialog(QDialog):
         dir_color = "#26a69a" if is_buy else "#ef5350"
 
         # Header
-        header = QLabel(f"<h2 style='color:{dir_color}'>{direction} {ticker}</h2>")
+        header = QLabel(
+            f"<span style='color:{dir_color}; font-size:16px; font-weight:bold'>"
+            f"{direction}</span>"
+            f" <span style='color:#9598a1; font-size:16px'>{ticker}</span>"
+        )
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
 
-        # Entry group
-        entry_group = QGroupBox("Entry")
-        eg = QGridLayout(entry_group)
-        eg.addWidget(QLabel("Price:"), 0, 0)
-        eg.addWidget(QLabel(f"<b>{t.get('entry_price', '—')}</b>"), 0, 1)
-        eg.addWidget(QLabel("Time:"), 1, 0)
-        eg.addWidget(QLabel(str(t.get("entry_time", "—"))), 1, 1)
-        eg.addWidget(QLabel("Reason:"), 2, 0)
-
-        reason_label = QLabel(str(t.get("entry_reason", "—")))
-        reason_label.setWordWrap(True)
-        reason_label.setStyleSheet("color: #d1d4dc; padding: 4px;")
-        eg.addWidget(reason_label, 2, 1)
-
-        eg.addWidget(QLabel("Qty:"), 3, 0)
-        eg.addWidget(QLabel(str(t.get("qty", "—"))), 3, 1)
-        layout.addWidget(entry_group)
-
-        # Exit group
-        exit_group = QGroupBox("Exit")
-        xg = QGridLayout(exit_group)
-        xg.addWidget(QLabel("Price:"), 0, 0)
-        xg.addWidget(QLabel(f"<b>{t.get('exit_price', '—')}</b>"), 0, 1)
-        xg.addWidget(QLabel("Time:"), 1, 0)
-        xg.addWidget(QLabel(str(t.get("exit_time", "—"))), 1, 1)
-        xg.addWidget(QLabel("Reason:"), 2, 0)
-
-        exit_reason_label = QLabel(str(t.get("exit_reason", "—")))
-        exit_reason_label.setWordWrap(True)
-        exit_reason_label.setStyleSheet("color: #d1d4dc; padding: 4px;")
-        xg.addWidget(exit_reason_label, 2, 1)
-
-        xg.addWidget(QLabel("Candles held:"), 3, 0)
-        xg.addWidget(QLabel(str(t.get("candles_held", "—"))), 3, 1)
-        layout.addWidget(exit_group)
-
-        # Levels group
-        levels_group = QGroupBox("Levels")
-        lg = QGridLayout(levels_group)
-        lg.addWidget(QLabel("Stop Loss:"), 0, 0)
-        sl = t.get("stop_price", "—")
-        lg.addWidget(QLabel(f"<span style='color:#ff9800'>{sl}</span>"), 0, 1)
-        lg.addWidget(QLabel("Take Profit:"), 1, 0)
-        tp = t.get("target_price", "—")
-        lg.addWidget(QLabel(f"<span style='color:#2962ff'>{tp}</span>"), 1, 1)
-        layout.addWidget(levels_group)
-
-        # P&L
+        # P&L (prominent, at top)
         pnl = t.get("pnl")
-        commission = t.get("commission", 0)
         if pnl is not None:
             pnl_color = "#26a69a" if pnl >= 0 else "#ef5350"
             pnl_sign = "+" if pnl >= 0 else ""
+            commission = t.get("commission", 0)
             pnl_label = QLabel(
-                f"<h3>P&L: <span style='color:{pnl_color}'>{pnl_sign}{pnl:.2f}</span>"
-                f" <span style='color:#787b86; font-size:12px'>(commission: {commission:.4f})</span></h3>"
+                f"<div style='text-align:center'>"
+                f"<span style='color:{pnl_color}; font-size:20px; font-weight:bold'>"
+                f"{pnl_sign}{pnl:.2f}</span>"
+                f"<br><span style='color:#525669; font-size:10px'>commission: {commission:.4f}</span>"
+                f"</div>"
             )
             pnl_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             layout.addWidget(pnl_label)
 
+        # Entry
+        entry_group = QGroupBox("Entry")
+        eg = QGridLayout(entry_group)
+        eg.setSpacing(4)
+        self._add_row(eg, 0, "Price", f"{t.get('entry_price', '—')}")
+        self._add_row(eg, 1, "Time", self._fmt_time(t.get("entry_time", "—")))
+        self._add_row(eg, 2, "Reason", str(t.get("entry_reason", "—")), wrap=True)
+        self._add_row(eg, 3, "Qty", str(t.get("qty", "—")))
+        layout.addWidget(entry_group)
+
+        # Exit
+        exit_group = QGroupBox("Exit")
+        xg = QGridLayout(exit_group)
+        xg.setSpacing(4)
+        self._add_row(xg, 0, "Price", f"{t.get('exit_price', '—')}")
+        self._add_row(xg, 1, "Time", self._fmt_time(t.get("exit_time", "—")))
+
+        exit_reason = str(t.get("exit_reason", "—"))
+        reason_color = "#26a69a" if "take_profit" in exit_reason else "#ef5350" if "stop_loss" in exit_reason else "#ff9800"
+        self._add_row(xg, 2, "Result", exit_reason, color=reason_color)
+        self._add_row(xg, 3, "Bars held", str(t.get("candles_held", "—")))
+        layout.addWidget(exit_group)
+
+        # Levels
+        levels_group = QGroupBox("Levels")
+        lg = QGridLayout(levels_group)
+        lg.setSpacing(4)
+        sl = t.get("stop_price", "—")
+        tp = t.get("target_price", "—")
+        self._add_row(lg, 0, "Stop Loss", str(sl), color="#ff9800")
+        self._add_row(lg, 1, "Take Profit", str(tp), color="#2962ff")
+        layout.addWidget(levels_group)
+
         # Close button
-        btn_layout = QHBoxLayout()
         close_btn = QPushButton("Close")
+        close_btn.setProperty("class", "accent-btn")
+        close_btn.setFixedWidth(80)
         close_btn.clicked.connect(self.accept)
+        btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         btn_layout.addWidget(close_btn)
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
+
+    @staticmethod
+    def _add_row(grid: QGridLayout, row: int, label: str, value: str,
+                 color: str = "", wrap: bool = False) -> None:
+        key_lbl = QLabel(label)
+        key_lbl.setStyleSheet("color: #636674; font-size: 11px;")
+
+        val_text = value
+        if color:
+            val_text = f"<span style='color:{color}'>{value}</span>"
+        val_lbl = QLabel(val_text)
+        val_lbl.setTextFormat(Qt.TextFormat.RichText)
+        val_lbl.setStyleSheet("font-size: 12px;")
+        if wrap:
+            val_lbl.setWordWrap(True)
+
+        grid.addWidget(key_lbl, row, 0)
+        grid.addWidget(val_lbl, row, 1)
+
+    @staticmethod
+    def _fmt_time(t) -> str:
+        s = str(t)
+        if "T" in s:
+            s = s.replace("T", " ")
+        return s[:19]

@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
+import json
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QVBoxLayout, QWidget,
     QMessageBox,
@@ -26,7 +27,7 @@ from traderbot.chart.trades.journal import TradeJournalReader
 from traderbot.chart.trades.sim_journal import SimulationJournal
 from traderbot.chart.trades.table import TradesPanel
 from traderbot.chart.strategy.runner import StrategyRunner, SimulationConfig
-from traderbot.chart.widgets.toolbar import MainToolbar
+from traderbot.chart.widgets.toolbar import MainToolbar, StrategyBar
 from traderbot.chart.widgets.symbol_dialog import SymbolSearchDialog
 from traderbot.chart.widgets.trade_detail import TradeDetailDialog
 from traderbot.chart.widgets.statusbar import ChartStatusBar
@@ -66,15 +67,18 @@ class MainWindow(QMainWindow):
         self._sim_journal = SimulationJournal(str(PROJECT_ROOT / "data" / "sim_journal.db"))
         self._strategy_runner = StrategyRunner(provider=self._provider)
 
-        # ── Toolbar ──────────────────────────────────────
+        # ── Toolbars ─────────────────────────────────────
         self._toolbar = MainToolbar(self)
-        self._toolbar.set_strategies(
-            self._strategy_runner.get_strategy_names(),
-            strategy_tickers=self._load_strategy_tickers(),
-        )
         self._toolbar.set_search_service(self._search_service)
         self._populate_ticker_list()
         self.addToolBar(self._toolbar)
+
+        self._strategy_bar = StrategyBar(self)
+        self._strategy_bar.set_strategies(
+            self._strategy_runner.get_strategy_names(),
+            strategy_tickers=self._load_strategy_tickers(),
+        )
+        self.addToolBar(self._strategy_bar)
 
         # ── Central widget ─────────────���─────────────────
         central = QWidget()
@@ -108,6 +112,19 @@ class MainWindow(QMainWindow):
         self._statusbar = ChartStatusBar(self)
         self.setStatusBar(self._statusbar)
 
+        # ── Playback state ───────────────────────────────
+        self._playback_timer = QTimer(self)
+        self._playback_timer.timeout.connect(self._playback_tick)
+        self._pb_candles: list[dict] = []
+        self._pb_trades: list = []
+        self._pb_idx = 0
+        self._pb_warmup = 60
+        self._pb_trade_ptr = 0      # next trade entry to show
+        self._pb_active_trade = None # trade with open position (lines shown)
+        self._pb_shown_markers: list[dict] = []  # accumulated markers
+        self._pb_shown_trades: list = []  # trades for table
+        self._pb_paused = False
+
         # ── Connect signals ──────────────────────────────
         self._connect_signals()
 
@@ -125,7 +142,6 @@ class MainWindow(QMainWindow):
         self._toolbar.ema_toggled.connect(self._chart.toggle_ema)
         self._toolbar.auto_refresh_toggled.connect(self._chart.set_auto_refresh)
         self._toolbar.theme_toggle_requested.connect(self._toggle_theme)
-        self._toolbar.strategy_run_requested.connect(self._on_strategy_run)
         self._toolbar.fit_requested.connect(self._chart.fit_content)
         self._toolbar.crosshair_mode_changed.connect(self._chart.set_crosshair_mode)
         self._toolbar.tool_changed.connect(self._chart.set_active_tool)
@@ -137,12 +153,22 @@ class MainWindow(QMainWindow):
         self._toolbar.rsi_toggled.connect(lambda v: self._chart.set_rsi(visible=v))
         self._toolbar.macd_toggled.connect(lambda v: self._chart.set_macd(visible=v))
 
+        # Strategy bar
+        self._strategy_bar.strategy_run_requested.connect(self._on_strategy_run)
+        self._strategy_bar.playback_play_requested.connect(self._on_playback_start)
+        self._strategy_bar.playback_pause_requested.connect(self._on_playback_pause)
+        self._strategy_bar.playback_stop_requested.connect(self._on_playback_stop)
+        self._strategy_bar.playback_step_requested.connect(self._on_playback_step)
+        self._strategy_bar._speed_combo.currentIndexChanged.connect(self._on_playback_speed_changed)
+
         # Chart
         self._chart.status_changed.connect(self._statusbar.set_status)
         self._chart.crosshair_data.connect(self._statusbar.set_ohlcv)
         self._chart.trade_marker_clicked.connect(self._on_marker_clicked)
         self._chart.candles_loaded.connect(self._on_candles_loaded)
         self._chart._bridge.tool_deactivated.connect(self._toolbar.deactivate_tools)
+        self._chart._bridge.playback_pause.connect(self._on_playback_pause)
+        self._chart._bridge.playback_step.connect(self._on_playback_step)
 
         # Trades table
         self._trades_panel.trade_selected.connect(self._on_trade_selected)
@@ -235,7 +261,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Data", "Load candles first.")
             return
 
-        sim_days = self._toolbar.get_selected_days()
+        sim_days = self._strategy_bar.get_selected_days()
         self._statusbar.set_status(f"Running '{strategy_name}' for {sim_days} days...")
 
         try:
@@ -357,6 +383,333 @@ class MainWindow(QMainWindow):
             f"Balance: {result.final_balance:.0f} | Precision: {precision}"
         )
 
+    # ── Playback (candle-by-candle replay) ─────────────
+
+    def _on_playback_start(self, strategy_name: str) -> None:
+        """Run simulation, then replay candles one-by-one."""
+        df = self._chart.get_candle_df()
+        if df.empty:
+            QMessageBox.warning(self, "No Data", "Load candles first.")
+            return
+
+        sim_days = self._strategy_bar.get_selected_days()
+        self._statusbar.set_status(f"Preparing playback: '{strategy_name}' {sim_days}d...")
+
+        try:
+            result, candles, primary_tf = self._run_simulation_for_playback(
+                strategy_name, df, sim_days,
+            )
+        except Exception:
+            import traceback
+            logger.exception("[APP] Playback simulation failed")
+            QMessageBox.critical(self, "Error", traceback.format_exc()[-500:])
+            return
+
+        if not candles or result is None:
+            return
+
+        primary_df = candles[primary_tf]
+        self._pb_candles = self._df_to_candle_list(primary_df)
+        self._pb_trades = sorted(result.trades, key=lambda t: t.entry_time)
+        self._pb_trade_ptr = 0
+        self._pb_active_trade = None
+        self._pb_shown_markers = []
+        self._pb_shown_trades = []
+        self._pb_paused = False
+        self._pb_strategy_name = strategy_name
+
+        # Calculate warmup: end BEFORE the first trade so markers
+        # don't appear retroactively on warmup candles.
+        self._pb_warmup = min(60, len(self._pb_candles) // 4)
+        if self._pb_trades:
+            first_entry_ts = self._trade_time_to_ts(self._pb_trades[0].entry_time)
+            if first_entry_ts is not None:
+                for i, c in enumerate(self._pb_candles):
+                    if c["time"] >= first_entry_ts:
+                        # Stop warmup 5 candles before the first trade
+                        self._pb_warmup = max(0, i - 5)
+                        break
+
+        # Clear chart and load warmup candles
+        warmup_data = self._pb_candles[:self._pb_warmup]
+        if warmup_data:
+            self._chart._bridge.set_candles(json.dumps(warmup_data))
+        else:
+            # No warmup — start with an empty chart, first candle via append
+            self._chart._bridge.set_candles(json.dumps([self._pb_candles[0]]))
+            self._pb_warmup = 1
+        self._chart._bridge.set_trade_markers(json.dumps([]))
+        self._chart._bridge.clear_price_lines()
+        self._trades_panel.set_trades([])
+
+        self._pb_idx = self._pb_warmup
+
+        logger.info(
+            "[PLAYBACK] %s: %d candles, %d trades, warmup=%d, first_trade=%s",
+            strategy_name, len(self._pb_candles), len(self._pb_trades),
+            self._pb_warmup,
+            self._pb_trades[0].entry_time if self._pb_trades else "none",
+        )
+
+        # Start timer
+        speed_ms = self._strategy_bar.get_playback_speed()
+        self._playback_timer.start(speed_ms)
+        self._strategy_bar.set_playback_state(True)
+        self._statusbar.set_status(
+            f"Playback: {strategy_name} | {len(self._pb_trades)} trades to replay"
+        )
+
+    def _run_simulation_for_playback(self, strategy_name: str, df, sim_days: int):
+        """Run simulation and return (result, candles_dict, primary_tf)."""
+        import pandas as pd
+        from datetime import timedelta
+        from traderbot.chart.strategy.runner import SimulationConfig
+
+        strategy_cls = self._strategy_runner._registry.get(strategy_name)
+        if not strategy_cls:
+            QMessageBox.warning(self, "Error", f"Strategy '{strategy_name}' not found")
+            return None, None, None
+
+        required = getattr(strategy_cls, "required_timeframes", [])
+        candles: dict = {}
+
+        for tf in required:
+            self._statusbar.set_status(f"Loading {tf} data...")
+            try:
+                tf_df = self._provider.get_candles(
+                    self._chart.current_symbol, self._chart.current_exchange,
+                    tf, n_bars=5000,
+                )
+                if not tf_df.empty:
+                    candles[tf] = tf_df
+            except Exception:
+                pass
+            if tf not in candles and not df.empty:
+                resampled = self._resample_candles(df, tf)
+                if resampled is not None and not resampled.empty:
+                    candles[tf] = resampled
+
+        if not candles:
+            QMessageBox.warning(self, "Error", "Could not load required timeframes")
+            return None, None, None
+
+        cutoff = pd.Timestamp.now(tz="UTC") - timedelta(days=sim_days)
+        for tf_key in list(candles.keys()):
+            candles[tf_key] = candles[tf_key].loc[candles[tf_key].index >= cutoff]
+
+        # Scan data for SL/TP precision
+        scan_df = None
+        scan_tf = "15S" if self._provider.has_premium else "1m"
+        self._statusbar.set_status(f"Loading {scan_tf} scan data...")
+        try:
+            scan_df = self._provider.get_candles(
+                self._chart.current_symbol, self._chart.current_exchange,
+                scan_tf, n_bars=5000,
+            )
+            if scan_df.empty:
+                scan_df = None
+        except Exception:
+            pass
+
+        if scan_df is not None:
+            scan_df = scan_df.loc[scan_df.index >= cutoff]
+            if scan_df.empty:
+                scan_df = None
+
+        self._statusbar.set_status(f"Simulating '{strategy_name}'...")
+        sim_config = SimulationConfig(scan_tf=scan_tf)
+        result = self._strategy_runner.run(
+            strategy_name, candles,
+            scan_df=scan_df,
+            config=sim_config,
+            ticker=self._chart.current_symbol,
+        )
+
+        primary_tf = required[0] if required else list(candles.keys())[0]
+        primary_df = candles[primary_tf]
+        logger.info(
+            "[PLAYBACK] Data range: %s .. %s (%d bars, tf=%s)",
+            primary_df.index[0], primary_df.index[-1],
+            len(primary_df), primary_tf,
+        )
+        return result, candles, primary_tf
+
+    def _playback_tick(self) -> None:
+        """Add one candle and check for trade events."""
+        if self._pb_idx >= len(self._pb_candles):
+            self._on_playback_stop()
+            return
+
+        candle = self._pb_candles[self._pb_idx]
+        self._pb_idx += 1
+        candle_time = candle["time"]
+
+        # Append candle to chart
+        self._chart._bridge.append_candles(json.dumps([candle]))
+
+        # Check trade entries
+        while self._pb_trade_ptr < len(self._pb_trades):
+            trade = self._pb_trades[self._pb_trade_ptr]
+            entry_ts = self._trade_time_to_ts(trade.entry_time)
+            if entry_ts is not None and entry_ts <= candle_time:
+                # Show entry marker
+                self._pb_shown_markers.append({
+                    "time": entry_ts,
+                    "type": "entry",
+                    "direction": trade.direction,
+                    "price": trade.entry_price,
+                    "stop_price": trade.stop_price,
+                    "target_price": trade.target_price,
+                    "entry_reason": trade.entry_reason,
+                    "qty": trade.qty,
+                    "trade_id": trade.id,
+                    "ticker": trade.ticker,
+                })
+                self._chart._bridge.set_trade_markers(
+                    json.dumps(self._pb_shown_markers)
+                )
+                # Show SL/TP/Entry price lines
+                self._pb_active_trade = trade
+                self._show_position_lines(trade)
+                self._pb_trade_ptr += 1
+            else:
+                break
+
+        # Check trade exits
+        if self._pb_active_trade is not None:
+            trade = self._pb_active_trade
+            exit_ts = self._trade_time_to_ts(trade.exit_time)
+            if exit_ts is not None and exit_ts <= candle_time:
+                # Show exit marker
+                self._pb_shown_markers.append({
+                    "time": exit_ts,
+                    "type": "exit",
+                    "direction": trade.direction,
+                    "price": trade.exit_price,
+                    "pnl": trade.pnl,
+                    "exit_reason": trade.exit_reason,
+                    "entry_reason": trade.entry_reason,
+                    "candles_held": trade.candles_held,
+                    "trade_id": trade.id,
+                    "ticker": trade.ticker,
+                })
+                self._chart._bridge.set_trade_markers(
+                    json.dumps(self._pb_shown_markers)
+                )
+                # Remove position lines
+                self._chart._bridge.clear_price_lines()
+                # Add to trades table
+                self._pb_shown_trades.append(trade)
+                self._trades_panel.set_trades(self._pb_shown_trades)
+                self._pb_active_trade = None
+
+        # Status
+        pct = int(self._pb_idx / len(self._pb_candles) * 100)
+        total_pnl = sum(t.pnl for t in self._pb_shown_trades)
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        self._statusbar.set_status(
+            f"Playback {pct}% | {self._pb_idx}/{len(self._pb_candles)} | "
+            f"trades: {len(self._pb_shown_trades)} | P&L: {pnl_sign}{total_pnl:.2f}"
+        )
+
+    def _show_position_lines(self, trade) -> None:
+        """Show entry/SL/TP price lines for an open position."""
+        is_buy = trade.direction == "BUY"
+        lines = [
+            {
+                "price": trade.entry_price,
+                "color": "#26a69a" if is_buy else "#ef5350",
+                "title": f"Entry {trade.entry_price:.2f}",
+                "style": 0,
+            },
+            {
+                "price": trade.stop_price,
+                "color": "#ff9800",
+                "title": f"SL {trade.stop_price:.2f}",
+                "style": 2,
+            },
+            {
+                "price": trade.target_price,
+                "color": "#2962ff",
+                "title": f"TP {trade.target_price:.2f}",
+                "style": 2,
+            },
+        ]
+        self._chart._bridge.set_price_lines(json.dumps(lines))
+
+    def _on_playback_pause(self) -> None:
+        """Toggle pause/resume."""
+        if self._pb_paused:
+            speed_ms = self._strategy_bar.get_playback_speed()
+            self._playback_timer.start(speed_ms)
+            self._pb_paused = False
+        else:
+            self._playback_timer.stop()
+            self._pb_paused = True
+
+    def _on_playback_step(self) -> None:
+        """Advance one candle while paused."""
+        if not self._pb_paused:
+            self._playback_timer.stop()
+            self._pb_paused = True
+        self._playback_tick()
+
+    def _on_playback_stop(self) -> None:
+        """Stop playback and show final results."""
+        self._playback_timer.stop()
+        self._pb_paused = False
+        self._strategy_bar.set_playback_state(False)
+        self._chart._bridge.clear_price_lines()
+
+        # Show ALL candles (including ones not yet played) so there's no gap
+        if self._pb_candles:
+            self._chart._bridge.set_candles(json.dumps(self._pb_candles))
+            # Re-apply all accumulated markers
+            if self._pb_shown_markers:
+                self._chart._bridge.set_trade_markers(
+                    json.dumps(self._pb_shown_markers)
+                )
+
+        total_pnl = sum(t.pnl for t in self._pb_shown_trades)
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        self._statusbar.set_status(
+            f"Playback done | {len(self._pb_shown_trades)} trades | "
+            f"P&L: {pnl_sign}{total_pnl:.2f}"
+        )
+
+    def _on_playback_speed_changed(self, _index: int) -> None:
+        """Update timer interval when speed changes during playback."""
+        if self._playback_timer.isActive():
+            speed_ms = self._strategy_bar.get_playback_speed()
+            self._playback_timer.setInterval(speed_ms)
+
+    @staticmethod
+    def _df_to_candle_list(df) -> list[dict]:
+        """Convert DataFrame to list of candle dicts for chart JS."""
+        data = []
+        for ts, row in df.iterrows():
+            data.append({
+                "time": int(ts.timestamp()),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+                "volume": float(row.get("volume", 0)),
+            })
+        return data
+
+    @staticmethod
+    def _trade_time_to_ts(time_str: str) -> int | None:
+        """Convert trade time string to unix timestamp."""
+        if not time_str:
+            return None
+        try:
+            from datetime import datetime
+            dt = datetime.fromisoformat(time_str)
+            return int(dt.timestamp())
+        except (ValueError, TypeError):
+            return None
+
     def _load_trades_for_ticker(self, ticker: str) -> None:
         """Load trades from journal for the current ticker."""
         trades = self._journal.read_from_sqlite(ticker=ticker, limit=200)
@@ -428,13 +781,23 @@ class MainWindow(QMainWindow):
         if STYLE_PATH.exists():
             style = STYLE_PATH.read_text(encoding="utf-8")
             if not self._is_dark:
-                # Simple replacements for light theme
-                style = style.replace("#131722", "#ffffff")
-                style = style.replace("#1e222d", "#f0f3fa")
-                style = style.replace("#2a2e39", "#d6dcde")
-                style = style.replace("#363a45", "#c8c8c8")
-                style = style.replace("#d1d4dc", "#131722")
-                style = style.replace("#787b86", "#6a6d78")
+                # Dark → Light color mapping
+                replacements = [
+                    ("#131722", "#ffffff"),   # main bg
+                    ("#1a1e28", "#f5f5f5"),   # secondary bg
+                    ("#1e222d", "#f0f3fa"),   # toolbar bg
+                    ("#252830", "#e0e3eb"),   # subtle borders
+                    ("#2a2e39", "#d6dcde"),   # borders
+                    ("#363a45", "#c8c8c8"),   # input borders
+                    ("#171b26", "#fafafa"),   # alt row
+                    ("#525669", "#9598a1"),   # dim text
+                    ("#636674", "#787b86"),   # muted text
+                    ("#787b86", "#6a6d78"),   # secondary text
+                    ("#9598a1", "#555"),      # default text
+                    ("#d1d4dc", "#131722"),   # primary text
+                ]
+                for dark, light in replacements:
+                    style = style.replace(dark, light)
             self.setStyleSheet(style)
 
     @staticmethod

@@ -1,9 +1,11 @@
-"""Trades table widget — QTableView with custom model."""
+"""Trades table widget — QTableView with custom model and summary stats."""
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QAbstractTableModel, QModelIndex, pyqtSignal, QPoint
-from PyQt6.QtGui import QColor, QAction
-from PyQt6.QtWidgets import QTableView, QHeaderView, QWidget, QVBoxLayout, QLabel, QHBoxLayout, QMenu
+from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import (
+    QTableView, QHeaderView, QWidget, QVBoxLayout, QLabel, QHBoxLayout, QMenu,
+)
 
 from traderbot.chart.trades.models import TradeDisplayRecord
 
@@ -14,9 +16,9 @@ COLUMNS = [
     ("entry_price", "Entry"),
     ("exit_price", "Exit"),
     ("pnl", "P&L"),
-    ("entry_time", "Entry Time"),
-    ("exit_time", "Exit Time"),
-    ("exit_reason", "Reason"),
+    ("entry_time", "Time In"),
+    ("exit_time", "Time Out"),
+    ("exit_reason", "Result"),
     ("stop_price", "SL"),
     ("target_price", "TP"),
     ("candles_held", "Bars"),
@@ -26,7 +28,6 @@ COLUMNS = [
 
 
 class TradeTableModel(QAbstractTableModel):
-    """Model for the trades table."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -76,9 +77,22 @@ class TradeTableModel(QAbstractTableModel):
                 return f"{value:+.2f}" if value else "0.00"
             if col_key in ("entry_time", "exit_time"):
                 s = str(value)
+                # Show only date + time, no timezone
                 if "T" in s:
                     return s.replace("T", " ")[:19]
                 return s[:19] if len(s) > 19 else s
+            if col_key == "exit_reason":
+                # Friendly names
+                r = str(value)
+                if "take_profit" in r:
+                    return "TP"
+                if "stop_loss" in r:
+                    return "SL"
+                if "timeout" in r:
+                    return "Timeout"
+                if "end_of_data" in r:
+                    return "EOD"
+                return r
             return str(value)
 
         if role == Qt.ItemDataRole.ForegroundRole:
@@ -87,25 +101,29 @@ class TradeTableModel(QAbstractTableModel):
             if col_key == "direction":
                 return QColor("#26a69a") if trade.direction == "BUY" else QColor("#ef5350")
             if col_key == "exit_reason":
-                if "take_profit" in str(value):
+                r = str(value)
+                if "take_profit" in r:
                     return QColor("#26a69a")
-                elif "stop_loss" in str(value):
+                if "stop_loss" in r:
                     return QColor("#ef5350")
                 return QColor("#ff9800")
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if col_key in ("entry_price", "exit_price", "stop_price", "target_price", "pnl", "qty", "candles_held"):
+            if col_key in ("entry_price", "exit_price", "stop_price", "target_price",
+                           "pnl", "qty", "candles_held"):
                 return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            if col_key in ("direction", "exit_reason"):
+                return Qt.AlignmentFlag.AlignCenter
 
         return None
 
 
 class TradesPanel(QWidget):
-    """Panel containing trades table with summary stats."""
+    """Panel containing trades table with summary stats bar."""
 
-    trade_selected = pyqtSignal(dict)  # trade dict when row clicked
-    trade_double_clicked = pyqtSignal(dict)  # trade dict for detail popup
-    scroll_to_trade = pyqtSignal(dict)  # right-click → show on chart
+    trade_selected = pyqtSignal(dict)
+    trade_double_clicked = pyqtSignal(dict)
+    scroll_to_trade = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -115,20 +133,33 @@ class TradesPanel(QWidget):
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Summary row
-        self._summary_layout = QHBoxLayout()
-        self._total_label = QLabel("Trades: 0")
-        self._pnl_label = QLabel("Total P&L: 0.00")
-        self._winrate_label = QLabel("Win Rate: —")
-        self._avg_label = QLabel("Avg: —")
-        for lbl in (self._total_label, self._pnl_label, self._winrate_label, self._avg_label):
-            lbl.setStyleSheet("color: #787b86; font-size: 12px; padding: 2px 8px;")
+        # ── Summary stats bar ────────────────────────────
+        summary_widget = QWidget()
+        summary_widget.setObjectName("summary-bar")
+        summary_widget.setStyleSheet(
+            "#summary-bar { background-color: #1a1e28; border-bottom: 1px solid #252830; }"
+        )
+        self._summary_layout = QHBoxLayout(summary_widget)
+        self._summary_layout.setContentsMargins(8, 4, 8, 4)
+        self._summary_layout.setSpacing(4)
+
+        self._total_label = self._make_stat("Trades: 0")
+        self._pnl_label = self._make_stat("P&L: —", accent=True)
+        self._winrate_label = self._make_stat("Win: —")
+        self._avg_label = self._make_stat("Avg: —")
+        self._pf_label = self._make_stat("PF: —")
+        self._max_dd_label = self._make_stat("MaxDD: —")
+
+        for lbl in (self._total_label, self._pnl_label, self._winrate_label,
+                    self._avg_label, self._pf_label, self._max_dd_label):
             self._summary_layout.addWidget(lbl)
         self._summary_layout.addStretch()
-        layout.addLayout(self._summary_layout)
 
-        # Table
+        layout.addWidget(summary_widget)
+
+        # ── Table ────────────────────────────────────────
         self._table = QTableView()
         self._table.setModel(self._model)
         self._table.setAlternatingRowColors(True)
@@ -136,8 +167,9 @@ class TradesPanel(QWidget):
         self._table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
         self._table.setSortingEnabled(True)
         self._table.verticalHeader().setVisible(False)
+        self._table.setShowGrid(False)
 
-        # Context menu (right-click)
+        # Context menu
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_context_menu)
 
@@ -145,19 +177,28 @@ class TradesPanel(QWidget):
         header = self._table.horizontalHeader()
         header.setStretchLastSection(True)
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setHighlightSections(False)
 
-        # Connect signals
+        # Row height
+        self._table.verticalHeader().setDefaultSectionSize(26)
+
+        # Signals
         self._table.clicked.connect(self._on_row_clicked)
         self._table.doubleClicked.connect(self._on_row_double_clicked)
 
         layout.addWidget(self._table)
 
+    @staticmethod
+    def _make_stat(text: str, accent: bool = False) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setProperty("class", "summary-stat-accent" if accent else "summary-stat")
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        return lbl
+
     def set_trades(self, trades: list[TradeDisplayRecord]) -> None:
-        """Update the table with new trade data."""
         self._model.set_trades(trades)
         self._update_summary(trades)
 
-        # Auto-resize columns
         for i in range(len(COLUMNS)):
             self._table.resizeColumnToContents(i)
 
@@ -166,25 +207,61 @@ class TradesPanel(QWidget):
         self._total_label.setText(f"Trades: {total}")
 
         if total == 0:
-            self._pnl_label.setText("Total P&L: 0.00")
-            self._winrate_label.setText("Win Rate: —")
+            self._pnl_label.setText("P&L: —")
+            self._winrate_label.setText("Win: —")
             self._avg_label.setText("Avg: —")
+            self._pf_label.setText("PF: —")
+            self._max_dd_label.setText("MaxDD: —")
             return
 
         total_pnl = sum(t.pnl for t in trades)
-        wins = sum(1 for t in trades if t.pnl > 0)
-        winrate = (wins / total) * 100
+        wins = [t for t in trades if t.pnl > 0]
+        losses = [t for t in trades if t.pnl <= 0]
+        win_count = len(wins)
+        winrate = (win_count / total) * 100
         avg_pnl = total_pnl / total
 
-        pnl_color = "#26a69a" if total_pnl >= 0 else "#ef5350"
-        self._pnl_label.setText(f"Total P&L: <span style='color:{pnl_color}'>{total_pnl:+.2f}</span>")
-        self._pnl_label.setTextFormat(Qt.TextFormat.RichText)
+        # Profit factor
+        gross_profit = sum(t.pnl for t in wins) if wins else 0
+        gross_loss = abs(sum(t.pnl for t in losses)) if losses else 0
+        pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
-        self._winrate_label.setText(f"Win Rate: {winrate:.1f}% ({wins}/{total})")
+        # Max drawdown (sequential)
+        peak = 0.0
+        running = 0.0
+        max_dd = 0.0
+        for t in trades:
+            running += t.pnl
+            peak = max(peak, running)
+            dd = peak - running
+            max_dd = max(max_dd, dd)
+
+        pnl_color = "#26a69a" if total_pnl >= 0 else "#ef5350"
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        self._pnl_label.setText(
+            f"P&L: <span style='color:{pnl_color}'>{pnl_sign}{total_pnl:.2f}</span>"
+        )
+
+        wr_color = "#26a69a" if winrate >= 50 else "#ef5350"
+        self._winrate_label.setText(
+            f"Win: <span style='color:{wr_color}'>{winrate:.0f}%</span>"
+            f" <span style='color:#525669'>({win_count}/{total})</span>"
+        )
 
         avg_color = "#26a69a" if avg_pnl >= 0 else "#ef5350"
-        self._avg_label.setText(f"Avg: <span style='color:{avg_color}'>{avg_pnl:+.2f}</span>")
-        self._avg_label.setTextFormat(Qt.TextFormat.RichText)
+        self._avg_label.setText(
+            f"Avg: <span style='color:{avg_color}'>{avg_pnl:+.2f}</span>"
+        )
+
+        pf_color = "#26a69a" if pf >= 1.0 else "#ef5350"
+        pf_text = f"{pf:.2f}" if pf != float("inf") else "max"
+        self._pf_label.setText(
+            f"PF: <span style='color:{pf_color}'>{pf_text}</span>"
+        )
+
+        self._max_dd_label.setText(
+            f"MaxDD: <span style='color:#ef5350'>{max_dd:.2f}</span>"
+        )
 
     def _on_row_clicked(self, index: QModelIndex) -> None:
         trade = self._model.get_trade(index.row())
@@ -197,7 +274,6 @@ class TradesPanel(QWidget):
             self.trade_double_clicked.emit(trade.to_dict())
 
     def _on_context_menu(self, pos: QPoint) -> None:
-        """Right-click context menu on trades table."""
         index = self._table.indexAt(pos)
         if not index.isValid():
             return
