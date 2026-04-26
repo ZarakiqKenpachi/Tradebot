@@ -19,6 +19,8 @@ class ChartBridge(QObject):
     tool_deactivated = pyqtSignal()  # JS cancelled active tool (Escape/RMB)
     playback_pause = pyqtSignal()    # Space key — toggle pause
     playback_step = pyqtSignal()     # Right arrow — step forward
+    playback_progress = pyqtSignal(dict)  # JS reports progress {idx, total, shownTrades, pnl}
+    playback_done = pyqtSignal(dict)      # JS playback finished
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -66,6 +68,22 @@ class ChartBridge(QObject):
     def onPlaybackStep(self):
         """Right arrow pressed — step forward one candle."""
         self.playback_step.emit()
+
+    @pyqtSlot(str)
+    def onPlaybackProgress(self, json_data: str):
+        """JS playback reports progress."""
+        try:
+            self.playback_progress.emit(json.loads(json_data))
+        except Exception:
+            pass
+
+    @pyqtSlot(str)
+    def onPlaybackDone(self, json_data: str):
+        """JS playback finished."""
+        try:
+            self.playback_done.emit(json.loads(json_data))
+        except Exception:
+            self.playback_done.emit({})
 
     # ── Python -> JS calls ───────────────────────────────
 
@@ -140,6 +158,32 @@ class ChartBridge(QObject):
 
     def remove_last_user_line(self) -> None:
         self._run_js("removeLastUserLine()")
+
+    # Playback (JS-side animation)
+    def start_playback(self, candles_j: str, markers_j: str, trades_j: str,
+                       warmup: int, speed_ms: int) -> None:
+        self._run_js(
+            f"startPlayback('{self._escape(candles_j)}','{self._escape(markers_j)}',"
+            f"'{self._escape(trades_j)}',{warmup},{speed_ms})"
+        )
+
+    def pause_playback(self) -> None:
+        self._run_js("pausePlayback()")
+
+    def resume_playback(self) -> None:
+        self._run_js("resumePlayback()")
+
+    def toggle_playback(self) -> None:
+        self._run_js("togglePlayback()")
+
+    def step_playback(self) -> None:
+        self._run_js("stepPlayback()")
+
+    def set_playback_speed(self, ms: int) -> None:
+        self._run_js(f"setPlaybackSpeed({ms})")
+
+    def stop_playback(self) -> None:
+        self._run_js("stopPlayback()")
 
     # Navigation
     def set_crosshair_mode(self, mode: str) -> None:

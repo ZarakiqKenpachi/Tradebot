@@ -550,7 +550,11 @@ function initKeyboard() {
         // Space — pause/resume playback
         if (e.key === " " || e.code === "Space") {
             e.preventDefault();
-            if (bridge) bridge.onPlaybackPause();
+            if (_pb.candles.length > 0) {
+                togglePlayback();
+            } else if (bridge) {
+                bridge.onPlaybackPause();
+            }
             return;
         }
         // Arrow keys
@@ -558,10 +562,13 @@ function initKeyboard() {
             chart.timeScale().scrollToPosition(chart.timeScale().scrollPosition() - 5, false);
         }
         if (e.key === "ArrowRight") {
-            if (e.shiftKey && bridge) {
-                // Shift+Right — step one candle forward
+            if (e.shiftKey) {
                 e.preventDefault();
-                bridge.onPlaybackStep();
+                if (_pb.candles.length > 0) {
+                    stepPlayback();
+                } else if (bridge) {
+                    bridge.onPlaybackStep();
+                }
                 return;
             }
             chart.timeScale().scrollToPosition(chart.timeScale().scrollPosition() + 5, false);
@@ -849,6 +856,271 @@ function toggleDrawingMode(enabled) {
     // Legacy — now use setActiveTool("hray") or null
     if (enabled) setActiveTool("hray");
     else setActiveTool(null);
+}
+
+// ══════════════════════════════════════════════════════════
+// PLAYBACK ENGINE — all animation runs in JS to avoid IPC overhead
+// ══════════════════════════════════════════════════════════
+
+let _pb = {
+    candles: [],        // all candle data
+    markers: [],        // pre-computed trade markers (entry+exit)
+    trades: [],         // trade objects for Python-side table
+    idx: 0,             // current candle index
+    warmup: 0,          // warmup count (initial candles shown at once)
+    timer: null,        // setInterval id
+    speedMs: 100,       // ms per candle
+    paused: false,
+    shownMarkers: [],   // markers already visible
+    candleTimes: null,  // Set of all candle timestamps (for snapping markers)
+    lastTime: 0,        // last appended candle time (for dedup guard)
+};
+
+function startPlayback(candlesJson, markersJson, tradesJson, warmup, speedMs) {
+    stopPlayback();
+    let rawCandles = JSON.parse(candlesJson);
+    _pb.markers = JSON.parse(markersJson);
+    _pb.trades = JSON.parse(tradesJson);
+
+    // Deduplicate and ensure strictly increasing timestamps
+    const deduped = [];
+    let prevTime = -1;
+    for (const c of rawCandles) {
+        if (c.time > prevTime) {
+            deduped.push(c);
+            prevTime = c.time;
+        }
+    }
+    _pb.candles = deduped;
+
+    _pb.warmup = Math.min(warmup, deduped.length - 1);
+    _pb.speedMs = speedMs;
+    _pb.idx = _pb.warmup;
+    _pb.paused = false;
+    _pb.shownMarkers = [];
+    _pb.lastTime = 0;
+
+    console.log("[PLAYBACK] Start:", deduped.length, "candles,", _pb.markers.length, "markers, warmup=", _pb.warmup);
+
+    // Build set of candle timestamps for snapping markers
+    _pb.candleTimes = new Set(deduped.map(c => c.time));
+
+    // Snap marker timestamps to nearest candle time
+    for (const m of _pb.markers) {
+        if (!_pb.candleTimes.has(m.time)) {
+            m.time = _snapToCandle(m.time);
+        }
+        m._shown = false;
+    }
+
+    // Set warmup candles at once
+    const wData = _pb.candles.slice(0, warmup);
+    if (wData.length > 0) {
+        candleSeries.setData(wData.map(d => ({
+            time: d.time, open: d.open, high: d.high, low: d.low, close: d.close,
+        })));
+        volumeSeries.setData(wData.map(d => ({
+            time: d.time, value: d.volume || 0,
+            color: d.close >= d.open ? theme.volumeUp : theme.volumeDown,
+        })));
+        _pb.lastTime = wData[wData.length - 1].time;
+    }
+    candleSeries.setMarkers([]);
+    clearPriceLines();
+
+    _pb.timer = setInterval(_pbTick, speedMs);
+}
+
+function _snapToCandle(ts) {
+    // Find the closest candle time <= ts (binary-search-like on sorted array)
+    let best = _pb.candles[0].time;
+    for (let i = 0; i < _pb.candles.length; i++) {
+        if (_pb.candles[i].time <= ts) best = _pb.candles[i].time;
+        else break;
+    }
+    return best;
+}
+
+function _pbTick() {
+    if (_pb.idx >= _pb.candles.length) {
+        _pbFinish();
+        return;
+    }
+
+    const d = _pb.candles[_pb.idx];
+    _pb.idx++;
+    const ct = d.time;
+
+    // Guard: skip if time is not strictly greater than last
+    if (ct <= _pb.lastTime) return;
+    _pb.lastTime = ct;
+
+    // Append candle (try-catch so one bad bar doesn't kill playback)
+    try {
+        candleSeries.update({ time: ct, open: d.open, high: d.high, low: d.low, close: d.close });
+        volumeSeries.update({ time: ct, value: d.volume || 0,
+            color: d.close >= d.open ? theme.volumeUp : theme.volumeDown });
+    } catch (e) {
+        console.error("[PLAYBACK] update error at idx", _pb.idx - 1, "time", ct, e);
+        return;
+    }
+
+    // Scroll — throttle to every 3 candles to avoid render bottleneck
+    if (_pb.idx % 3 === 0 || _pb.idx >= _pb.candles.length - 1) {
+        chart.timeScale().scrollToRealTime();
+    }
+
+    // Show markers whose snapped time <= current candle time
+    let changed = false;
+    for (const m of _pb.markers) {
+        if (m._shown) continue;
+        if (m.time <= ct) {
+            m._shown = true;
+            _pb.shownMarkers.push(m);
+            changed = true;
+
+            // Price lines: show on entry, clear on exit
+            if (m.type === "entry") {
+                _pbShowLines(m);
+            } else if (m.type === "exit") {
+                clearPriceLines();
+            }
+        }
+    }
+    if (changed) {
+        try {
+            // Only include markers whose time is within already-rendered candles
+            const rendered = _pb.shownMarkers.filter(m => m.time <= ct);
+            const lw = rendered.map(m => ({
+                time: m.time,
+                position: m.direction === "BUY" ? "belowBar" : "aboveBar",
+                color: getMarkerColor(m),
+                shape: getMarkerShape(m),
+                text: getMarkerText(m),
+                size: 1.5,
+            }));
+            lw.sort((a, b) => a.time - b.time);
+            candleSeries.setMarkers(lw);
+        } catch (e) {
+            console.error("[PLAYBACK] setMarkers error", e);
+        }
+    }
+
+    // Report progress to Python every 10 candles or on trade events
+    if (bridge && (_pb.idx % 10 === 0 || changed)) {
+        const shownTradeCount = _pb.shownMarkers.filter(m => m.type === "exit").length;
+        const pnl = _pb.trades.filter(t => t._exitTime != null && t._exitTime <= ct)
+            .reduce((sum, t) => sum + (t.pnl || 0), 0);
+        bridge.onPlaybackProgress(JSON.stringify({
+            idx: _pb.idx,
+            total: _pb.candles.length,
+            shownTrades: shownTradeCount,
+            pnl: Math.round(pnl * 100) / 100,
+            tradeEvent: changed,
+        }));
+    }
+}
+
+function _pbShowLines(m) {
+    clearPriceLines();
+    const isBuy = m.direction === "BUY";
+    const lines = [
+        { price: m.price, color: isBuy ? "#26a69a" : "#ef5350",
+          title: "Entry " + (m.price || 0).toFixed(2), lineStyle: 0 },
+    ];
+    if (m.stop_price) {
+        lines.push({ price: m.stop_price, color: "#ff9800",
+            title: "SL " + m.stop_price.toFixed(2), lineStyle: 2 });
+    }
+    if (m.target_price) {
+        lines.push({ price: m.target_price, color: "#2962ff",
+            title: "TP " + m.target_price.toFixed(2), lineStyle: 2 });
+    }
+    for (const l of lines) {
+        priceLines.push(candleSeries.createPriceLine({
+            price: l.price, color: l.color, lineWidth: 1,
+            lineStyle: l.lineStyle,
+            axisLabelVisible: true, title: l.title,
+        }));
+    }
+}
+
+function _pbFinish() {
+    if (_pb.timer) { clearInterval(_pb.timer); _pb.timer = null; }
+
+    // Final re-render: setData with ALL candles (clean state, no accumulated errors)
+    try {
+        candleSeries.setData(_pb.candles.map(d => ({
+            time: d.time, open: d.open, high: d.high, low: d.low, close: d.close,
+        })));
+        volumeSeries.setData(_pb.candles.map(d => ({
+            time: d.time, value: d.volume || 0,
+            color: d.close >= d.open ? theme.volumeUp : theme.volumeDown,
+        })));
+        // Show all markers
+        const all = _pb.markers.map(m => ({
+            time: m.time,
+            position: m.direction === "BUY" ? "belowBar" : "aboveBar",
+            color: getMarkerColor(m),
+            shape: getMarkerShape(m),
+            text: getMarkerText(m),
+            size: 1.5,
+        }));
+        all.sort((a, b) => a.time - b.time);
+        candleSeries.setMarkers(all);
+        clearPriceLines();
+        chart.timeScale().scrollToRealTime();
+    } catch (e) {
+        console.error("[PLAYBACK] finish re-render error", e);
+    }
+
+    // Report completion
+    if (bridge) {
+        bridge.onPlaybackDone(JSON.stringify({
+            total: _pb.candles.length,
+            shownTrades: _pb.shownMarkers.filter(m => m.type === "exit").length,
+        }));
+    }
+}
+
+function pausePlayback() {
+    if (_pb.timer) { clearInterval(_pb.timer); _pb.timer = null; }
+    _pb.paused = true;
+}
+
+function resumePlayback() {
+    if (_pb.paused && !_pb.timer) {
+        _pb.timer = setInterval(_pbTick, _pb.speedMs);
+        _pb.paused = false;
+    }
+}
+
+function togglePlayback() {
+    if (_pb.paused) resumePlayback();
+    else pausePlayback();
+}
+
+function stepPlayback() {
+    if (!_pb.paused) pausePlayback();
+    _pbTick();
+}
+
+function setPlaybackSpeed(ms) {
+    _pb.speedMs = ms;
+    if (_pb.timer) {
+        clearInterval(_pb.timer);
+        _pb.timer = setInterval(_pbTick, ms);
+    }
+}
+
+function stopPlayback() {
+    if (_pb.timer) { clearInterval(_pb.timer); _pb.timer = null; }
+    _pb.paused = false;
+    _pb.candles = [];
+    _pb.markers = [];
+    _pb.trades = [];
+    _pb.shownMarkers = [];
+    clearPriceLines();
 }
 
 // ══════════════════════════════════════════════════════════
