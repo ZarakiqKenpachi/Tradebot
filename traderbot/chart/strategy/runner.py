@@ -1,7 +1,6 @@
-"""Strategy simulation engine — mirrors backtest/engine.py with 15S precision.
+"""Strategy simulation engine — mirrors backtest/engine.py logic.
 
-Key differences from the chart's old runner:
-- SL/TP/fill scanning on 15S candles (sub-minute precision)
+Uses T-Bank 1m candles for SL/TP/fill scanning (same data source as backtest).
 - Limit order fill simulation with invalidation
 - Slippage on market orders (SL, timeout)
 - RiskManager with balance tracking
@@ -34,7 +33,7 @@ _PENDING_TIMEOUT = 20      # 30m-candle equivalents for limit order timeout
 @dataclass
 class SimulationConfig:
     """Configuration for the simulation engine."""
-    initial_balance: float = 1_000_000.0
+    initial_balance: float = 100_000.0
     risk_pct: float = 0.05
     max_position_pct: float = 0.40
     commission_pct: float = 0.0004
@@ -43,7 +42,7 @@ class SimulationConfig:
     max_consecutive_sl: int = 3
     lot_size: int = 10                  # default, overridden per ticker
     price_step: float = 0.01            # default, overridden per ticker
-    scan_tf: str = "15S"                # granularity for SL/TP/fill scanning
+    scan_tf: str = "1m"                 # granularity for SL/TP/fill scanning
 
 
 @dataclass
@@ -78,10 +77,9 @@ class StrategyRunner:
     """Run strategies with full simulation matching live/backtest behavior.
 
     Data flow:
-    1. Load strategy candles (30m, 1h) from TV — 5000 bars = months of data
-    2. Load 15S scan candles from TV — loaded on-demand per time window
-    3. Walk bar-by-bar on the primary strategy timeframe
-    4. Inside each bar, scan 15S candles for precise SL/TP/fill
+    1. Load strategy candles (30m, 1h) + 1m scan data from T-Bank
+    2. Walk bar-by-bar on the primary strategy timeframe
+    3. Inside each bar, scan 1m candles for precise SL/TP/fill
     """
 
     def __init__(self, provider: CandleProvider | None = None):

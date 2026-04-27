@@ -166,6 +166,36 @@ class _TvWebSocket:
 
 # ── Main Provider ────────────────────────────────────────────
 
+def _sessionid_to_jwt(sessionid: str) -> str | None:
+    """Convert a TradingView sessionid cookie to a WebSocket JWT auth token.
+
+    tvDatafeed HTTP methods work with the sessionid cookie directly,
+    but the raw WebSocket requires a JWT extracted from the chart page.
+    """
+    import re
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            "https://www.tradingview.com/chart/",
+            headers={
+                "Cookie": f"sessionid={sessionid}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0.0.0",
+            },
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        html = resp.read().decode("utf-8", errors="ignore")
+        m = re.search(r'"auth_token"\s*:\s*"([^"]+)"', html)
+        if m:
+            jwt = m.group(1)
+            logger.info("[TVFEED] Extracted JWT from sessionid (%d chars)", len(jwt))
+            return jwt
+    except Exception:
+        logger.exception("[TVFEED] Failed to extract JWT from sessionid")
+
+    return None
+
+
 class TvDatafeedProvider:
     """Candle provider using TradingView.
 
@@ -190,9 +220,9 @@ class TvDatafeedProvider:
     ):
         self._username = username
         self._password = password
-        self._manual_token = auth_token  # from browser sessionid
+        self._manual_token = auth_token  # sessionid from browser cookie
         self._tv = None
-        self._auth_token = "unauthorized_user_token"
+        self._auth_token = "unauthorized_user_token"  # JWT for WebSocket
         self._connected = False
 
     def _create_connection(self) -> None:
@@ -202,12 +232,14 @@ class TvDatafeedProvider:
         self._tv = None
         self._auth_token = "unauthorized_user_token"
 
-        # Method 1: Direct auth_token (most reliable for Google/Apple accounts)
+        # Method 1: Direct sessionid (most reliable for Google/Apple accounts)
         if self._manual_token:
             try:
                 self._tv = TvDatafeed()
                 self._tv.token = self._manual_token
-                self._auth_token = self._manual_token
+                # Convert sessionid → JWT for WebSocket
+                jwt = _sessionid_to_jwt(self._manual_token)
+                self._auth_token = jwt or self._manual_token
                 self._connected = True
                 logger.info("[TVFEED] Connected with manual auth_token (Premium)")
                 return
@@ -385,6 +417,14 @@ class TvDatafeedProvider:
                     symbol_type=str(item[3]) if len(item) > 3 else "",
                 ))
         return symbols
+
+    def set_auth_token(self, token: str) -> None:
+        """Hot-swap auth token (e.g. after browser login). Reconnects."""
+        self._manual_token = token
+        self._tv = None
+        self._auth_token = "unauthorized_user_token"
+        self._connected = False
+        self._create_connection()
 
     def is_connected(self) -> bool:
         return self._connected

@@ -99,12 +99,7 @@ REFRESH_INTERVALS = {
     "1d": 600,
     "1w": 900,
 
-    # Simulation scan TF — the granularity used for SL/TP checking in strategy runner
-    # 15S gives sub-minute precision for fills and exits
 }
-
-# Simulation precision: which TF to use for scanning SL/TP/fills inside each bar
-SIMULATION_SCAN_TF = "15S"
 
 
 @dataclass
@@ -117,7 +112,7 @@ class AppConfig:
     cache_db_path: str = "data/chart_cache.db"
     window_width: int = 1400
     window_height: int = 900
-    # TradingView credentials (enables 15S candles for simulation)
+    # TradingView credentials (enables 15S candles for chart display)
     tv_username: str = ""
     tv_password: str = ""
     tv_auth_token: str = ""  # alternative: sessionid from browser cookies
