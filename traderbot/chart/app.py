@@ -20,7 +20,6 @@ from traderbot.chart.config import (
     AppConfig, DARK_THEME, LIGHT_THEME, ChartTheme,
 )
 from traderbot.chart.data.cache import CandleCache
-from traderbot.chart.data.tvfeed import TvDatafeedProvider
 from traderbot.chart.data.symbol_search import SymbolSearchService
 from traderbot.chart.chart.widget import ChartWidget
 from traderbot.chart.trades.journal import TradeJournalReader
@@ -32,6 +31,7 @@ from traderbot.chart.widgets.symbol_dialog import SymbolSearchDialog
 from traderbot.chart.widgets.trade_detail import TradeDetailDialog
 from traderbot.chart.widgets.statusbar import ChartStatusBar
 from traderbot.data.feed import DataFeed
+from traderbot.chart.data.tbank_provider import TBankCandleProvider
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +56,7 @@ class MainWindow(QMainWindow):
         self.resize(self._config.window_width, self._config.window_height)
 
         # ── Services ─────────────────────────────────────
-        self._provider = TvDatafeedProvider(
-            username=self._config.tv_username or None,
-            password=self._config.tv_password or None,
-            auth_token=self._config.tv_auth_token or None,
-        )
+        self._provider = TBankCandleProvider(tbank_feed, self._ticker_figi_map)
         self._cache = CandleCache(str(PROJECT_ROOT / self._config.cache_db_path))
         self._search_service = SymbolSearchService(
             self._provider,
@@ -129,9 +125,6 @@ class MainWindow(QMainWindow):
         # ── Apply style ───────────���──────────────────────
         self._apply_stylesheet()
 
-        # ── Check TV Premium (15S access) ───────────────
-        QTimer.singleShot(600, self._check_tv_premium)
-
         # ── Load default symbol after a short delay ──────
         QTimer.singleShot(500, self._load_default)
 
@@ -180,25 +173,6 @@ class MainWindow(QMainWindow):
 
     # ── Event handlers ───────────���───────────────────────
 
-    def _check_tv_premium(self) -> None:
-        """If no Premium access, offer TradingView login dialog."""
-        if self._provider.has_premium:
-            return
-        from traderbot.chart.widgets.tv_login import TvLoginDialog
-        dlg = TvLoginDialog(self)
-        dlg.token_obtained.connect(self._on_tv_token)
-        dlg.exec()
-
-    def _on_tv_token(self, token: str) -> None:
-        """Called when user successfully logs in to TradingView."""
-        self._provider.set_auth_token(token)
-        self._config.tv_auth_token = token
-        if self._provider.has_premium:
-            self._statusbar.set_status("TradingView Premium: 15S precision enabled")
-            logger.info("[APP] TradingView Premium activated via browser login")
-        else:
-            self._statusbar.set_status("TradingView login failed — using 1m precision")
-
     def _load_default(self) -> None:
         """Load default symbol on startup."""
         symbol = self._config.default_symbol
@@ -206,11 +180,7 @@ class MainWindow(QMainWindow):
         self._toolbar.set_symbol_text(symbol)
         self._toolbar.set_timeframe(tf)
 
-        # Use known MOEX exchange for default
-        from traderbot.chart.data.symbol_search import _KNOWN_MOEX
-        exchange = _KNOWN_MOEX.get(symbol, ("MOEX",))[0]
-
-        self._chart.load_symbol(symbol, exchange, tf)
+        self._chart.load_symbol(symbol, "MOEX", tf)
         self._statusbar.set_connected(self._provider.is_connected())
         self._load_trades_for_ticker(symbol)
 
@@ -220,11 +190,9 @@ class MainWindow(QMainWindow):
         if not query:
             return
 
-        # Quick load if exact match in known symbols
-        from traderbot.chart.data.symbol_search import _KNOWN_MOEX
-        if query in _KNOWN_MOEX:
-            exchange = _KNOWN_MOEX[query][0]
-            self._load_symbol(query, exchange)
+        # Quick load if exact match in known tickers
+        if query in self._provider._figi_map:
+            self._load_symbol(query, "MOEX")
             return
 
         # Open search dialog
@@ -422,79 +390,42 @@ class MainWindow(QMainWindow):
 
         symbol = self._chart.current_symbol
         figi = self._ticker_figi_map.get(symbol)
+        if not figi:
+            # Try to get FIGI from provider (it loads all MOEX shares)
+            figi = self._provider._figi_map.get(symbol)
 
-        # ── Try T-Bank data (preferred: accurate MOEX data, full history) ──
-        if self._tbank_feed and figi:
-            self._statusbar.set_status(f"Loading T-Bank data for {symbol} ({sim_days}d)...")
-            try:
-                # Load all required timeframes + 1m for scan from T-Bank
-                all_tfs = list(set(required) | {"1m", "30m"})
-                tbank_data = self._tbank_feed.get_candles_history(
-                    figi, all_tfs, days=sim_days + 15,  # +15 for strategy warmup window
-                )
-                if tbank_data:
-                    for tf in required:
-                        if tf in tbank_data and not tbank_data[tf].empty:
-                            candles[tf] = tbank_data[tf]
-                            logger.info(
-                                "[PLAYBACK] T-Bank %s: %d bars, %s .. %s",
-                                tf, len(candles[tf]),
-                                candles[tf].index[0], candles[tf].index[-1],
-                            )
-                    if "1m" in tbank_data and not tbank_data["1m"].empty:
-                        scan_df = tbank_data["1m"]
-                        scan_tf = "1m"
+        if not figi:
+            QMessageBox.warning(self, "Error", f"No FIGI found for {symbol}")
+            return None, None, None
+
+        self._statusbar.set_status(f"Loading T-Bank data for {symbol} ({sim_days}d)...")
+        try:
+            all_tfs = list(set(required) | {"1m", "30m"})
+            tbank_data = self._tbank_feed.get_candles_history(
+                figi, all_tfs, days=sim_days + 15,  # +15 for strategy warmup window
+            )
+            if tbank_data:
+                for tf in required:
+                    if tf in tbank_data and not tbank_data[tf].empty:
+                        candles[tf] = tbank_data[tf]
                         logger.info(
-                            "[PLAYBACK] T-Bank scan 1m: %d bars, %s .. %s",
-                            len(scan_df), scan_df.index[0], scan_df.index[-1],
+                            "[PLAYBACK] %s: %d bars, %s .. %s",
+                            tf, len(candles[tf]),
+                            candles[tf].index[0], candles[tf].index[-1],
                         )
-            except Exception:
-                logger.exception("[PLAYBACK] T-Bank data load failed for %s", symbol)
+                if "1m" in tbank_data and not tbank_data["1m"].empty:
+                    scan_df = tbank_data["1m"]
+                    scan_tf = "1m"
+                    logger.info("[PLAYBACK] scan 1m: %d bars", len(scan_df))
+        except Exception:
+            logger.exception("[PLAYBACK] Data load failed for %s", symbol)
 
-            # Get lot_size and price_step from T-Bank
-            try:
-                lot_size, price_step = self._tbank_feed.broker.get_instrument_info(figi)
-                logger.info("[PLAYBACK] T-Bank instrument: lot_size=%d, price_step=%.4f", lot_size, price_step)
-            except Exception:
-                logger.warning("[PLAYBACK] Could not get instrument info from T-Bank, using defaults")
-
-        # ── Fallback to TradingView if T-Bank didn't provide all data ──
-        missing_tfs = [tf for tf in required if tf not in candles]
-        if missing_tfs:
-            if not figi:
-                logger.info("[PLAYBACK] No FIGI for %s, using TradingView for all data", symbol)
-            else:
-                logger.info("[PLAYBACK] T-Bank missing %s, loading from TradingView", missing_tfs)
-
-            for tf in missing_tfs:
-                n_bars = self._calc_n_bars(tf, sim_days)
-                self._statusbar.set_status(f"Loading {tf} from TradingView ({n_bars} bars)...")
-                try:
-                    tf_df = self._provider.get_candles(
-                        symbol, self._chart.current_exchange, tf, n_bars=n_bars,
-                    )
-                    if not tf_df.empty:
-                        candles[tf] = tf_df
-                        logger.info("[PLAYBACK] TV %s: %d bars", tf, len(tf_df))
-                except Exception:
-                    logger.exception("[PLAYBACK] Failed to load %s from TV", tf)
-                if tf not in candles and not df.empty:
-                    resampled = self._resample_candles(df, tf)
-                    if resampled is not None and not resampled.empty:
-                        candles[tf] = resampled
-
-            # TV scan data fallback if T-Bank didn't provide it
-            if scan_df is None:
-                scan_tf = "15S" if self._provider.has_premium else "1m"
-                self._statusbar.set_status(f"Loading {scan_tf} scan data from TV...")
-                try:
-                    scan_df = self._provider.get_candles(
-                        symbol, self._chart.current_exchange, scan_tf, n_bars=5000,
-                    )
-                    if scan_df.empty:
-                        scan_df = None
-                except Exception:
-                    pass
+        # Get lot_size and price_step from T-Bank
+        try:
+            lot_size, price_step = self._tbank_feed.broker.get_instrument_info(figi)
+            logger.info("[PLAYBACK] %s: lot_size=%d, price_step=%.4f", symbol, lot_size, price_step)
+        except Exception:
+            logger.warning("[PLAYBACK] Could not get instrument info, using defaults")
 
         if not candles:
             QMessageBox.warning(self, "Error", "Could not load required timeframes")
@@ -601,7 +532,7 @@ class MainWindow(QMainWindow):
         strategy_name = self._pb_strategy_name
         sim_days = self._pb_sim_days
         if result and strategy_name:
-            scan_tf = "15S" if self._provider.has_premium else "1m"
+            scan_tf = "1m"
             sim_config = SimulationConfig(scan_tf=scan_tf)
             run_id = self._sim_journal.save_run(
                 strategy=strategy_name,
@@ -680,33 +611,22 @@ class MainWindow(QMainWindow):
             self._chart.set_trade_markers(trade_dicts)
 
     def _populate_ticker_list(self) -> None:
-        """Fill quick ticker combo with config tickers + known MOEX tickers."""
-        from traderbot.chart.data.symbol_search import _KNOWN_MOEX
-
+        """Fill quick ticker combo with config tickers + all MOEX shares from T-Bank."""
         tickers: list[tuple[str, str, str]] = []
         seen = set()
 
         # 1. Tickers from config.yaml (trading tickers first)
-        config_path = PROJECT_ROOT / "traderbot" / "config.yaml"
-        if config_path.exists():
-            try:
-                import yaml
-                with open(config_path, "r", encoding="utf-8") as f:
-                    cfg = yaml.safe_load(f)
-                for ticker_name in cfg.get("tickers", {}):
-                    if ticker_name not in seen:
-                        exchange = _KNOWN_MOEX.get(ticker_name, ("MOEX",))[0]
-                        desc = _KNOWN_MOEX.get(ticker_name, ("", ""))[1] if ticker_name in _KNOWN_MOEX else ""
-                        tickers.append((ticker_name, exchange, desc))
-                        seen.add(ticker_name)
-            except Exception:
-                pass
+        for symbol in self._ticker_figi_map:
+            if symbol not in seen:
+                tickers.append((symbol, "MOEX", ""))
+                seen.add(symbol)
 
-        # 2. All known MOEX tickers
-        for sym, (exch, desc, _) in _KNOWN_MOEX.items():
-            if sym not in seen:
-                tickers.append((sym, exch, desc))
-                seen.add(sym)
+        # 2. All MOEX shares from T-Bank API
+        all_shares = self._provider.get_all_symbols()
+        for info in all_shares:
+            if info.symbol not in seen:
+                tickers.append((info.symbol, info.exchange, info.description))
+                seen.add(info.symbol)
 
         self._toolbar.set_ticker_list(tickers)
 
@@ -846,36 +766,19 @@ def main():
     app.setApplicationName("Chart Analyzer")
     app.setOrganizationName("TraderBot")
 
-    # Load TV credentials from env (enables 15S chart display)
-    import os
-    from dotenv import load_dotenv
-    load_dotenv(PROJECT_ROOT / "traderbot" / "passes_tv.env")
-    load_dotenv(PROJECT_ROOT / "traderbot" / ".env")
+    config = AppConfig()
 
-    config = AppConfig(
-        tv_username=os.getenv("TV_USERNAME", ""),
-        tv_password=os.getenv("TV_PASSWORD", ""),
-        tv_auth_token=os.getenv("TV_AUTH_TOKEN", ""),
-    )
-
-    if config.tv_auth_token:
-        print("TradingView Premium: auth_token provided (15S chart display enabled)")
-    elif config.tv_username:
-        print(f"TradingView: will try login as {config.tv_username}")
-    else:
-        print("TradingView: no credentials — browser login will be offered")
-
-    # Initialize T-Bank data feed for simulation (accurate MOEX data)
+    # Initialize T-Bank data feed (all data: chart display + simulation)
     # Read-only token for market data — safe to commit, cannot trade or access accounts
     TBANK_MARKET_DATA_TOKEN = "t.2ioHpwYVj4t12B_iRoqmfE3Rb4jkLIN1cSB7RDzBoAEJUjPo4tdkcjpiW_NGuzDKoj5aKVLbSc-syHejhbgIpg"
-    tbank_feed = None
     try:
         from traderbot.broker.tbank import TBankBroker
         broker = TBankBroker(token=TBANK_MARKET_DATA_TOKEN, sandbox=True, app_name="ChartAnalyzer-MD")
         tbank_feed = DataFeed(broker)
-        print("T-Bank: market data connected (simulation will use real MOEX data)")
+        print("T-Bank: connected (real MOEX data)")
     except Exception as e:
-        print(f"T-Bank: connection failed ({e}) — simulation will use TradingView data")
+        print(f"T-Bank: connection failed ({e})")
+        sys.exit(1)
 
     window = MainWindow(config, tbank_feed=tbank_feed)
     window.show()

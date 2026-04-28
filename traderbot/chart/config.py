@@ -112,7 +112,3 @@ class AppConfig:
     cache_db_path: str = "data/chart_cache.db"
     window_width: int = 1400
     window_height: int = 900
-    # TradingView credentials (enables 15S candles for chart display)
-    tv_username: str = ""
-    tv_password: str = ""
-    tv_auth_token: str = ""  # alternative: sessionid from browser cookies
