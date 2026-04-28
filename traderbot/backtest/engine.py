@@ -49,6 +49,7 @@ class _TickerState:
     df_entry: pd.DataFrame
     df_1m: pd.DataFrame | None
     df_30m: pd.DataFrame | None
+    dividend_dates: list = field(default_factory=list)  # last_buy_date objects
     # мутабельное
     position: _VirtualPosition | None = None
     pending: tuple | None = None              # (setup, qty, balance_at_signal)
@@ -73,12 +74,14 @@ class BacktestEngine:
         self,
         all_data: dict[str, dict[str, pd.DataFrame]],
         trading_schedule: dict | None = None,
+        dividend_data: dict[str, list] | None = None,
     ) -> list[TradeRecord]:
         """
         Прогнать симуляцию по историческим данным.
 
         all_data: {ticker_name: {timeframe: DataFrame}}
         trading_schedule: {date: TradingDay} из TBankBroker.get_trading_schedule()
+        dividend_data: {ticker_name: [last_buy_date, ...]} для фильтрации шортов
 
         Все тикеры обрабатываются в едином хронологическом порядке,
         поэтому баланс обновляется сразу после каждой закрытой сделки
@@ -107,6 +110,7 @@ class BacktestEngine:
                 df_entry=candles_dict[min_tf],
                 df_1m=candles_dict.get("1m"),
                 df_30m=candles_dict.get("30m"),
+                dividend_dates=(dividend_data or {}).get(ticker_name, []),
                 consecutive_sl={ticker_name: 0},
                 sl_date={ticker_name: ""},
             )
@@ -280,6 +284,12 @@ class BacktestEngine:
         setup = state.strategy.find_setup(window)
         if setup is None:
             return trades, balance
+
+        # Dividend filter: нельзя шортить перед дивидендной отсечкой
+        if setup.direction == Signal.SELL and state.dividend_dates:
+            bar_date = current_time.date() if hasattr(current_time, 'date') else None
+            if bar_date and _is_near_dividend(bar_date, state.dividend_dates):
+                return trades, balance
 
         # Округлить цены до шага инструмента (как round_to_step в live ExecutionManager)
         if state.price_step > 0:
@@ -546,3 +556,17 @@ class BacktestEngine:
             return 4_000.0
         else:
             return 7_775.0
+
+
+def _is_near_dividend(bar_date, dividend_dates: list, days_before: int = 3) -> bool:
+    """Check if bar_date is within days_before of any dividend last_buy_date."""
+    from datetime import date as date_type
+    for d in dividend_dates:
+        if isinstance(d, datetime):
+            d = d.date()
+        if not isinstance(d, date_type):
+            continue
+        diff = (d - bar_date).days
+        if 0 <= diff <= days_before:
+            return True
+    return False

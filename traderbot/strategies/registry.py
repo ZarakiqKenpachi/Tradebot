@@ -6,6 +6,7 @@ from traderbot.strategies.ict_gazp import ICTGazpStrategy
 from traderbot.strategies.tatn_strat import ICTStrategyV3Pro
 from traderbot.strategies.gmkn_pro_trend_strat import GMKNProTrendStrategy
 from traderbot.strategies.nvtk_pro_strategy import NVTKProStrategy
+from traderbot.strategies.nvtk_pro_strategy_exp import NVTKProStrategyExp
 
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "ict": ICTStrategy,
@@ -15,6 +16,7 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "tatn_strat": ICTStrategyV3Pro,
     "gmkn_pro_trend_strat": GMKNProTrendStrategy,
     "nvtk_pro_strategy": NVTKProStrategy,
+    "nvtk_pro_strategy_exp": NVTKProStrategyExp,
 }
 
 

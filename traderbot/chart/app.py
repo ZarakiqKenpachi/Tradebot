@@ -457,11 +457,22 @@ class MainWindow(QMainWindow):
                     primary_tf, last_bar, gap_hours,
                 )
 
+        # Load dividend dates for short blocking
+        dividend_dates = []
+        try:
+            divs = self._tbank_feed.broker.get_dividends(figi, days_ahead=sim_days + 30)
+            dividend_dates = [d["last_buy_date"] for d in divs if d["last_buy_date"]]
+            if dividend_dates:
+                logger.info("[PLAYBACK] %s: %d dividend dates loaded", symbol, len(dividend_dates))
+        except Exception:
+            logger.debug("[PLAYBACK] Could not load dividends for %s", symbol)
+
         self._statusbar.set_status(f"Simulating '{strategy_name}'...")
         sim_config = SimulationConfig(
             scan_tf=scan_tf,
             lot_size=lot_size,
             price_step=price_step,
+            dividend_dates=dividend_dates,
             **self._sim_params,
         )
         result = self._strategy_runner.run(

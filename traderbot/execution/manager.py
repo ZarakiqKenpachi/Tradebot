@@ -95,6 +95,37 @@ class ExecutionManager:
                 self.notifier.send_admin(admin_msg)
 
     # ------------------------------------------------------------------
+    # Дивиденды
+    # ------------------------------------------------------------------
+
+    def _is_dividend_blocked(self, ticker: str, figi: str) -> bool:
+        """Проверить, нельзя ли шортить из-за близкой дивидендной отсечки."""
+        try:
+            dividends = self.broker.get_dividends(figi, days_ahead=10)
+        except Exception:
+            logger.debug("[EXEC] Could not fetch dividends for %s", ticker)
+            return False
+
+        if not dividends:
+            return False
+
+        today = datetime.now(_MSK).date()
+        for div in dividends:
+            last_buy = div["last_buy_date"]
+            if last_buy is None:
+                continue
+            last_buy_date = last_buy.date() if hasattr(last_buy, "date") else last_buy
+            # Блокируем шорт за 3 дня до last_buy_date включительно
+            if today <= last_buy_date and (last_buy_date - today).days <= 3:
+                logger.info(
+                    "[EXEC] %s SELL blocked: dividend cutoff %s (last_buy=%s, div=%.2f₽)",
+                    ticker, div["record_date"], last_buy_date, div["dividend_net"],
+                )
+                return True
+
+        return False
+
+    # ------------------------------------------------------------------
     # Уведомления
     # ------------------------------------------------------------------
 
@@ -114,6 +145,11 @@ class ExecutionManager:
 
     def open_position(self, ticker: str, figi: str, setup: Setup) -> None:
         """Выставить лимитную заявку. SL/TP будут добавлены после исполнения."""
+        # 0. Dividend filter: нельзя шортить перед дивидендной отсечкой
+        if setup.direction == Signal.SELL:
+            if self._is_dividend_blocked(ticker, figi):
+                return
+
         # 1. Баланс, размер лота и шаг цены
         balance = self.broker.get_portfolio_balance(self.account_id)
         lot_size, price_step = self.broker.get_instrument_info(figi)

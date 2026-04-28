@@ -80,6 +80,28 @@ class TBankBroker:
         step = _quotation_to_float(instrument.min_price_increment)
         return lot_size, step
 
+    def get_dividends(self, figi: str, days_ahead: int = 30) -> list[dict]:
+        """Получить дивиденды по инструменту.
+
+        Returns list of dicts with keys: last_buy_date, record_date, payment_date,
+        dividend_net (float, RUB).
+        """
+        with self._client() as client:
+            resp = client.instruments.get_dividends(
+                figi=figi,
+                from_=now() - timedelta(days=30),
+                to=now() + timedelta(days=days_ahead),
+            )
+        result = []
+        for d in resp.dividends:
+            result.append({
+                "last_buy_date": d.last_buy_date,
+                "record_date": d.record_date,
+                "payment_date": d.payment_date,
+                "dividend_net": _quotation_to_float(d.dividend_net),
+            })
+        return result
+
     def get_portfolio_balance(self, account_id: str) -> float:
         """Получить баланс портфеля в RUB."""
         with self._client() as client:

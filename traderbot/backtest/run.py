@@ -106,6 +106,19 @@ def main():
         logger.error("No data loaded")
         sys.exit(1)
 
+    # Загрузить дивидендные даты для фильтрации шортов
+    logger.info("Loading dividend dates...")
+    dividend_data = {}
+    for ticker_name, ticker_conf in tickers.items():
+        try:
+            divs = broker.get_dividends(ticker_conf.figi, days_ahead=days + 30)
+            dates = [d["last_buy_date"] for d in divs if d["last_buy_date"]]
+            if dates:
+                dividend_data[ticker_name] = dates
+                logger.info("  %s: %d dividend dates", ticker_name, len(dates))
+        except Exception as e:
+            logger.warning("  %s: could not load dividends: %s", ticker_name, e)
+
     # Загрузить торговый календарь MOEX для фильтрации праздников и торговых часов
     logger.info("Loading MOEX trading schedule...")
     try:
@@ -122,7 +135,7 @@ def main():
     # Запустить симуляцию
     logger.info("Running backtest...")
     engine = BacktestEngine(config)
-    results = engine.run(all_data, trading_schedule=trading_schedule)
+    results = engine.run(all_data, trading_schedule=trading_schedule, dividend_data=dividend_data)
 
     # Вывести отчёт
     report = BacktestReport(results, config.backtest_initial_balance)

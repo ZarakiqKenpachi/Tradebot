@@ -43,6 +43,7 @@ class SimulationConfig:
     lot_size: int = 1                   # overridden per ticker from T-Bank API
     price_step: float = 0.01            # overridden per ticker from T-Bank API
     scan_tf: str = "1m"                 # granularity for SL/TP/fill scanning
+    dividend_dates: list = field(default_factory=list)  # list of last_buy_date (date objects)
 
 
 @dataclass
@@ -305,6 +306,13 @@ class StrategyRunner:
                 continue
 
             result.setups_found += 1
+
+            # Dividend filter: нельзя шортить перед дивидендной отсечкой
+            if setup.direction.value == "SELL" and cfg.dividend_dates:
+                bar_date = current_time.date() if hasattr(current_time, 'date') else None
+                if bar_date and _is_near_dividend(bar_date, cfg.dividend_dates):
+                    logger.debug("[RUNNER] Skipped SELL: near dividend cutoff")
+                    continue
 
             # Round prices to step
             if cfg.price_step > 0:
@@ -677,6 +685,20 @@ def _get_current_price(bar_scan: pd.DataFrame, primary_df: pd.DataFrame, i: int)
     if i > 0:
         return float(primary_df.iloc[i - 1]["close"])
     return 0.0
+
+
+def _is_near_dividend(bar_date, dividend_dates: list, days_before: int = 3) -> bool:
+    """Check if bar_date is within days_before of any dividend last_buy_date."""
+    from datetime import date as date_type
+    for d in dividend_dates:
+        if isinstance(d, datetime):
+            d = d.date()
+        if not isinstance(d, date_type):
+            continue
+        diff = (d - bar_date).days
+        if 0 <= diff <= days_before:
+            return True
+    return False
 
 
 
