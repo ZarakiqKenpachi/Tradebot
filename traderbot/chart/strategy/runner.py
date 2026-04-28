@@ -310,6 +310,24 @@ class StrategyRunner:
             if cfg.price_step > 0:
                 setup = _round_setup(setup, cfg.price_step)
 
+            # Limit order price validation:
+            # BUY limit cannot be above current price, SELL limit cannot be below
+            current_price = _get_current_price(bar_scan, primary_df, i)
+            if current_price > 0:
+                is_buy = setup.direction.value == "BUY"
+                if is_buy and setup.entry_price > current_price:
+                    logger.debug(
+                        "[RUNNER] Skipped BUY: entry %.2f > market %.2f",
+                        setup.entry_price, current_price,
+                    )
+                    continue
+                if not is_buy and setup.entry_price < current_price:
+                    logger.debug(
+                        "[RUNNER] Skipped SELL: entry %.2f < market %.2f",
+                        setup.entry_price, current_price,
+                    )
+                    continue
+
             # Position sizing
             qty = _position_size(
                 balance, setup.entry_price, setup.stop_price,
@@ -650,6 +668,17 @@ def _get_last_price(scan_df: pd.DataFrame, primary_df: pd.DataFrame, i: int) -> 
     if scan_df is not None and not scan_df.empty:
         return float(scan_df.iloc[-1]["close"])
     return float(primary_df.iloc[i]["close"])
+
+
+def _get_current_price(bar_scan: pd.DataFrame, primary_df: pd.DataFrame, i: int) -> float:
+    """Get current market price at the moment of signal (open of scan bar or prev close)."""
+    if bar_scan is not None and not bar_scan.empty:
+        return float(bar_scan.iloc[0]["open"])
+    if i > 0:
+        return float(primary_df.iloc[i - 1]["close"])
+    return 0.0
+
+
 
 
 def _to_datetime(value) -> datetime:

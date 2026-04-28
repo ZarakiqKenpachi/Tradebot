@@ -127,6 +127,26 @@ class ExecutionManager:
         stop_price = round_to_step(setup.stop_price, price_step)
         target_price = round_to_step(setup.target_price, price_step)
 
+        # 2a. Limit order price validation:
+        #     BUY limit cannot be above market, SELL limit cannot be below market
+        try:
+            market_price = self.broker.get_last_price(figi)
+        except Exception:
+            market_price = None
+        if market_price is not None:
+            if setup.direction == Signal.BUY and entry_price > market_price:
+                logger.info(
+                    "[EXEC] %s BUY limit %.2f > market %.2f → skipped",
+                    ticker, entry_price, market_price,
+                )
+                return
+            elif setup.direction == Signal.SELL and entry_price < market_price:
+                logger.info(
+                    "[EXEC] %s SELL limit %.2f < market %.2f → skipped",
+                    ticker, entry_price, market_price,
+                )
+                return
+
         # 3. Размер позиции в лотах
         qty = self.risk.position_size(balance, entry_price, stop_price, lot_size)
         if qty < 1:

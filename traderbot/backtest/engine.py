@@ -290,6 +290,19 @@ class BacktestEngine:
                 target_price=round_to_step(setup.target_price, state.price_step),
             )
 
+        # Limit order price validation:
+        # BUY limit cannot be above current price, SELL limit cannot be below
+        if bar_1m is not None and not bar_1m.empty:
+            current_price = float(bar_1m.iloc[0]["open"])
+        else:
+            current_price = 0.0
+        if current_price > 0:
+            is_buy = setup.direction.value == "BUY"
+            if is_buy and setup.entry_price > current_price:
+                return trades, balance
+            if not is_buy and setup.entry_price < current_price:
+                return trades, balance
+
         qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price, state.lot_size)
         if qty < 1:
             return trades, balance
