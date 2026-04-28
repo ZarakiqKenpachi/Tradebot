@@ -34,14 +34,14 @@ _PENDING_TIMEOUT = 20      # 30m-candle equivalents for limit order timeout
 class SimulationConfig:
     """Configuration for the simulation engine."""
     initial_balance: float = 100_000.0
-    risk_pct: float = 0.05
-    max_position_pct: float = 0.40
+    risk_pct: float = 0.10
+    max_position_pct: float = 1.50
     commission_pct: float = 0.0004
     slippage_pct: float = 0.0005
-    max_candles_timeout: int = 48       # in 30m candles
+    max_candles_timeout: int = 12       # in 30m candles (from config.yaml trading section)
     max_consecutive_sl: int = 3
-    lot_size: int = 10                  # default, overridden per ticker
-    price_step: float = 0.01            # default, overridden per ticker
+    lot_size: int = 1                   # overridden per ticker from T-Bank API
+    price_step: float = 0.01            # overridden per ticker from T-Bank API
     scan_tf: str = "1m"                 # granularity for SL/TP/fill scanning
 
 

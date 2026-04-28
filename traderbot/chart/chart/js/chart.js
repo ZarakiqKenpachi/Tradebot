@@ -654,12 +654,13 @@ function initChart() {
     });
     resizeObserver.observe(container);
 
-    // Click — marker detection
+    // Click — marker detection → build full trade data from entry+exit pair
     chart.subscribeClick(param => {
         if (!param.point || !param.time) return;
         const clickedMarker = findMarkerAtTime(param.time);
         if (clickedMarker && bridge) {
-            bridge.onMarkerClicked(JSON.stringify(clickedMarker));
+            const fullTrade = buildFullTrade(clickedMarker);
+            bridge.onMarkerClicked(JSON.stringify(fullTrade));
         }
     });
 
@@ -761,8 +762,50 @@ function getMarkerText(m) {
     return "X";
 }
 function findMarkerAtTime(time) {
-    for (const m of tradeMarkers) { if (Math.abs(m.time - time) < 3600) return m; }
+    // Search both static markers and playback markers
+    const allMarkers = _pb.shownMarkers && _pb.shownMarkers.length > 0
+        ? _pb.shownMarkers : tradeMarkers;
+    for (const m of allMarkers) { if (Math.abs(m.time - time) < 3600) return m; }
     return null;
+}
+
+function buildFullTrade(marker) {
+    // Find the paired entry+exit markers by trade_id and merge into one object
+    const allMarkers = _pb.shownMarkers && _pb.shownMarkers.length > 0
+        ? _pb.shownMarkers : tradeMarkers;
+    const tid = marker.trade_id;
+    let entry = null, exit = null;
+    if (tid !== undefined) {
+        for (const m of allMarkers) {
+            if (m.trade_id === tid) {
+                if (m.type === "entry") entry = m;
+                else if (m.type === "exit") exit = m;
+            }
+        }
+    }
+    if (!entry && !exit) return marker;
+    const result = { direction: (entry || exit).direction, ticker: (entry || exit).ticker };
+    if (entry) {
+        result.entry_price = entry.price;
+        result.entry_time = _tsToISO(entry.time);
+        result.entry_reason = entry.entry_reason;
+        result.qty = entry.qty;
+        result.stop_price = entry.stop_price;
+        result.target_price = entry.target_price;
+    }
+    if (exit) {
+        result.exit_price = exit.price;
+        result.exit_time = _tsToISO(exit.time);
+        result.exit_reason = exit.exit_reason;
+        result.pnl = exit.pnl;
+        result.candles_held = exit.candles_held;
+    }
+    result.trade_id = tid;
+    return result;
+}
+
+function _tsToISO(ts) {
+    return new Date(ts * 1000).toISOString().replace("Z", "");
 }
 
 // ── Theme ──────────────────────────────────────────────
@@ -1068,6 +1111,8 @@ function _pbFinish() {
         }));
         all.sort((a, b) => a.time - b.time);
         candleSeries.setMarkers(all);
+        // Sync tradeMarkers so click detection works after playback
+        tradeMarkers = _pb.markers;
         clearPriceLines();
         chart.timeScale().scrollToRealTime();
     } catch (e) {

@@ -1,7 +1,7 @@
 """Trade detail popup — shown when clicking a trade marker or table row."""
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QGroupBox, QGridLayout,
     QPushButton, QHBoxLayout,
@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import (
 
 class TradeDetailDialog(QDialog):
     """Shows full details of a trade: entry/exit, reason, P&L."""
+
+    scroll_to_trade = pyqtSignal(dict)
 
     def __init__(self, trade: dict, parent=None):
         super().__init__(parent)
@@ -43,12 +45,20 @@ class TradeDetailDialog(QDialog):
         if pnl is not None:
             pnl_color = "#26a69a" if pnl >= 0 else "#ef5350"
             pnl_sign = "+" if pnl >= 0 else ""
-            commission = t.get("commission", 0)
+            # Calculate % move
+            entry_p = t.get("entry_price")
+            exit_p = t.get("exit_price")
+            pct_str = ""
+            if entry_p and exit_p and entry_p != 0:
+                pct = (exit_p - entry_p) / entry_p * 100
+                if t.get("direction") == "SELL":
+                    pct = -pct
+                pct_sign = "+" if pct >= 0 else ""
+                pct_str = f"  <span style='color:{pnl_color}; font-size:14px'>({pct_sign}{pct:.2f}%)</span>"
             pnl_label = QLabel(
                 f"<div style='text-align:center'>"
                 f"<span style='color:{pnl_color}; font-size:20px; font-weight:bold'>"
-                f"{pnl_sign}{pnl:.2f}</span>"
-                f"<br><span style='color:#525669; font-size:10px'>commission: {commission:.4f}</span>"
+                f"{pnl_sign}{pnl:.2f}</span>{pct_str}"
                 f"</div>"
             )
             pnl_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -81,22 +91,42 @@ class TradeDetailDialog(QDialog):
         levels_group = QGroupBox("Levels")
         lg = QGridLayout(levels_group)
         lg.setSpacing(4)
-        sl = t.get("stop_price", "—")
-        tp = t.get("target_price", "—")
-        self._add_row(lg, 0, "Stop Loss", str(sl), color="#ff9800")
-        self._add_row(lg, 1, "Take Profit", str(tp), color="#2962ff")
+        sl = t.get("stop_price")
+        tp = t.get("target_price")
+        entry_p = t.get("entry_price")
+        sl_str = str(sl) if sl else "—"
+        tp_str = str(tp) if tp else "—"
+        if sl and entry_p and entry_p != 0:
+            sl_pct = abs(sl - entry_p) / entry_p * 100
+            sl_str += f"  (−{sl_pct:.2f}%)"
+        if tp and entry_p and entry_p != 0:
+            tp_pct = abs(tp - entry_p) / entry_p * 100
+            tp_str += f"  (+{tp_pct:.2f}%)"
+        self._add_row(lg, 0, "Stop Loss", sl_str, color="#ff9800")
+        self._add_row(lg, 1, "Take Profit", tp_str, color="#2962ff")
         layout.addWidget(levels_group)
 
-        # Close button
-        close_btn = QPushButton("Close")
-        close_btn.setProperty("class", "accent-btn")
-        close_btn.setFixedWidth(80)
-        close_btn.clicked.connect(self.accept)
+        # Buttons
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
+
+        goto_btn = QPushButton("Перейти")
+        goto_btn.setProperty("class", "accent-btn")
+        goto_btn.setFixedWidth(90)
+        goto_btn.clicked.connect(self._on_goto)
+        btn_layout.addWidget(goto_btn)
+
+        close_btn = QPushButton("Закрыть")
+        close_btn.setFixedWidth(90)
+        close_btn.clicked.connect(self.accept)
         btn_layout.addWidget(close_btn)
+
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
+
+    def _on_goto(self) -> None:
+        self.scroll_to_trade.emit(self._trade)
+        self.accept()
 
     @staticmethod
     def _add_row(grid: QGridLayout, row: int, label: str, value: str,

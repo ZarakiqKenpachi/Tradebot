@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         self._config = config or AppConfig()
         self._tbank_feed = tbank_feed  # T-Bank data feed for simulation
         self._ticker_figi_map = self._load_ticker_figi_map()  # symbol → figi
+        self._sim_params = self._load_sim_params()  # risk/trading params from config.yaml
         self._is_dark = True
 
         self.setWindowTitle("Chart Analyzer — TraderBot")
@@ -238,6 +239,7 @@ class MainWindow(QMainWindow):
     def _on_marker_clicked(self, marker_data: dict) -> None:
         """Show trade detail when marker clicked on chart."""
         dialog = TradeDetailDialog(marker_data, self)
+        dialog.scroll_to_trade.connect(self._on_scroll_to_trade)
         dialog.exec()
 
     def _on_trade_selected(self, trade: dict) -> None:
@@ -247,6 +249,7 @@ class MainWindow(QMainWindow):
     def _on_trade_double_clicked(self, trade: dict) -> None:
         """Show trade detail popup on double-click."""
         dialog = TradeDetailDialog(trade, self)
+        dialog.scroll_to_trade.connect(self._on_scroll_to_trade)
         dialog.exec()
 
     def _on_scroll_to_trade(self, trade: dict) -> None:
@@ -458,6 +461,7 @@ class MainWindow(QMainWindow):
             scan_tf=scan_tf,
             lot_size=lot_size,
             price_step=price_step,
+            **self._sim_params,
         )
         result = self._strategy_runner.run(
             strategy_name, candles,
@@ -663,6 +667,31 @@ class MainWindow(QMainWindow):
                 name: tc.get("figi", "")
                 for name, tc in cfg.get("tickers", {}).items()
                 if tc.get("figi")
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _load_sim_params() -> dict:
+        """Load simulation parameters from config.yaml (risk + trading + backtest)."""
+        config_path = PROJECT_ROOT / "traderbot" / "config.yaml"
+        if not config_path.exists():
+            return {}
+        try:
+            import yaml
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            risk = cfg.get("risk", {})
+            trading = cfg.get("trading", {})
+            bt = cfg.get("backtest", {})
+            return {
+                "initial_balance": bt.get("initial_balance", 100_000.0),
+                "risk_pct": risk.get("risk_pct", 0.10),
+                "max_position_pct": risk.get("max_position_pct", 1.50),
+                "commission_pct": trading.get("commission_pct", 0.0004),
+                "slippage_pct": bt.get("slippage_pct", 0.0005),
+                "max_candles_timeout": trading.get("max_candles_timeout", 12),
+                "max_consecutive_sl": risk.get("max_consecutive_sl", 3),
             }
         except Exception:
             return {}
