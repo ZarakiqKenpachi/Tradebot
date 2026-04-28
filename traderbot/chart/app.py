@@ -154,6 +154,7 @@ class MainWindow(QMainWindow):
         self._strategy_bar.playback_pause_requested.connect(self._on_playback_pause)
         self._strategy_bar.playback_stop_requested.connect(self._on_playback_stop)
         self._strategy_bar.playback_step_requested.connect(self._on_playback_step)
+        self._strategy_bar.playback_skip_to_end_requested.connect(self._on_playback_skip)
         self._strategy_bar._speed_combo.currentIndexChanged.connect(self._on_playback_speed_changed)
 
         # Chart
@@ -567,6 +568,10 @@ class MainWindow(QMainWindow):
     def _on_playback_step(self) -> None:
         """Advance one candle while paused — delegate to JS."""
         self._chart._bridge.step_playback()
+
+    def _on_playback_skip(self) -> None:
+        """Skip to end of playback, showing all candles without animation."""
+        self._chart._bridge.skip_to_end()
 
     def _on_playback_stop(self) -> None:
         """Stop playback — delegate to JS, then show final results."""

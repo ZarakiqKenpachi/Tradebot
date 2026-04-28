@@ -1158,6 +1158,51 @@ function setPlaybackSpeed(ms) {
     }
 }
 
+function skipToEnd() {
+    // Skip animation: finish playback instantly, showing all remaining candles
+    if (_pb.timer) { clearInterval(_pb.timer); _pb.timer = null; }
+
+    // Fast-forward through all remaining candles without animation
+    while (_pb.idx < _pb.candles.length) {
+        const d = _pb.candles[_pb.idx];
+        _pb.idx++;
+        const ct = d.time;
+
+        // Guard: skip if time is not strictly greater than last
+        if (ct <= _pb.lastTime) continue;
+        _pb.lastTime = ct;
+
+        // Append candle
+        try {
+            candleSeries.update({ time: ct, open: d.open, high: d.high, low: d.low, close: d.close });
+            volumeSeries.update({ time: ct, value: d.volume || 0,
+                color: d.close >= d.open ? theme.volumeUp : theme.volumeDown });
+        } catch (e) {
+            console.error("[PLAYBACK] skip error at idx", _pb.idx - 1, "time", ct, e);
+            continue;
+        }
+
+        // Show all remaining markers
+        for (const m of _pb.markers) {
+            if (m._shown) continue;
+            if (m.time <= ct) {
+                m._shown = true;
+                _pb.shownMarkers.push(m);
+
+                // Price lines: show on entry, clear on exit
+                if (m.type === "entry") {
+                    _pbShowLines(m);
+                } else if (m.type === "exit") {
+                    clearPriceLines();
+                }
+            }
+        }
+    }
+
+    // Final render with all candles and markers
+    _pbFinish();
+}
+
 function stopPlayback() {
     if (_pb.timer) { clearInterval(_pb.timer); _pb.timer = null; }
     _pb.paused = false;

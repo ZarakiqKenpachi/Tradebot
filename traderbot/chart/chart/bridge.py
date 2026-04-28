@@ -19,6 +19,7 @@ class ChartBridge(QObject):
     tool_deactivated = pyqtSignal()  # JS cancelled active tool (Escape/RMB)
     playback_pause = pyqtSignal()    # Space key — toggle pause
     playback_step = pyqtSignal()     # Right arrow — step forward
+    playback_skip_to_end = pyqtSignal()  # Skip to end of playback
     playback_progress = pyqtSignal(dict)  # JS reports progress {idx, total, shownTrades, pnl}
     playback_done = pyqtSignal(dict)      # JS playback finished
 
@@ -184,6 +185,9 @@ class ChartBridge(QObject):
 
     def stop_playback(self) -> None:
         self._run_js("stopPlayback()")
+
+    def skip_to_end(self) -> None:
+        self._run_js("skipToEnd()")
 
     # Navigation
     def set_crosshair_mode(self, mode: str) -> None:

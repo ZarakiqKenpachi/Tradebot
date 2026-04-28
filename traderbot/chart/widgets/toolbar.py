@@ -307,6 +307,7 @@ class StrategyBar(QToolBar):
     playback_pause_requested = pyqtSignal()
     playback_stop_requested = pyqtSignal()
     playback_step_requested = pyqtSignal()
+    playback_skip_to_end_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__("Strategy", parent)
@@ -353,6 +354,11 @@ class StrategyBar(QToolBar):
         self._step_btn.clicked.connect(self.playback_step_requested.emit)
         self.addWidget(self._step_btn)
 
+        self._skip_btn = _icon_btn(">>|", 30, "Skip to end (no animation)", cls="playback-btn")
+        self._skip_btn.setEnabled(False)
+        self._skip_btn.clicked.connect(self.playback_skip_to_end_requested.emit)
+        self.addWidget(self._skip_btn)
+
         self._stop_btn = _icon_btn("Stop", 36, "Stop playback", cls="stop-btn")
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self.playback_stop_requested.emit)
@@ -391,6 +397,7 @@ class StrategyBar(QToolBar):
         self._play_btn.setEnabled(not playing)
         self._pause_btn.setEnabled(playing)
         self._step_btn.setEnabled(playing)
+        self._skip_btn.setEnabled(playing)
         self._stop_btn.setEnabled(playing)
 
     # ── Private ──────────────────────────────────────────
