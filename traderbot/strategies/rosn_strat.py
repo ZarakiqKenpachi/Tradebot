@@ -11,31 +11,29 @@ logger = logging.getLogger(__name__)
 _MSK = ZoneInfo("Europe/Moscow")
 _EVENING_HOUR = 17
 
-# ── Sweep ────────────────────────────────────────────────────
-SWEEP_LOOKBACK = 6
+# ── EMA light trend filter ───────────────────────────────────
+EMA_PERIOD = 20
 
-# ── EMA trend filter ─────────────────────────────────────────
-EMA_FAST = 20
-EMA_SLOW = 50
+# ── Sweep ────────────────────────────────────────────────────
+SWEEP_LOOKBACK = 8
+MAX_SWEEP_AGE = 3
 
 # ── Displacement quality ─────────────────────────────────────
 DISPLACEMENT_MIN_BODY_RATIO = 0.50
-DISPLACEMENT_MIN_ATR_RATIO  = 0.85
-MAX_DISP_BARS = 10
-MAX_SWEEP_AGE = 1
+DISPLACEMENT_MIN_ATR_RATIO = 0.80
+MAX_DISP_BARS = 8
 
-# ── Entry / Stop / Target ─────────────────────────────────────
-ENTRY_RETRACEMENT = 0.50
-STOP_BUFFER       = 0.003
-MIN_SL_DISTANCE   = 0.004
-RISK_REWARD       = 2.0
+# ── Entry / Stop / Target ────────────────────────────────────
+ENTRY_RETRACEMENT = 0.90
+STOP_BUFFER = 0.003
+MIN_SL_DISTANCE = 0.003
+RISK_REWARD = 2.5
 
 
-class ICTStrategyV2Sw10Rr2(BaseStrategy):
+class ROSNStrategy(BaseStrategy):
     """
-    SBER ICT v2 — sweep 10 свечей 1H, EMA-тренд только, RR 1:2.
-    Trend mode: EMA20/50 фильтр, торгуем строго по тренду.
-    Range mode отключён — он генерировал шум в боковиках.
+    ROSN ICT — sweep 5 свечей 1H, лёгкий EMA(20) тренд-фильтр, RR 1:1.8.
+    Вечерний фильтр BUY (гэп-риск).
     """
 
     required_timeframes = ["30m", "1h"]
@@ -45,11 +43,11 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
         self._pending_sweep_level: float | None = None
         self._pending_direction: Signal | None = None
 
-    def find_setup(self, candles: dict[str, pd.DataFrame]) -> Setup | None:
-        df_1h  = candles["1h"]
+    def find_setup(self, candles):
+        df_1h = candles["1h"]
         df_30m = candles["30m"]
 
-        if len(df_1h) < EMA_SLOW + SWEEP_LOOKBACK + 2:
+        if len(df_1h) < max(SWEEP_LOOKBACK + 2, EMA_PERIOD + 1):
             return None
 
         if self._pending_setup is not None:
@@ -58,17 +56,22 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
             else:
                 return self._pending_setup
 
-        trend = self._ema_trend(df_1h)
-        if trend is None:
-            return None
-
-        sweep = self._detect_sweep(df_1h, trend)
+        sweep = self._detect_sweep(df_1h)
         if sweep is None:
             return None
 
         direction, sweep_level, sweep_time, sweep_wick = sweep
 
-        # Не открываем BUY вечером — гэп-риск
+        # Лёгкий тренд-фильтр: close vs EMA(20) на 1H
+        ema = df_1h["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+        last_close = float(df_1h["close"].iloc[-1])
+        last_ema = float(ema.iloc[-1])
+        if direction == Signal.BUY and last_close < last_ema:
+            return None
+        if direction == Signal.SELL and last_close > last_ema:
+            return None
+
+        # Не открываем BUY вечером — гэп вниз утром убивает лонги
         if direction == Signal.BUY and not df_30m.empty:
             latest_time = df_30m.index[-1]
             try:
@@ -85,19 +88,8 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
             self._pending_direction = direction
         return setup
 
-    def _ema_trend(self, df_1h: pd.DataFrame) -> Signal | None:
-        ema_fast = df_1h["close"].ewm(span=EMA_FAST, adjust=False).mean()
-        ema_slow = df_1h["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-        ef = float(ema_fast.iloc[-1])
-        es = float(ema_slow.iloc[-1])
-        if pd.isna(ef) or pd.isna(es) or es == 0:
-            return None
-        if ef > es:
-            return Signal.BUY
-        return Signal.SELL
-
     def _detect_sweep(
-        self, df_1h: pd.DataFrame, trend: Signal
+        self, df_1h: pd.DataFrame
     ) -> tuple[Signal, float, pd.Timestamp, float] | None:
         n = len(df_1h)
         if n < SWEEP_LOOKBACK + 1:
@@ -108,34 +100,27 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
             if i < SWEEP_LOOKBACK:
                 break
             sweep_candle = df_1h.iloc[i]
-            structure    = df_1h.iloc[i - SWEEP_LOOKBACK:i]
-            sweep_time   = df_1h.index[i]
+            structure = df_1h.iloc[i - SWEEP_LOOKBACK:i]
+            sweep_time = df_1h.index[i]
 
-            if trend == Signal.BUY:
-                structure_low = float(structure["low"].min())
-                if sweep_candle["low"] < structure_low and sweep_candle["close"] > structure_low:
-                    return Signal.BUY, structure_low, sweep_time, float(sweep_candle["low"])
+            structure_low = float(structure["low"].min())
+            if sweep_candle["low"] < structure_low and sweep_candle["close"] > structure_low:
+                return Signal.BUY, structure_low, sweep_time, float(sweep_candle["low"])
 
-            if trend == Signal.SELL:
-                structure_high = float(structure["high"].max())
-                if sweep_candle["high"] > structure_high and sweep_candle["close"] < structure_high:
-                    return Signal.SELL, structure_high, sweep_time, float(sweep_candle["high"])
+            structure_high = float(structure["high"].max())
+            if sweep_candle["high"] > structure_high and sweep_candle["close"] < structure_high:
+                return Signal.SELL, structure_high, sweep_time, float(sweep_candle["high"])
 
         return None
 
     def _find_displacement(
-        self,
-        df_30m: pd.DataFrame,
-        direction: Signal,
-        sweep_level: float,
-        sweep_time: pd.Timestamp,
-        sweep_wick: float,
+        self, df_30m, direction, sweep_level, sweep_time, sweep_wick
     ) -> Setup | None:
         after_sweep = df_30m[df_30m.index >= sweep_time].iloc[:MAX_DISP_BARS]
         if after_sweep.empty:
             return None
 
-        atr_14 = self._calc_atr(df_30m, 14)
+        atr_14 = self._atr(df_30m, 14)
         if atr_14 is None or atr_14.empty:
             return None
 
@@ -156,16 +141,17 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
 
             if direction == Signal.BUY and candle["close"] > candle["open"]:
                 entry_price = float(candle["close"]) - ENTRY_RETRACEMENT * body
-                stop_price  = sweep_wick * (1 - STOP_BUFFER)
+                stop_price = sweep_wick * (1 - STOP_BUFFER)
                 risk = entry_price - stop_price
                 if risk > 0 and risk / entry_price >= MIN_SL_DISTANCE:
+                    tp = entry_price + risk * RISK_REWARD
                     return Setup(
-                        direction=Signal.BUY,
-                        entry_price=round(entry_price, 4),
-                        stop_price=round(stop_price, 4),
-                        target_price=round(entry_price + RISK_REWARD * risk, 4),
-                        entry_reason=(
-                            f"SBER (тренд) 1H свип ниже {sweep_level:.2f} "
+                        Signal.BUY,
+                        round(entry_price, 4),
+                        round(stop_price, 4),
+                        round(tp, 4),
+                        (
+                            f"ROSN 1H свип ниже {sweep_level:.2f} "
                             f"в {sweep_time.strftime('%H:%M')}; "
                             f"30m BUY импульс в {idx.strftime('%H:%M')}"
                         ),
@@ -173,16 +159,17 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
 
             if direction == Signal.SELL and candle["close"] < candle["open"]:
                 entry_price = float(candle["close"]) + ENTRY_RETRACEMENT * body
-                stop_price  = sweep_wick * (1 + STOP_BUFFER)
+                stop_price = sweep_wick * (1 + STOP_BUFFER)
                 risk = stop_price - entry_price
                 if risk > 0 and risk / entry_price >= MIN_SL_DISTANCE:
+                    tp = entry_price - risk * RISK_REWARD
                     return Setup(
-                        direction=Signal.SELL,
-                        entry_price=round(entry_price, 4),
-                        stop_price=round(stop_price, 4),
-                        target_price=round(entry_price - RISK_REWARD * risk, 4),
-                        entry_reason=(
-                            f"SBER (тренд) 1H свип выше {sweep_level:.2f} "
+                        Signal.SELL,
+                        round(entry_price, 4),
+                        round(stop_price, 4),
+                        round(tp, 4),
+                        (
+                            f"ROSN 1H свип выше {sweep_level:.2f} "
                             f"в {sweep_time.strftime('%H:%M')}; "
                             f"30m SELL импульс в {idx.strftime('%H:%M')}"
                         ),
@@ -190,14 +177,14 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
 
         return None
 
-    def _calc_atr(self, df: pd.DataFrame, period: int) -> pd.Series | None:
-        if len(df) < period + 1:
+    def _atr(self, df, p):
+        if len(df) < p + 1:
             return None
-        h  = df["high"]
-        l  = df["low"]
+        h = df["high"]
+        l = df["low"]
         pc = df["close"].shift(1)
         tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-        return tr.rolling(period).mean()
+        return tr.rolling(p).mean()
 
     def _is_pending_invalidated(self, df_30m: pd.DataFrame) -> bool:
         if self._pending_direction is None or self._pending_sweep_level is None:
@@ -213,6 +200,6 @@ class ICTStrategyV2Sw10Rr2(BaseStrategy):
         self._clear_pending()
 
     def _clear_pending(self):
-        self._pending_setup       = None
+        self._pending_setup = None
         self._pending_sweep_level = None
-        self._pending_direction   = None
+        self._pending_direction = None

@@ -14,23 +14,17 @@ SWEEP_LOOKBACK = 15
 # ── EMA trend filter ─────────────────────────────────────────
 EMA_FAST = 20
 EMA_SLOW = 50
-EMA_RANGE_THRESHOLD = 0.005
-
-# ── Range-mode quality (строже тренда) ───────────────────────
-RANGE_MIN_BODY_RATIO = 0.60
-RANGE_MIN_ATR_RATIO  = 1.00
-RANGE_SWEEP_AGE = 2
 
 # ── Displacement quality ─────────────────────────────────────
-DISPLACEMENT_MIN_BODY_RATIO = 0.45   # чуть мягче для большей частоты
-DISPLACEMENT_MIN_ATR_RATIO  = 0.78   # чуть мягче для большей частоты
+DISPLACEMENT_MIN_BODY_RATIO = 0.50
+DISPLACEMENT_MIN_ATR_RATIO  = 0.85
 MAX_DISP_BARS = 8
-MAX_SWEEP_AGE = 2                    # сканируем последние N свечей 1H на свип
+MAX_SWEEP_AGE = 1                    # только последняя свеча 1H
 
 # ── Entry / Stop / Target ─────────────────────────────────────
 ENTRY_RETRACEMENT = 0.50
 STOP_BUFFER       = 0.003
-MIN_SL_DISTANCE   = 0.003
+MIN_SL_DISTANCE   = 0.007
 RISK_REWARD       = 2.0
 
 
@@ -66,53 +60,46 @@ class ICTStrategy(BaseStrategy):
             else:
                 return self._pending_setup
 
-        mode, trend = self._ema_mode(df_1h)
-        if mode is None:
+        trend = self._ema_trend(df_1h)
+        if trend is None:
             return None
 
-        is_range = (mode == "range")
-
-        sweep = self._detect_sweep(df_1h, trend, is_range)
+        sweep = self._detect_sweep(df_1h, trend)
         if sweep is None:
             return None
 
         direction, sweep_level, sweep_time, sweep_wick = sweep
 
-        setup = self._find_displacement(df_30m, direction, sweep_level, sweep_time, sweep_wick, is_range)
+        setup = self._find_displacement(df_30m, direction, sweep_level, sweep_time, sweep_wick)
         if setup is not None:
             self._pending_setup = setup
             self._pending_sweep_level = sweep_level
             self._pending_direction = direction
         return setup
 
-    # ── EMA mode ─────────────────────────────────────────────
+    # ── EMA trend ────────────────────────────────────────────
 
-    def _ema_mode(self, df_1h: pd.DataFrame):
+    def _ema_trend(self, df_1h: pd.DataFrame) -> Signal | None:
         ema_fast = df_1h["close"].ewm(span=EMA_FAST, adjust=False).mean()
         ema_slow = df_1h["close"].ewm(span=EMA_SLOW, adjust=False).mean()
         ef = float(ema_fast.iloc[-1])
         es = float(ema_slow.iloc[-1])
         if pd.isna(ef) or pd.isna(es) or es == 0:
-            return None, None
-        spread = abs(ef - es) / es
-        if spread <= EMA_RANGE_THRESHOLD:
-            return "range", None
+            return None
         if ef > es:
-            return "trend", Signal.BUY
-        return "trend", Signal.SELL
+            return Signal.BUY
+        return Signal.SELL
 
     # ── Sweep detection ───────────────────────────────────────
 
     def _detect_sweep(
-        self, df_1h: pd.DataFrame, trend, is_range: bool
+        self, df_1h: pd.DataFrame, trend: Signal
     ) -> tuple[Signal, float, pd.Timestamp, float] | None:
         n = len(df_1h)
         if n < SWEEP_LOOKBACK + 1:
             return None
 
-        age = RANGE_SWEEP_AGE if is_range else MAX_SWEEP_AGE
-
-        for offset in range(age):
+        for offset in range(MAX_SWEEP_AGE):
             i = n - 1 - offset
             if i < SWEEP_LOOKBACK:
                 break
@@ -120,15 +107,12 @@ class ICTStrategy(BaseStrategy):
             structure    = df_1h.iloc[i - SWEEP_LOOKBACK:i]
             sweep_time   = df_1h.index[i]
 
-            check_buy  = is_range or trend == Signal.BUY
-            check_sell = is_range or trend == Signal.SELL
-
-            if check_buy:
+            if trend == Signal.BUY:
                 structure_low = float(structure["low"].min())
                 if sweep_candle["low"] < structure_low and sweep_candle["close"] > structure_low:
                     return Signal.BUY, structure_low, sweep_time, float(sweep_candle["low"])
 
-            if check_sell:
+            if trend == Signal.SELL:
                 structure_high = float(structure["high"].max())
                 if sweep_candle["high"] > structure_high and sweep_candle["close"] < structure_high:
                     return Signal.SELL, structure_high, sweep_time, float(sweep_candle["high"])
@@ -144,7 +128,6 @@ class ICTStrategy(BaseStrategy):
         sweep_level: float,
         sweep_time: pd.Timestamp,
         sweep_wick: float,
-        is_range: bool,
     ) -> Setup | None:
         after_sweep = df_30m[df_30m.index >= sweep_time].iloc[:MAX_DISP_BARS]
         if after_sweep.empty:
@@ -154,9 +137,6 @@ class ICTStrategy(BaseStrategy):
         if atr_14 is None or atr_14.empty:
             return None
 
-        body_min = RANGE_MIN_BODY_RATIO if is_range else DISPLACEMENT_MIN_BODY_RATIO
-        atr_min  = RANGE_MIN_ATR_RATIO  if is_range else DISPLACEMENT_MIN_ATR_RATIO
-
         for idx, candle in after_sweep.iterrows():
             candle_range = float(candle["high"] - candle["low"])
             if candle_range == 0:
@@ -164,16 +144,14 @@ class ICTStrategy(BaseStrategy):
 
             body = abs(float(candle["close"] - candle["open"]))
 
-            if body / candle_range < body_min:
+            if body / candle_range < DISPLACEMENT_MIN_BODY_RATIO:
                 continue
 
             candle_atr = atr_14.get(idx)
             if candle_atr is None or pd.isna(candle_atr) or candle_atr == 0:
                 continue
-            if candle_range < candle_atr * atr_min:
+            if candle_range < candle_atr * DISPLACEMENT_MIN_ATR_RATIO:
                 continue
-
-            mode_str = "боковик" if is_range else "тренд"
 
             if direction == Signal.BUY and candle["close"] > candle["open"]:
                 entry_price = float(candle["close"]) - ENTRY_RETRACEMENT * body
@@ -187,7 +165,7 @@ class ICTStrategy(BaseStrategy):
                         stop_price=round(stop_price, 4),
                         target_price=round(target_price, 4),
                         entry_reason=(
-                            f"ROSN ({mode_str}) 1H свип ниже {sweep_level:.2f} "
+                            f"ROSN (тренд) 1H свип ниже {sweep_level:.2f} "
                             f"в {sweep_time.strftime('%H:%M')}; "
                             f"30m BUY импульс в {idx.strftime('%H:%M')}"
                         ),
@@ -205,7 +183,7 @@ class ICTStrategy(BaseStrategy):
                         stop_price=round(stop_price, 4),
                         target_price=round(target_price, 4),
                         entry_reason=(
-                            f"ROSN ({mode_str}) 1H свип выше {sweep_level:.2f} "
+                            f"ROSN (тренд) 1H свип выше {sweep_level:.2f} "
                             f"в {sweep_time.strftime('%H:%M')}; "
                             f"30m SELL импульс в {idx.strftime('%H:%M')}"
                         ),
@@ -242,23 +220,3 @@ class ICTStrategy(BaseStrategy):
         self._pending_sweep_level  = None
         self._pending_direction    = None
 
-    @staticmethod
-    def _format_reason(
-        direction: Signal,
-        sweep_level: float,
-        sweep_time: pd.Timestamp,
-        candle_time: pd.Timestamp,
-        body: float,
-        candle_range: float,
-        atr: float,
-    ) -> str:
-        body_pct = body / candle_range * 100 if candle_range else 0
-        atr_pct  = candle_range / atr * 100  if atr        else 0
-        is_buy   = direction == Signal.BUY
-        return (
-            f"ROSN 1H свип {'ниже' if is_buy else 'выше'} "
-            f"структурного {'минимума' if is_buy else 'максимума'} {sweep_level:.2f} "
-            f"(sw{SWEEP_LOOKBACK}, EMA-тренд, {sweep_time.strftime('%H:%M')}); "
-            f"30m импульс {'вверх' if is_buy else 'вниз'} в {candle_time.strftime('%H:%M')} "
-            f"(тело {body_pct:.0f}%, диапазон {atr_pct:.0f}% ATR)"
-        )

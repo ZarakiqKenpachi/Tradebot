@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # GMKN PRO TREND 2.0
 
-RISK_REWARD = 2.4
+RISK_REWARD = 1.5
 
 EMA_FAST = 20
 EMA_SLOW = 50
@@ -25,8 +25,8 @@ DISPLACEMENT_BREAK_LOOKBACK = 4
 MAX_BARS_AFTER_PULLBACK_FOR_SIGNAL = 6
 
 OTE_MIN = 0.62
-OTE_MAX = 0.79
-OTE_ENTRY = 0.70
+OTE_MAX = 0.95
+OTE_ENTRY = 0.90
 
 STOP_BUFFER = 0.0015
 MIN_SL_DISTANCE = 0.0025

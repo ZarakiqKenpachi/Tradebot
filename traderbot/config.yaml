@@ -29,7 +29,7 @@ subscription:
 
 # === Риск-менеджмент ===
 risk:
-  risk_pct: 0.10
+  risk_pct: 0.15
   max_position_pct: 1.50
   max_consecutive_sl: 3
   max_daily_sl: 3
@@ -50,10 +50,10 @@ tickers:
     strategy: "ict_v2_sw4_rr35"
   ROSN:
     figi: "BBG004731354"
-    strategy: "ict"
+    strategy: "rosn_strat"
   NVTK:
     figi: "BBG00475KKY8"
-    strategy: "nvtk_pro_strategy"
+    strategy: "nvtk_sweep_strat"
   TATN:
     figi: "BBG004RVFFC0"
     strategy: "tatn_strat"
@@ -72,7 +72,7 @@ journal:
 # === Основной цикл ===
 trading:
   poll_interval_sec: 60
-  max_candles_timeout: 12
+  max_candles_timeout: 18
   commission_pct: 0.0004
 
 # === Бэктест ===

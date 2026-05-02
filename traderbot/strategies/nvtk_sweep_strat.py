@@ -9,32 +9,31 @@ from traderbot.types import Setup, Signal
 logger = logging.getLogger(__name__)
 
 _MSK = ZoneInfo("Europe/Moscow")
-_EVENING_HOUR = 17   # после 17:30 МСК — вечерняя сессия, не открываем BUY (гэп-риск)
+_EVENING_HOUR = 17
 
 # ── EMA light trend filter ───────────────────────────────────
 EMA_PERIOD = 20
 
 # ── Sweep ────────────────────────────────────────────────────
-SWEEP_LOOKBACK = 5
-MAX_SWEEP_AGE = 3
+SWEEP_LOOKBACK = 4
+MAX_SWEEP_AGE = 4
 
 # ── Displacement quality ─────────────────────────────────────
-DISPLACEMENT_MIN_BODY_RATIO = 0.55
-DISPLACEMENT_MIN_ATR_RATIO = 0.9
+DISPLACEMENT_MIN_BODY_RATIO = 0.50
+DISPLACEMENT_MIN_ATR_RATIO = 0.80
 MAX_DISP_BARS = 8
 
 # ── Entry / Stop / Target ────────────────────────────────────
 ENTRY_RETRACEMENT = 0.90
-STOP_BUFFER = 0.003
+STOP_BUFFER = 0.004
 MIN_SL_DISTANCE = 0.003
-RISK_REWARD = 2.5
+RISK_REWARD = 3.0
 
 
-class ICTStrategyV3Pro(BaseStrategy):
+class NVTKSweepStrategy(BaseStrategy):
     """
-    TATN ICT v3 Pro — sweep 8 свечей 1H, EMA 20/50 тренд-фильтр, RR 1:2.
-    Торгуем только по тренду (EMA20 > EMA50 = BUY, EMA20 < EMA50 = SELL).
-    Pending-сетап с инвалидацией по sweep level.
+    NVTK Sweep — sweep 6 свечей 1H, лёгкий EMA(20) тренд-фильтр, RR 1:2.
+    Вечерний фильтр BUY.
     """
 
     required_timeframes = ["30m", "1h"]
@@ -63,7 +62,7 @@ class ICTStrategyV3Pro(BaseStrategy):
 
         direction, sweep_level, sweep_time, sweep_wick = sweep
 
-        # Лёгкий тренд-фильтр: close vs EMA(20) на 1H
+        # Лёгкий тренд-фильтр: close vs EMA(20)
         ema = df_1h["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
         last_close = float(df_1h["close"].iloc[-1])
         last_ema = float(ema.iloc[-1])
@@ -72,7 +71,7 @@ class ICTStrategyV3Pro(BaseStrategy):
         if direction == Signal.SELL and last_close > last_ema:
             return None
 
-        # Не открываем BUY вечером — гэп вниз утром убивает лонги
+        # Вечерний фильтр BUY
         if direction == Signal.BUY and not df_30m.empty:
             latest_time = df_30m.index[-1]
             try:
@@ -89,9 +88,7 @@ class ICTStrategyV3Pro(BaseStrategy):
             self._pending_direction = direction
         return setup
 
-    def _detect_sweep(
-        self, df_1h: pd.DataFrame
-    ) -> tuple[Signal, float, pd.Timestamp, float] | None:
+    def _detect_sweep(self, df_1h):
         n = len(df_1h)
         if n < SWEEP_LOOKBACK + 1:
             return None
@@ -114,9 +111,7 @@ class ICTStrategyV3Pro(BaseStrategy):
 
         return None
 
-    def _find_displacement(
-        self, df_30m, direction, sweep_level, sweep_time, sweep_wick
-    ) -> Setup | None:
+    def _find_displacement(self, df_30m, direction, sweep_level, sweep_time, sweep_wick):
         after_sweep = df_30m[df_30m.index >= sweep_time].iloc[:MAX_DISP_BARS]
         if after_sweep.empty:
             return None
@@ -151,11 +146,8 @@ class ICTStrategyV3Pro(BaseStrategy):
                         round(entry_price, 4),
                         round(stop_price, 4),
                         round(tp, 4),
-                        (
-                            f"TATN (тренд) 1H свип ниже {sweep_level:.2f} "
-                            f"в {sweep_time.strftime('%H:%M')}; "
-                            f"30m BUY импульс в {idx.strftime('%H:%M')}"
-                        ),
+                        f"NVTK 1H свип ниже {sweep_level:.2f} в {sweep_time.strftime('%H:%M')}; "
+                        f"30m BUY импульс в {idx.strftime('%H:%M')}",
                     )
 
             if direction == Signal.SELL and candle["close"] < candle["open"]:
@@ -169,11 +161,8 @@ class ICTStrategyV3Pro(BaseStrategy):
                         round(entry_price, 4),
                         round(stop_price, 4),
                         round(tp, 4),
-                        (
-                            f"TATN (тренд) 1H свип выше {sweep_level:.2f} "
-                            f"в {sweep_time.strftime('%H:%M')}; "
-                            f"30m SELL импульс в {idx.strftime('%H:%M')}"
-                        ),
+                        f"NVTK 1H свип выше {sweep_level:.2f} в {sweep_time.strftime('%H:%M')}; "
+                        f"30m SELL импульс в {idx.strftime('%H:%M')}",
                     )
 
         return None
@@ -187,7 +176,7 @@ class ICTStrategyV3Pro(BaseStrategy):
         tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
         return tr.rolling(p).mean()
 
-    def _is_pending_invalidated(self, df_30m: pd.DataFrame) -> bool:
+    def _is_pending_invalidated(self, df_30m):
         if self._pending_direction is None or self._pending_sweep_level is None:
             return True
         if df_30m.empty:
@@ -197,7 +186,7 @@ class ICTStrategyV3Pro(BaseStrategy):
             return float(latest["low"]) < self._pending_sweep_level
         return float(latest["high"]) > self._pending_sweep_level
 
-    def on_trade_opened(self) -> None:
+    def on_trade_opened(self):
         self._clear_pending()
 
     def _clear_pending(self):

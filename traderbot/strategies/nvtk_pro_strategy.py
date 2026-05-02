@@ -1,5 +1,6 @@
 import logging
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -7,6 +8,9 @@ from traderbot.strategies.base import BaseStrategy
 from traderbot.types import Setup, Signal
 
 logger = logging.getLogger(__name__)
+
+_MSK = ZoneInfo("Europe/Moscow")
+_EVENING_HOUR = 17
 
 
 EMA_FAST = 20
@@ -100,6 +104,15 @@ class NVTKProStrategy(BaseStrategy):
 
         if candidate is None:
             return None
+
+        # Не открываем BUY вечером — гэп вниз утром убивает лонги
+        if candidate.direction == Signal.BUY and not df_15m.empty:
+            try:
+                msk_hour = df_15m.index[-1].astimezone(_MSK).hour
+            except Exception:
+                msk_hour = df_15m.index[-1].hour
+            if msk_hour >= _EVENING_HOUR:
+                return None
 
         if not self._can_trade_zone(candidate.zone_key):
             return None

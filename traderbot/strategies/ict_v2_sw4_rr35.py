@@ -27,10 +27,10 @@ MAX_DISP_BARS = 8
 MAX_SWEEP_AGE = 3                    # сканируем последние N свечей 1H на свип
 
 # ── Entry / Stop / Target ─────────────────────────────────────
-ENTRY_RETRACEMENT = 0.50
-STOP_BUFFER       = 0.003
+ENTRY_RETRACEMENT = 0.90
+STOP_BUFFER       = 0.004
 MIN_SL_DISTANCE   = 0.003
-RISK_REWARD       = 2.0              # было 3.5 — недостижимо
+RISK_REWARD       = 2.5
 
 
 class ICTStrategyV2Sw4Rr35(BaseStrategy):
@@ -78,6 +78,16 @@ class ICTStrategyV2Sw4Rr35(BaseStrategy):
             return None
 
         direction, sweep_level, sweep_time, sweep_wick = sweep
+
+        # В range mode: лёгкий EMA(20) фильтр — не торгуем против тренда
+        if is_range:
+            ema20 = df_1h["close"].ewm(span=EMA_FAST, adjust=False).mean()
+            last_close = float(df_1h["close"].iloc[-1])
+            last_ema = float(ema20.iloc[-1])
+            if direction == Signal.BUY and last_close < last_ema:
+                return None
+            if direction == Signal.SELL and last_close > last_ema:
+                return None
 
         setup = self._find_displacement(df_30m, direction, sweep_level, sweep_time, sweep_wick, is_range)
         if setup is not None:

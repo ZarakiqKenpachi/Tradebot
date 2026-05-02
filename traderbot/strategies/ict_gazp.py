@@ -26,7 +26,7 @@ H4_LOOKBACK = 5          # candles back for bias support check
 
 # ── 1H ──────────────────────────────────────────────────────
 SWEEP_LOOKBACK = 68      # ~4 trading days of H1 (17h/day x 4)
-IMPULSE_MAX_AGE = 8      # max H1 candles back for valid impulse
+IMPULSE_MAX_AGE = 15     # max H1 candles back for valid impulse
 SWEEP_WINDOW = 20        # candles before impulse to look for sweep
 
 # ── Impulse quality (Model B) ────────────────────────────────
@@ -38,12 +38,12 @@ MAX_ZONE_ATTEMPTS = 1
 
 # ── 15m ─────────────────────────────────────────────────────
 RETRACEMENT = 0.50
-STOP_BUFFER = 0.002      # 0.2% buffer beyond invalidation level
+STOP_BUFFER = 0.003      # 0.2% buffer beyond invalidation level
 MIN_SL_PCT = 0.003       # min stop distance as % of price
 
 # ── Targets ─────────────────────────────────────────────────
 RR_TP2 = 2.0
-RR_TP3 = 4.0
+RR_TP3 = 3.0
 
 
 class _ImpulseBlock(NamedTuple):
@@ -109,7 +109,6 @@ class ICTGazpStrategy(BaseStrategy):
                 return None
 
         # Step 4: 1H impulse block
-        # neutral D1 → continuation only (no sweep+shift)
         impulse = self._find_impulse(df_1h, bias, continuation_only=d1_neutral)
         if impulse is None:
             logger.debug("[GAZP] No 1H impulse — skip")
