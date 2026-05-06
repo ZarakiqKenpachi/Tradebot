@@ -33,6 +33,7 @@ risk:
   max_position_pct: 1.50
   max_consecutive_sl: 3
   max_daily_sl: 3
+  max_open_positions: 4
 
 # === Торговые инструменты ===
 tickers:

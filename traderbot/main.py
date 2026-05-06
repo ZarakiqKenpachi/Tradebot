@@ -14,7 +14,7 @@ import pathlib
 import signal
 import threading
 import time
-from datetime import datetime, time as dt_time, timezone
+from datetime import date, datetime, timezone
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
@@ -29,6 +29,7 @@ from traderbot.execution.manager import ExecutionManager
 from traderbot.journal.multi_writer import ClientJournalView, MultiTradeJournal
 from traderbot.journal.sqlite_writer import SqliteTradeJournal
 from traderbot.journal.writer import TradeJournal
+from traderbot.market_schedule import MarketSchedule
 from traderbot.notifications.bot import TelegramBot
 from traderbot.notifications.fsm import FSM
 from traderbot.notifications.handlers.admin import _build_daily_report
@@ -41,6 +42,17 @@ from traderbot.strategies.registry import get_strategy
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Reason labels (shared)
+# ---------------------------------------------------------------------------
+_REASON_LABELS = {
+    "stop_loss": "стоп-лосс",
+    "take_profit": "тейк-профит",
+    "timeout": "по времени",
+    "revoked": "принудительно",
+    "deleted": "удаление клиента",
+}
+
 # Порог consecutive_errors, после которого клиент автоматически ставится на паузу
 MAX_CLIENT_ERRORS = 5
 # Как часто (сек) проверять новых активных клиентов в БД
@@ -52,52 +64,139 @@ HEARTBEAT_INTERVAL_SEC = 3600
 # Как часто (сек) пытаться переподключить Telegram при ошибке инициализации
 TELEGRAM_RETRY_SEC = 300
 
-# Торговые часы МОEX (МСК)
 MSK = ZoneInfo("Europe/Moscow")
-_MARKET_OPEN = dt_time(7, 0)
-_MARKET_CLOSE = dt_time(23, 50)
-
-# Праздничные дни MOEX 2025–2026 (YYYY-MM-DD), когда биржа закрыта
-# Источник: https://www.moex.com/s719
-_MOEX_HOLIDAYS: frozenset[str] = frozenset({
-    # 2025
-    "2025-01-01", "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07",
-    "2025-01-08",
-    "2025-02-24",
-    "2025-03-10",
-    "2025-05-01", "2025-05-02", "2025-05-08", "2025-05-09",
-    "2025-06-12", "2025-06-13",
-    "2025-11-03", "2025-11-04",
-    "2025-12-31",
-    # 2026
-    "2026-01-01", "2026-01-02", "2026-01-07", "2026-01-08", "2026-01-09",
-    "2026-02-23",
-    "2026-03-09",
-    "2026-05-01", "2026-05-04", "2026-05-11",
-    "2026-06-12",
-    "2026-11-04",
-    "2026-12-31",
-})
 
 # Клиенты, которым уже отправлено уведомление об отсутствии токена (дедупликация)
 _no_token_warned: set[int] = set()
 
 
+
+
 # ---------------------------------------------------------------------------
-# Market hours helpers
+# Консолидация торговых уведомлений
 # ---------------------------------------------------------------------------
 
-def is_market_open(now_msk: datetime) -> bool:
-    """Проверить, открыта ли сейчас торговая сессия MOEX.
+def _get_client_name(registry: ClientRegistry, client_id: int) -> str:
+    client = registry.get_by_id(client_id)
+    if client:
+        return client.account_name or client.email or f"#{client_id}"
+    return f"#{client_id}"
 
-    Учитывает: время (07:00–23:50 МСК), выходные дни, официальные праздники MOEX.
-    """
-    if now_msk.weekday() >= 5:   # суббота=5, воскресенье=6
-        return False
-    if now_msk.strftime("%Y-%m-%d") in _MOEX_HOLIDAYS:
-        return False
-    t = now_msk.time().replace(tzinfo=None)
-    return _MARKET_OPEN <= t < _MARKET_CLOSE
+
+def _consolidate_and_send(
+    events: list[dict],
+    registry: ClientRegistry,
+    notifier,
+) -> None:
+    """Консолидировать буферизированные торговые события и отправить админу."""
+    if not events or notifier is None:
+        return
+
+    # Группировка по типу события и ключевым полям
+    from collections import defaultdict
+
+    groups: dict[str, dict[tuple, list[dict]]] = defaultdict(lambda: defaultdict(list))
+
+    for ev in events:
+        etype = ev["type"]
+        if etype == "limit_placed":
+            key = (ev["ticker"], ev["direction"], ev["entry_price"],
+                   ev["stop_price"], ev["target_price"], ev.get("entry_reason", ""))
+        elif etype == "position_opened":
+            key = (ev["ticker"], ev["direction"], ev["entry_price"],
+                   ev["stop_price"], ev["target_price"], ev.get("entry_reason", ""))
+        elif etype == "position_closed":
+            key = (ev["ticker"], ev["direction"], ev["entry_price"],
+                   ev["exit_price"], ev.get("close_reason", ""), ev.get("entry_reason", ""))
+        elif etype in ("limit_cancelled_timeout", "limit_cancelled_external",
+                       "limit_cancelled_market_close"):
+            key = (ev["ticker"], ev["direction"], ev["entry_price"])
+        else:
+            key = (ev.get("ticker", ""), ev.get("direction", ""))
+        groups[etype][key].append(ev)
+
+    # Форматирование и отправка
+    for etype, keyed in groups.items():
+        for key, evts in keyed.items():
+            msg = _format_consolidated_message(etype, evts, registry)
+            if msg:
+                notifier.send_admin(msg)
+
+
+def _format_consolidated_message(
+    etype: str, events: list[dict], registry: ClientRegistry,
+) -> str:
+    """Сформировать одно консолидированное сообщение из группы событий."""
+    ev0 = events[0]
+    clients_info = []
+    for ev in events:
+        name = _get_client_name(registry, ev["client_id"])
+        clients_info.append((name, ev))
+
+    if etype == "limit_placed":
+        lines = [
+            f"\U0001f4cb Выставлена лимитная заявка {ev0['ticker']} {ev0['direction']}",
+            f"Цена: {ev0['entry_price']} | SL: {ev0['stop_price']} | TP: {ev0['target_price']}",
+            f"Причина: {ev0.get('entry_reason', '—')}",
+        ]
+        for name, ev in clients_info:
+            lines.append(f"  💼 {name}: {ev['qty']} лот.")
+        return "\n".join(lines)
+
+    if etype == "position_opened":
+        lines = [
+            f"\U0001f7e2 Позиция открыта {ev0['ticker']} {ev0['direction']}",
+            f"Вход: {ev0['entry_price']} | SL: {ev0['stop_price']} | TP: {ev0['target_price']}",
+            f"Причина: {ev0.get('entry_reason', '—')}",
+        ]
+        for name, ev in clients_info:
+            lines.append(f"  💼 {name}: {ev['qty']} лот.")
+        return "\n".join(lines)
+
+    if etype == "position_closed":
+        reason_label = _REASON_LABELS.get(ev0.get("close_reason", ""), ev0.get("close_reason", ""))
+        lines = [
+            f"\U0001f534 Закрыта позиция {ev0['ticker']} {ev0['direction']}",
+            f"Вход: {ev0['entry_price']} \u2192 Выход: {ev0['exit_price']}",
+            f"Причина закрытия: {reason_label}",
+            f"Причина входа: {ev0.get('entry_reason', '—')}",
+            f"Длительность: {ev0.get('candles_held', 0)} свечей",
+        ]
+        for name, ev in clients_info:
+            lines.append(f"  💼 {name}: {ev['pnl']:+.2f} ₽")
+        return "\n".join(lines)
+
+    if etype == "limit_cancelled_timeout":
+        lines = [
+            f"\u274c Лимитная заявка {ev0['ticker']} {ev0['direction']} отменена",
+            f"Цена: {ev0['entry_price']} | Не исполнена за {ev0.get('pending_candles', '?')} свечей",
+        ]
+        if len(clients_info) > 1:
+            names = ", ".join(name for name, _ in clients_info)
+            lines.append(f"  Клиенты: {names}")
+        return "\n".join(lines)
+
+    if etype == "limit_cancelled_external":
+        lines = [
+            f"\u274c Лимитная заявка {ev0['ticker']} {ev0['direction']} отменена",
+            f"Цена: {ev0['entry_price']}",
+        ]
+        if len(clients_info) > 1:
+            names = ", ".join(name for name, _ in clients_info)
+            lines.append(f"  Клиенты: {names}")
+        return "\n".join(lines)
+
+    if etype == "limit_cancelled_market_close":
+        lines = [
+            f"\u274c Лимитная заявка {ev0['ticker']} {ev0['direction']} отменена (закрытие рынка)",
+            f"Цена: {ev0['entry_price']}",
+        ]
+        if len(clients_info) > 1:
+            names = ", ".join(name for name, _ in clients_info)
+            lines.append(f"  Клиенты: {names}")
+        return "\n".join(lines)
+
+    return ""
 
 
 def _get_today_pnl(db, now_msk: datetime) -> float:
@@ -399,11 +498,21 @@ def _build_exec(client, config: AppConfig, sqlite_state: SqliteStateStore,
         logger.exception("[MAIN] broker_from_client failed for client %d", client.id)
         return None
 
-    try:
-        deposit = broker.get_portfolio_balance(account_id)
-    except Exception:
-        logger.exception("[MAIN] get_portfolio_balance failed for client %d", client.id)
-        return None
+    deposit = None
+    for attempt in range(1, 4):
+        try:
+            deposit = broker.get_portfolio_balance(account_id)
+            break
+        except Exception:
+            if attempt < 3:
+                logger.warning(
+                    "[MAIN] get_portfolio_balance attempt %d/3 failed for client %d, retrying in %ds",
+                    attempt, client.id, attempt * 2,
+                )
+                time.sleep(attempt * 2)
+            else:
+                logger.exception("[MAIN] get_portfolio_balance failed for client %d after 3 attempts", client.id)
+                return None
 
     risk = RiskManager(config.risk_pct, config.max_position_pct, deposit)
     state_view = ClientStateView(sqlite_state, client.id)
@@ -420,6 +529,7 @@ def _build_exec(client, config: AppConfig, sqlite_state: SqliteStateStore,
         max_candles_timeout=config.max_candles_timeout,
         max_consecutive_sl=config.max_consecutive_sl,
         max_daily_sl=config.max_daily_sl,
+        max_open_positions=config.max_open_positions,
         client_id=client.id,
         is_admin=(client.role == ClientRole.ADMIN),
     )
@@ -459,37 +569,41 @@ def _expire_overdue_subscribers(registry: ClientRegistry, execs: dict, notifier)
 
 
 def _warn_expiring_soon(registry: ClientRegistry, notifier) -> None:
-    """Отправить предупреждение клиентам, чья подписка истекает через 7 или 1 день.
+    """Отправить предупреждение клиентам, чья подписка скоро истекает.
 
+    Пороги: 7 дней, 3 дня, 1 день, 1 час.
     Чтобы не спамить при каждом вызове sync_execs (раз в 60 сек), уведомление
     отправляется только один раз за каждый порог: проверяем, укладывается ли
     paid_until ровно в окно [порог, порог + REGISTRY_REFRESH_SEC].
     """
+    _THRESHOLDS = [
+        (7 * 86400, "7 дней"),
+        (3 * 86400, "3 дня"),
+        (1 * 86400, "1 день"),
+        (3600,      "1 час"),
+    ]
     now = datetime.now(timezone.utc)
     active_clients = registry.list_active()
     for client in active_clients:
         if client.role == ClientRole.ADMIN or not client.paid_until:
             continue
         delta_sec = (client.paid_until - now).total_seconds()
-        for days_left in (7, 1):
-            threshold_sec = days_left * 86400
-            # Попадаем в окно: от threshold до threshold+refresh_interval
+        for threshold_sec, label in _THRESHOLDS:
             if threshold_sec >= delta_sec > threshold_sec - REGISTRY_REFRESH_SEC:
-                days_word = "7 дней" if days_left == 7 else "1 день"
                 if notifier:
                     notifier.send_to_client(
                         client.id,
-                        f"⚠️ Ваша подписка истекает через {days_word} "
-                        f"({client.paid_until.strftime('%d.%m.%Y')}).\n"
+                        f"⚠️ Ваша подписка истекает через {label} "
+                        f"({client.paid_until.strftime('%d.%m.%Y %H:%M')}).\n"
                         "Для продления напишите /pay или обратитесь к администратору: @MakeRFGreatAgain",
                     )
                     notifier.send_admin(
-                        f"⏳ Подписка клиента {client.id} истекает через {days_word} "
-                        f"({client.paid_until.strftime('%d.%m.%Y')})"
+                        f"⏳ Подписка клиента {client.id} истекает через {label} "
+                        f"({client.paid_until.strftime('%d.%m.%Y %H:%M')})"
                     )
                 logger.info("[MAIN] Client %d subscription expires in %s (paid_until=%s)",
-                            client.id, days_word, client.paid_until.isoformat())
-                break  # Один порог за вызов достаточно
+                            client.id, label, client.paid_until.isoformat())
+                break
 
 
 def sync_execs(
@@ -685,6 +799,8 @@ def main() -> None:
         app_name=config.market_data.app_name,
     )
     feed = DataFeed(md_broker)
+    first_figi = next(iter(config.tickers.values())).figi
+    schedule = MarketSchedule.from_figi(md_broker, first_figi)
 
     # 4. Bootstrap admin-клиентов из конфига → БД
     bootstrap_admin_clients(registry, config)
@@ -799,6 +915,7 @@ def main() -> None:
     last_heartbeat = 0.0
     last_tg_retry = 0.0
     _market_was_open: bool | None = None   # None = первая итерация
+    _daily_summary_sent_date: date | None = None
 
     try:
         while not _stop.is_set():
@@ -815,7 +932,8 @@ def main() -> None:
                                 em.notifier = notifier
 
                 now_msk = datetime.now(timezone.utc).astimezone(MSK)
-                market_open = is_market_open(now_msk)
+                schedule.refresh()
+                market_open = schedule.is_open(now_msk)
 
                 # Детектировать открытие рынка → уведомление с балансами
                 if _market_was_open is False and market_open:
@@ -839,14 +957,36 @@ def main() -> None:
                             lines.append(f"Итого: {total_balance:,.2f} ₽")
                         notifier.send_admin("\n".join(lines))
 
-                # Детектировать закрытие рынка → дневная статистика + недельная по пятницам
+                # Детектировать закрытие рынка → отмена лимиток + дневная статистика
                 if _market_was_open is True and not market_open:
-                    logger.info("[MAIN] Market closed at %s MSK, sending daily summary",
-                                now_msk.strftime("%H:%M"))
+                    logger.info("[MAIN] Market closed at %s MSK", now_msk.strftime("%H:%M"))
+                    # Отменить все pending лимитки с корректным сообщением
+                    market_close_events: list[dict] = []
+                    for client_id, em in list(execs.items()):
+                        try:
+                            market_close_events.extend(em.cancel_pending_market_close())
+                        except Exception:
+                            logger.exception("[MAIN] cancel_pending_market_close failed for client %d",
+                                             client_id)
+                    _consolidate_and_send(market_close_events, registry, notifier)
                     _send_daily_summary(db, registry, notifier, now_msk)
+                    _daily_summary_sent_date = now_msk.date()
                     # Пятница → недельный отчёт
                     if now_msk.weekday() == 4:
                         _send_weekly_summary(db, notifier, now_msk)
+
+                # Fallback: бот запущен после закрытия рынка —
+                # отправить итоги дня, если были сделки и ещё не отправлялись
+                if _market_was_open is None and not market_open:
+                    if now_msk.weekday() < 5 and now_msk.date() not in schedule._holidays:
+                        if now_msk.date() != _daily_summary_sent_date:
+                            # Не отправляем пустой отчёт при старте —
+                            # только если сегодня реально были сделки
+                            if _get_today_pnl(db, now_msk) != 0.0:
+                                logger.info("[MAIN] Bot started after market close, sending daily summary")
+                                _send_daily_summary(db, registry, notifier, now_msk)
+                            _daily_summary_sent_date = now_msk.date()
+
                 _market_was_open = market_open
 
                 # Подтянуть новых клиентов / убрать неактивных
@@ -855,7 +995,13 @@ def main() -> None:
                     if reload_event.is_set():
                         logger.info("[MAIN] Manual reload triggered via /reload_clients")
                         reload_event.clear()
+                    prev_count = len(execs)
                     sync_execs(execs, registry, config, sqlite_state, multi_journal, notifier)
+                    new_count = len(execs)
+                    if new_count != prev_count and notifier:
+                        notifier.send_admin(
+                            f"🔄 Клиентов в торговом цикле: {new_count}"
+                        )
                     last_refresh = time.time()
 
                 # Вне торговых часов: пропускаем API-вызовы, тихо ждём
@@ -955,6 +1101,7 @@ def main() -> None:
                     shared_setup = strategy.find_setup(candles)
 
                     # Per-client: обновить/открыть позицию
+                    ticker_events: list[dict] = []
                     for client_id, em in list(execs.items()):
                         # Если revoked или достигнут дневной лимит SL — только сопровождаем
                         can_open = not em._revoked and not em._daily_sl_limit_reached
@@ -978,9 +1125,15 @@ def main() -> None:
                         else:
                             successful_clients.add(client_id)
 
+                        # Собрать буферизированные события
+                        ticker_events.extend(em.drain_trade_events())
+
                         # Запомнить для обработки после цикла тикеров (не вызываем повторно)
                         if em._daily_sl_limit_reached and client_id not in daily_sl_triggered:
                             daily_sl_triggered.add(client_id)
+
+                    # Консолидировать и отправить уведомления по тикеру
+                    _consolidate_and_send(ticker_events, registry, notifier)
 
                 # Пауза по дневному лимиту SL — один раз на клиента после всех тикеров
                 for client_id in daily_sl_triggered:

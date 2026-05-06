@@ -157,6 +157,8 @@ class ClientRegistry:
 
         # Обновить существующего.
         # Если новый токен не передан — оставить старый (не затирать пустой строкой).
+        # Если account_name уже задан пользователем — не перезаписывать значением из конфига.
+        effective_name = existing.account_name if existing.account_name else account_name
         if tbank_token:
             with self.db.write() as cur:
                 cur.execute(
@@ -170,7 +172,7 @@ class ClientRegistry:
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (account_name, tbank_token, tbank_account_id, now, existing.id),
+                    (effective_name, tbank_token, tbank_account_id, now, existing.id),
                 )
         else:
             with self.db.write() as cur:
@@ -183,7 +185,7 @@ class ClientRegistry:
                         updated_at = ?
                     WHERE id = ?
                     """,
-                    (account_name, now, existing.id),
+                    (effective_name, now, existing.id),
                 )
         with self.db.cursor() as cur:
             cur.execute("SELECT * FROM clients WHERE id = ?", (existing.id,))
@@ -357,10 +359,14 @@ class ClientRegistry:
         logger.info("[REGISTRY] client %d reset to pending_payment", client_id)
 
     def delete(self, client_id: int) -> None:
-        """Полное удаление (в админ-flow не используется — предпочитаем revoked-статус)."""
+        """Полное удаление клиента и всех связанных данных."""
         with self.db.write() as cur:
+            cur.execute("DELETE FROM trades WHERE client_id = ?", (client_id,))
+            cur.execute("DELETE FROM payments WHERE client_id = ?", (client_id,))
+            cur.execute("DELETE FROM positions WHERE client_id = ?", (client_id,))
+            cur.execute("DELETE FROM consecutive_sl WHERE client_id = ?", (client_id,))
             cur.execute("DELETE FROM clients WHERE id = ?", (client_id,))
-        logger.info("[REGISTRY] client %d deleted", client_id)
+        logger.info("[REGISTRY] client %d deleted (with related data)", client_id)
 
 
 # ---------------------------------------------------------------------------

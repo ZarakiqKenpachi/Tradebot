@@ -92,6 +92,20 @@ def register(
             bot.reply_to(message, _client_help_text(client.status))
 
     # ------------------------------------------------------------------
+    # /cancel — отмена активного FSM-диалога (онбординг, смена токена и т.д.)
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["cancel"])
+    def handle_cancel(message):
+        chat_id = message.chat.id
+        state = fsm.get_onboarding(chat_id)
+        if state == OnboardingState.IDLE:
+            bot.reply_to(message, "Нет активного диалога для отмены.")
+            return
+        fsm.clear_onboarding(chat_id)
+        bot.reply_to(message, "Отменено. Можете начать заново командой /setup, /mytoken или /nickname.")
+
+    # ------------------------------------------------------------------
     # /pay
     # ------------------------------------------------------------------
 
@@ -103,11 +117,14 @@ def register(
             bot.reply_to(message, "Сначала отправьте /start.")
             return
         if client.status in (ClientStatus.ACTIVE, ClientStatus.PAUSED):
-            paid_until = (
-                client.paid_until.strftime("%d.%m.%Y") if client.paid_until else "бессрочно"
-            )
-            bot.reply_to(message, f"У вас уже активная подписка (до {paid_until}).")
-            return
+            # Проверить, не истекла ли подписка
+            expired = client.paid_until and client.paid_until < datetime.now(timezone.utc)
+            if not expired:
+                paid_until = (
+                    client.paid_until.strftime("%d.%m.%Y") if client.paid_until else "бессрочно"
+                )
+                bot.reply_to(message, f"У вас уже активная подписка (до {paid_until}).")
+                return
 
         if payment_provider is not None:
             text = payment_provider.create_invoice(
@@ -116,12 +133,147 @@ def register(
                 payment_provider.period_days,
             )
             bot.reply_to(message, text)
+
+            # Уведомить админов с кнопками подтверждения
+            name = client.account_name or f"#{client.id}"
+            days = payment_provider.period_days
+            admin_text = (
+                f"💰 Запрос на оплату\n"
+                f"Клиент #{client.id} — {name} (chat_id: {client.tg_chat_id})\n"
+                f"Период: {days} дн."
+            )
+            ts = int(datetime.now(timezone.utc).timestamp())
+            markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                telebot.types.InlineKeyboardButton(
+                    f"✅ Подтвердить ({days} дн.)",
+                    callback_data=f"pay:ok:{client.id}:{days}:{ts}",
+                ),
+                telebot.types.InlineKeyboardButton(
+                    "❌ Отклонить",
+                    callback_data=f"pay:no:{client.id}:{ts}",
+                ),
+            )
+            for adm in registry.list_all():
+                if adm.role == ClientRole.ADMIN and adm.tg_chat_id:
+                    try:
+                        bot.send_message(adm.tg_chat_id, admin_text, reply_markup=markup)
+                    except Exception:
+                        pass
         else:
             bot.reply_to(
                 message,
                 "Для оформления подписки свяжитесь с администратором: @MakeRFGreatAgain\n"
                 "После подтверждения оплаты вы получите доступ к настройке.",
             )
+
+    PAY_TIMEOUT_SEC = 3600  # 1 час на подтверждение оплаты
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("pay:"))
+    def handle_pay_callback(call):
+        """Админ подтверждает или отклоняет оплату."""
+        parts = call.data.split(":")
+        if len(parts) < 4:
+            return
+        action = parts[1]  # ok / no
+        client_id = int(parts[2])
+        admin_chat_id = call.message.chat.id
+
+        # Проверка: только админ
+        admin = registry.get_by_chat_id(admin_chat_id)
+        if admin is None or admin.role != ClientRole.ADMIN:
+            bot.answer_callback_query(call.id, "⛔ Только для админов")
+            return
+
+        # Проверка таймаута
+        ts = int(parts[-1])
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        if now_ts - ts > PAY_TIMEOUT_SEC:
+            try:
+                bot.edit_message_reply_markup(admin_chat_id, call.message.message_id, reply_markup=None)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id, "⏰ Запрос истёк (больше 1 часа). Клиенту нужно повторить /pay.")
+            return
+
+        # Убрать кнопки
+        try:
+            bot.edit_message_reply_markup(admin_chat_id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+
+        client = registry.get_by_id(client_id)
+        if client is None:
+            bot.answer_callback_query(call.id, "Клиент не найден.")
+            return
+
+        if action == "no":
+            bot.answer_callback_query(call.id)
+            bot.send_message(admin_chat_id, f"❌ Оплата клиента #{client_id} отклонена.")
+            try:
+                bot.send_message(
+                    client.tg_chat_id,
+                    "❌ Ваш запрос на оплату отклонён.\n"
+                    "Свяжитесь с администратором для уточнения.",
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "ok" and len(parts) == 5:
+            from datetime import timedelta
+            days = int(parts[3])
+            now = datetime.now(timezone.utc)
+            base = max(client.paid_until or now, now)
+            new_paid_until = base + timedelta(days=days)
+
+            registry.set_paid_until(client.id, new_paid_until)
+
+            if client.status == ClientStatus.PENDING_PAYMENT:
+                registry.update_status(client.id, ClientStatus.PENDING_EMAIL)
+
+            # Записать оплату
+            now_iso = now.isoformat()
+            with db.write() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO payments (client_id, provider, amount_rub, status,
+                                          external_id, period_days, created_at, paid_at)
+                    VALUES (?, 'manual', 0, 'paid', NULL, ?, ?, ?)
+                    """,
+                    (client.id, days, now_iso, now_iso),
+                )
+
+            bot.answer_callback_query(call.id)
+            name = client.account_name or f"#{client.id}"
+            bot.send_message(
+                admin_chat_id,
+                f"✅ Оплата подтверждена: {name} — до {new_paid_until.strftime('%d.%m.%Y')} (+{days} дн.)",
+            )
+
+            # Уведомить клиента
+            try:
+                updated = registry.get_by_id(client.id)
+                if updated and updated.status == ClientStatus.PENDING_EMAIL:
+                    bot.send_message(
+                        client.tg_chat_id,
+                        f"✅ Ваша подписка активирована до {new_paid_until.strftime('%d.%m.%Y')}!\n\n"
+                        "Для начала торговли необходимо указать email и T-Bank токен.\n"
+                        "Отправьте /setup чтобы продолжить.",
+                    )
+                else:
+                    bot.send_message(
+                        client.tg_chat_id,
+                        f"✅ Подписка продлена до {new_paid_until.strftime('%d.%m.%Y')}.",
+                    )
+            except Exception:
+                logger.exception("[BOT] Failed to notify client %d about payment", client.id)
+
+            logger.info("[BOT] Payment confirmed: client %d (%d days, until %s)",
+                        client.id, days, new_paid_until)
+            return
+
+        bot.answer_callback_query(call.id)
 
     # ------------------------------------------------------------------
     # /setup — запускается после /grant от админа (статус pending_email)
@@ -396,6 +548,110 @@ def register(
         )
         logger.info("[BOT] /resume: client %d resumed", client.id)
 
+    # ------------------------------------------------------------------
+    # /delete_me — удаление собственного профиля
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(commands=["delete_me"])
+    def handle_delete_me(message):
+        chat_id = message.chat.id
+        client = registry.get_by_chat_id(chat_id)
+        if client is None:
+            bot.reply_to(message, "Вы не зарегистрированы.")
+            return
+        if client.role == ClientRole.ADMIN:
+            bot.reply_to(message, "⛔ Администратор не может удалить свой аккаунт.")
+            return
+
+        em = execs.get(client.id)
+        pos_warning = ""
+        if em and em.positions:
+            pos_warning = f"\n⚠️ Открытых позиций: {len(em.positions)} — будут закрыты по рынку!"
+
+        markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                "🗑 Да, удалить мой профиль",
+                callback_data=f"selfdelete:confirm:{client.id}",
+            ),
+            telebot.types.InlineKeyboardButton(
+                "❌ Отмена",
+                callback_data=f"selfdelete:cancel:{client.id}",
+            ),
+        )
+        bot.reply_to(
+            message,
+            f"Вы уверены, что хотите удалить свой профиль?\n"
+            f"Все данные и история сделок будут потеряны.{pos_warning}\n\n"
+            "Это действие необратимо.",
+            reply_markup=markup,
+        )
+
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("selfdelete:"))
+    def handle_self_delete_callback(call):
+        parts = call.data.split(":")
+        if len(parts) != 3:
+            return
+        _, action, client_id_str = parts
+        chat_id = call.message.chat.id
+
+        try:
+            bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+
+        if action == "cancel":
+            bot.answer_callback_query(call.id)
+            bot.send_message(chat_id, "Отмена. Ваш профиль не изменён.")
+            return
+
+        client = registry.get_by_id(int(client_id_str))
+        if client is None:
+            bot.answer_callback_query(call.id, "Профиль не найден.")
+            return
+
+        # Проверка: кнопку нажал тот же пользователь
+        if client.tg_chat_id != chat_id:
+            bot.answer_callback_query(call.id, "⛔ Эта кнопка не для вас.")
+            return
+
+        # Закрыть позиции
+        em = execs.pop(client.id, None)
+        closed = 0
+        if em:
+            for figi in list(em.positions.keys()):
+                try:
+                    p = em.positions[figi]
+                    em._close_position(figi, p.entry_price, "self_deleted")
+                    closed += 1
+                except Exception:
+                    logger.exception("[BOT] delete_me: failed to close %s for client %d",
+                                     figi, client.id)
+
+        client_id = client.id
+        registry.delete(client_id)
+
+        bot.answer_callback_query(call.id)
+        msg = "🗑 Ваш профиль удалён. Спасибо, что пользовались TraderBot.\nДля повторной регистрации — /start"
+        if closed:
+            msg += f"\nЗакрыто позиций: {closed}"
+        bot.send_message(chat_id, msg)
+
+        # Уведомить админов
+        name = client.account_name or client.email or f"#{client_id}"
+        admin_msg = f"🗑 Клиент #{client_id} ({name}) удалил свой профиль."
+        if closed:
+            admin_msg += f" Закрыто позиций: {closed}."
+        for adm in registry.list_all():
+            if adm.role == ClientRole.ADMIN and adm.tg_chat_id:
+                try:
+                    bot.send_message(adm.tg_chat_id, admin_msg)
+                except Exception:
+                    pass
+
+        logger.info("[BOT] /delete_me: client %d self-deleted (closed %d positions)",
+                     client_id, closed)
+
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
@@ -501,6 +757,8 @@ def _client_help_text(status: ClientStatus) -> str:
         "  /mystats — ваша статистика\n"
         "  /pause — приостановить торговлю\n"
         "  /resume — возобновить торговлю\n"
+        "  /cancel — отменить текущий диалог\n"
+        "  /delete_me — удалить свой профиль\n"
         "  /help — эта справка"
     )
     hint = _status_hint(status)
@@ -539,5 +797,6 @@ def _admin_help_text() -> str:
         "  /export_trades <chat_id> — CSV сделок\n"
         "  /reload_clients — обновить реестр\n"
         "  /status — ваши позиции\n"
+        "  /cancel — отменить текущий диалог\n"
         "  /help — эта справка"
     )

@@ -49,6 +49,7 @@ class MainWindow(QMainWindow):
         self._config = config or AppConfig()
         self._tbank_feed = tbank_feed  # T-Bank data feed for simulation
         self._ticker_figi_map = self._load_ticker_figi_map()  # symbol → figi
+        self._ticker_strategy_map = self._load_ticker_strategy_map()  # symbol → strategy_name
         self._sim_params = self._load_sim_params()  # risk/trading params from config.yaml
         self._is_dark = True
 
@@ -120,6 +121,10 @@ class MainWindow(QMainWindow):
         self._pb_all_trades: list = []  # all trades from simulation
         self._pb_candles: list[dict] = []
 
+        # ── Multi-ticker simulation state ────────────────
+        self._multi_sim_trades: dict[str, list] = {}  # ticker → trades
+        self._multi_sim_all_trades: list = []          # all trades combined
+
         # ── Connect signals ────────────────────���─────────
         self._connect_signals()
 
@@ -150,6 +155,8 @@ class MainWindow(QMainWindow):
 
         # Strategy bar
         self._strategy_bar.strategy_run_requested.connect(self._on_strategy_run)
+        self._strategy_bar.run_all_requested.connect(self._on_run_all_tickers)
+        self._strategy_bar.clear_trades_requested.connect(self._on_clear_sim_trades)
         self._strategy_bar.playback_play_requested.connect(self._on_playback_start)
         self._strategy_bar.playback_pause_requested.connect(self._on_playback_pause)
         self._strategy_bar.playback_stop_requested.connect(self._on_playback_stop)
@@ -218,11 +225,19 @@ class MainWindow(QMainWindow):
         tf = self._chart.current_timeframe or self._config.default_timeframe
         self._toolbar.set_symbol_text(symbol)
         self._chart.load_symbol(symbol, exchange, tf)
-        self._chart._bridge.set_trade_markers(json.dumps([]))
         self._chart._bridge.clear_price_lines()
-        self._trades_panel.set_trades([])
         self._statusbar.set_connected(self._provider.is_connected())
-        self._load_trades_for_ticker(symbol)
+
+        # If multi-sim trades exist for this ticker, restore them
+        if symbol in self._multi_sim_trades:
+            ticker_trades = self._multi_sim_trades[symbol]
+            self._trades_panel.set_trades(self._multi_sim_all_trades)
+            trade_dicts = [t.to_dict() for t in ticker_trades]
+            self._chart.set_trade_markers(trade_dicts)
+        else:
+            self._chart._bridge.set_trade_markers(json.dumps([]))
+            self._trades_panel.set_trades([])
+            self._load_trades_for_ticker(symbol)
 
     def _on_timeframe_changed(self, tf: str) -> None:
         self._chart.change_timeframe(tf)
@@ -260,6 +275,183 @@ class MainWindow(QMainWindow):
     def _on_strategy_run(self, strategy_name: str) -> None:
         """Run strategy — delegates to playback for visual replay."""
         self._on_playback_start(strategy_name)
+
+    def _on_run_all_tickers(self, sim_days: int) -> None:
+        """Run simulation for all config tickers with shared balance."""
+        import pandas as pd
+        from datetime import timedelta
+
+        if not self._ticker_strategy_map:
+            QMessageBox.warning(self, "Error", "No tickers with strategies in config.yaml")
+            return
+
+        self._multi_sim_trades.clear()
+        self._multi_sim_all_trades.clear()
+
+        balance = self._sim_params.get("initial_balance", 100_000.0)
+        all_trades: list = []
+        trade_id = 0
+        ticker_count = len(self._ticker_strategy_map)
+        max_open = self._sim_params.get("max_open_positions", 4)
+
+        # Collect data and per-ticker state for interleaved simulation
+        ticker_states: dict[str, dict] = {}
+
+        for idx, (symbol, strategy_name) in enumerate(self._ticker_strategy_map.items()):
+            figi = self._ticker_figi_map.get(symbol)
+            if not figi:
+                figi = self._provider._figi_map.get(symbol)
+            if not figi:
+                logger.warning("[RUN ALL] No FIGI for %s, skipping", symbol)
+                continue
+
+            self._statusbar.set_status(
+                f"Loading {symbol} ({idx+1}/{ticker_count})..."
+            )
+            QApplication.processEvents()
+
+            strategy_cls = self._strategy_runner._registry.get(strategy_name)
+            if not strategy_cls:
+                logger.warning("[RUN ALL] Strategy '%s' not found for %s", strategy_name, symbol)
+                continue
+
+            required = getattr(strategy_cls, "required_timeframes", [])
+            all_tfs = list(set(required) | {"1m", "30m"})
+
+            try:
+                tbank_data = self._tbank_feed.get_candles_history(
+                    figi, all_tfs, days=sim_days + 15,
+                )
+            except Exception:
+                logger.exception("[RUN ALL] Data load failed for %s", symbol)
+                continue
+
+            if not tbank_data:
+                continue
+
+            candles: dict = {}
+            for tf in required:
+                if tf in tbank_data and not tbank_data[tf].empty:
+                    candles[tf] = tbank_data[tf]
+            scan_df = tbank_data.get("1m")
+
+            if not candles:
+                continue
+
+            # Trim to sim window
+            cutoff = pd.Timestamp.now(tz="UTC") - timedelta(days=sim_days)
+            for tf_key in list(candles.keys()):
+                candles[tf_key] = candles[tf_key].loc[candles[tf_key].index >= cutoff]
+            if scan_df is not None:
+                scan_df = scan_df.loc[scan_df.index >= cutoff]
+                if scan_df.empty:
+                    scan_df = None
+
+            # Get instrument info
+            lot_size, price_step = 1, 0.01
+            try:
+                lot_size, price_step = self._tbank_feed.broker.get_instrument_info(figi)
+            except Exception:
+                pass
+
+            # Dividend dates
+            dividend_dates = []
+            try:
+                divs = self._tbank_feed.broker.get_dividends(figi, days_ahead=sim_days + 30)
+                dividend_dates = [d["last_buy_date"] for d in divs if d["last_buy_date"]]
+            except Exception:
+                pass
+
+            ticker_states[symbol] = {
+                "strategy_name": strategy_name,
+                "candles": candles,
+                "scan_df": scan_df,
+                "lot_size": lot_size,
+                "price_step": price_step,
+                "dividend_dates": dividend_dates,
+                "required": required,
+            }
+
+        if not ticker_states:
+            QMessageBox.warning(self, "Error", "No data loaded for any ticker")
+            return
+
+        # Run simulation per ticker sequentially (each with its own runner)
+        # Shared balance: after each ticker, pass remaining balance to next
+        # For fairness: run each ticker independently with equal initial balance
+        # (like the backtest engine does with chronological interleaving)
+        self._statusbar.set_status(f"Simulating {len(ticker_states)} tickers...")
+        QApplication.processEvents()
+
+        for symbol, state in ticker_states.items():
+            sim_config = SimulationConfig(
+                initial_balance=balance,
+                scan_tf="1m",
+                lot_size=state["lot_size"],
+                price_step=state["price_step"],
+                dividend_dates=state["dividend_dates"],
+                risk_pct=self._sim_params.get("risk_pct", 0.10),
+                max_position_pct=self._sim_params.get("max_position_pct", 1.50),
+                commission_pct=self._sim_params.get("commission_pct", 0.0004),
+                slippage_pct=self._sim_params.get("slippage_pct", 0.0005),
+                max_candles_timeout=self._sim_params.get("max_candles_timeout", 12),
+                max_consecutive_sl=self._sim_params.get("max_consecutive_sl", 3),
+            )
+            result = self._strategy_runner.run(
+                state["strategy_name"], state["candles"],
+                scan_df=state["scan_df"],
+                config=sim_config,
+                ticker=symbol,
+            )
+            if result and result.trades:
+                for t in result.trades:
+                    t.id = trade_id
+                    trade_id += 1
+                self._multi_sim_trades[symbol] = result.trades
+                all_trades.extend(result.trades)
+                balance = result.final_balance
+
+        # Sort all trades chronologically
+        all_trades.sort(key=lambda t: t.entry_time)
+        self._multi_sim_all_trades = all_trades
+
+        # Show results
+        total_pnl = sum(t.pnl for t in all_trades)
+        wins = sum(1 for t in all_trades if t.pnl > 0)
+        wr = (wins / len(all_trades) * 100) if all_trades else 0
+
+        pnl_sign = "+" if total_pnl >= 0 else ""
+        self._statusbar.set_status(
+            f"All tickers ({sim_days}d): {len(all_trades)} trades | "
+            f"P&L: {pnl_sign}{total_pnl:,.2f} | Win: {wr:.0f}% | "
+            f"Balance: {balance:,.0f}"
+        )
+
+        # Show all trades in table
+        self._trades_panel.set_trades(all_trades)
+
+        # Show current ticker's trades on chart
+        current_symbol = self._chart.current_symbol
+        if current_symbol in self._multi_sim_trades:
+            ticker_trades = self._multi_sim_trades[current_symbol]
+            trade_dicts = [t.to_dict() for t in ticker_trades]
+            self._chart.set_trade_markers(trade_dicts)
+
+        self._strategy_bar.set_has_sim_trades(True)
+        logger.info(
+            "[RUN ALL] %d tickers, %d trades, P&L=%.2f, balance=%.0f",
+            len(ticker_states), len(all_trades), total_pnl, balance,
+        )
+
+    def _on_clear_sim_trades(self) -> None:
+        """Clear all multi-sim cached trades."""
+        self._multi_sim_trades.clear()
+        self._multi_sim_all_trades.clear()
+        self._chart._bridge.set_trade_markers(json.dumps([]))
+        self._chart._bridge.clear_price_lines()
+        self._trades_panel.set_trades([])
+        self._strategy_bar.set_has_sim_trades(False)
+        self._statusbar.set_status("Simulation trades cleared")
 
     # ── Playback (candle-by-candle replay) ─────────────
 
@@ -514,6 +706,11 @@ class MainWindow(QMainWindow):
         self._pb_playing = False
         self._strategy_bar.set_playback_state(False)
 
+        # Single-ticker playback clears multi-sim state
+        self._multi_sim_trades.clear()
+        self._multi_sim_all_trades.clear()
+        self._strategy_bar.set_has_sim_trades(False)
+
         # Show all trades in table
         result = self._pb_result
         if result and result.trades:
@@ -688,6 +885,24 @@ class MainWindow(QMainWindow):
             return {}
 
     @staticmethod
+    def _load_ticker_strategy_map() -> dict[str, str]:
+        """Load ticker→strategy mapping from config.yaml."""
+        config_path = PROJECT_ROOT / "traderbot" / "config.yaml"
+        if not config_path.exists():
+            return {}
+        try:
+            import yaml
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f)
+            return {
+                name: tc.get("strategy", "")
+                for name, tc in cfg.get("tickers", {}).items()
+                if tc.get("strategy")
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
     def _load_sim_params() -> dict:
         """Load simulation parameters from config.yaml (risk + trading + backtest)."""
         config_path = PROJECT_ROOT / "traderbot" / "config.yaml"
@@ -708,6 +923,7 @@ class MainWindow(QMainWindow):
                 "slippage_pct": bt.get("slippage_pct", 0.0005),
                 "max_candles_timeout": trading.get("max_candles_timeout", 12),
                 "max_consecutive_sl": risk.get("max_consecutive_sl", 3),
+                "max_open_positions": risk.get("max_open_positions", 4),
             }
         except Exception:
             return {}

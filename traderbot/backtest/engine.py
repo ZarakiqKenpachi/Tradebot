@@ -69,6 +69,7 @@ class BacktestEngine:
         self.max_candles_timeout = config.max_candles_timeout
         self.max_consecutive_sl = config.max_consecutive_sl
         self.slippage_pct = config.backtest_slippage_pct
+        self.max_open_positions = config.max_open_positions
 
     def run(
         self,
@@ -127,8 +128,12 @@ class BacktestEngine:
 
         # Обработать все события с общим балансом
         for ts, ticker_name, i in events:
+            open_count = sum(
+                1 for s in states.values()
+                if s.position is not None or s.pending is not None
+            )
             new_trades, balance = self._process_bar(
-                states[ticker_name], i, balance, trading_schedule
+                states[ticker_name], i, balance, trading_schedule, open_count
             )
             trades.extend(new_trades)
 
@@ -156,6 +161,7 @@ class BacktestEngine:
         i: int,
         balance: float,
         trading_schedule: dict | None,
+        open_count: int = 0,
     ) -> tuple[list[TradeRecord], float]:
         """Обработать один бар df_entry[i] для тикера. Возвращает сделки + обновлённый баланс."""
         MSK = ZoneInfo("Europe/Moscow")
@@ -312,6 +318,10 @@ class BacktestEngine:
                 return trades, balance
             if not is_buy and setup.entry_price < current_price:
                 return trades, balance
+
+        # Лимит одновременных позиций
+        if open_count >= self.max_open_positions:
+            return trades, balance
 
         qty = self.risk.position_size(balance, setup.entry_price, setup.stop_price, state.lot_size)
         if qty < 1:

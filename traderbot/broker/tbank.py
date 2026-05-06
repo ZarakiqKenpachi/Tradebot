@@ -80,6 +80,15 @@ class TBankBroker:
         step = _quotation_to_float(instrument.min_price_increment)
         return lot_size, step
 
+    def get_instrument_exchange(self, figi: str) -> str:
+        """Получить идентификатор биржи инструмента (для trading_schedules)."""
+        with self._client() as client:
+            instrument = client.instruments.get_instrument_by(
+                id_type=InstrumentIdType.INSTRUMENT_ID_TYPE_FIGI,
+                id=figi,
+            ).instrument
+        return instrument.exchange
+
     def get_dividends(self, figi: str, days_ahead: int = 30) -> list[dict]:
         """Получить дивиденды по инструменту.
 

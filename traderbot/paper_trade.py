@@ -16,13 +16,14 @@ import pathlib
 import signal
 import threading
 import time
-from datetime import datetime, time as dt_time, timezone
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from zoneinfo import ZoneInfo
 
 from traderbot.broker.tbank import TBankBroker
 from traderbot.clients.db import Database
 from traderbot.config import AppConfig, load_config
+from traderbot.market_schedule import MarketSchedule
 from traderbot.data.feed import DataFeed
 from traderbot.execution.manager import ExecutionManager
 from traderbot.journal.multi_writer import ClientJournalView, MultiTradeJournal
@@ -36,27 +37,6 @@ from traderbot.strategies.registry import get_strategy
 logger = logging.getLogger(__name__)
 
 MSK = ZoneInfo("Europe/Moscow")
-_MARKET_OPEN = dt_time(7, 0)
-_MARKET_CLOSE = dt_time(23, 50)
-
-# Праздничные дни MOEX 2025-2026
-_MOEX_HOLIDAYS: frozenset[str] = frozenset({
-    "2025-01-01", "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07",
-    "2025-01-08",
-    "2025-02-24",
-    "2025-03-10",
-    "2025-05-01", "2025-05-02", "2025-05-08", "2025-05-09",
-    "2025-06-12", "2025-06-13",
-    "2025-11-03", "2025-11-04",
-    "2025-12-31",
-    "2026-01-01", "2026-01-02", "2026-01-07", "2026-01-08", "2026-01-09",
-    "2026-02-23",
-    "2026-03-09",
-    "2026-05-01", "2026-05-04", "2026-05-11",
-    "2026-06-12",
-    "2026-11-04",
-    "2026-12-31",
-})
 
 # Интервалы
 RECONCILE_INTERVAL_SEC = 300
@@ -64,15 +44,6 @@ HEARTBEAT_INTERVAL_SEC = 3600
 
 # Виртуальный client_id для paper trading (фиксированный)
 PAPER_CLIENT_ID = 1
-
-
-def is_market_open(now_msk: datetime) -> bool:
-    if now_msk.weekday() >= 5:
-        return False
-    if now_msk.strftime("%Y-%m-%d") in _MOEX_HOLIDAYS:
-        return False
-    t = now_msk.time().replace(tzinfo=None)
-    return _MARKET_OPEN <= t < _MARKET_CLOSE
 
 
 def setup_logging() -> None:
@@ -178,6 +149,8 @@ def main() -> None:
         app_name="TraderBot-Paper-MD",
     )
     feed = DataFeed(md_broker)
+    first_figi = next(iter(tickers.values())).figi
+    schedule = MarketSchedule.from_figi(md_broker, first_figi)
 
     # 3. Отдельная БД для paper trading
     db, sqlite_state, multi_journal = _init_paper_db(pt.database_path)
@@ -218,6 +191,7 @@ def main() -> None:
         max_candles_timeout=config.max_candles_timeout,
         max_consecutive_sl=config.max_consecutive_sl,
         max_daily_sl=config.max_daily_sl,
+        max_open_positions=config.max_open_positions,
         client_id=PAPER_CLIENT_ID,
         is_admin=True,
     )
@@ -253,7 +227,8 @@ def main() -> None:
         while not _stop.is_set():
             try:
                 now_msk = datetime.now(timezone.utc).astimezone(MSK)
-                market_open = is_market_open(now_msk)
+                schedule.refresh()
+                market_open = schedule.is_open(now_msk)
 
                 if _market_was_open is False and market_open:
                     balance = sandbox_broker.get_portfolio_balance(account_id)

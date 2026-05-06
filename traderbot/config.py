@@ -69,6 +69,7 @@ class AppConfig:
     max_position_pct: float
     max_consecutive_sl: int
     max_daily_sl: int
+    max_open_positions: int
     tickers: dict[str, TickerConfig]
     telegram: TelegramConfig
     journal_path: str
@@ -183,6 +184,7 @@ def load_config(path: str = "config.yaml") -> AppConfig:
         max_position_pct=risk["max_position_pct"],
         max_consecutive_sl=risk["max_consecutive_sl"],
         max_daily_sl=risk.get("max_daily_sl", 5),
+        max_open_positions=risk.get("max_open_positions", 4),
         tickers=tickers,
         telegram=telegram,
         journal_path=raw["journal"]["path"],

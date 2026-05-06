@@ -115,59 +115,468 @@ def register(
         bot.reply_to(message, "\n".join(lines))
 
     # ------------------------------------------------------------------
-    # /clients — список клиентов
+    # /clients — интерактивный список клиентов с inline-кнопками
     # ------------------------------------------------------------------
+
+    CLIENTS_PER_PAGE = 8
+
+    def _build_clients_list(page: int = 0) -> tuple[str, telebot.types.InlineKeyboardMarkup]:
+        """Собрать текст + inline-клавиатуру для страницы списка клиентов."""
+        all_clients = registry.list_all()
+        if not all_clients:
+            return "Клиентов нет.", telebot.types.InlineKeyboardMarkup()
+
+        admins = [c for c in all_clients if c.role.value == "admin"]
+        subscribers = [c for c in all_clients if c.role.value != "admin"]
+        in_loop_count = sum(1 for c in all_clients if c.id in execs)
+
+        header = (
+            f"👥 Всего: {len(all_clients)} "
+            f"(👑 {len(admins)} адм. / 👤 {len(subscribers)} подп.) "
+            f"| ▶ в цикле: {in_loop_count}"
+        )
+
+        # Объединённый список: сначала админы, потом подписчики
+        ordered = admins + subscribers
+        total_pages = max(1, (len(ordered) + CLIENTS_PER_PAGE - 1) // CLIENTS_PER_PAGE)
+        page = max(0, min(page, total_pages - 1))
+        page_slice = ordered[page * CLIENTS_PER_PAGE:(page + 1) * CLIENTS_PER_PAGE]
+
+        markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+        for c in page_slice:
+            role_icon = "👑" if c.role.value == "admin" else "👤"
+            status_icon = _status_icon(c.status)
+            name = c.account_name or c.email or f"#{c.id}"
+            em = execs.get(c.id)
+            loop_mark = f" ▶{len(em.positions)}п" if em else ""
+            label = f"{role_icon} {name} {status_icon}{_status_label_ru(c.status)}{loop_mark}"
+            markup.add(telebot.types.InlineKeyboardButton(
+                label, callback_data=f"cm:profile:{c.id}",
+            ))
+
+        # Пагинация
+        if total_pages > 1:
+            nav_buttons = []
+            if page > 0:
+                nav_buttons.append(telebot.types.InlineKeyboardButton(
+                    "◀", callback_data=f"cm:list:{page - 1}",
+                ))
+            nav_buttons.append(telebot.types.InlineKeyboardButton(
+                f"{page + 1}/{total_pages}", callback_data="cm:noop",
+            ))
+            if page < total_pages - 1:
+                nav_buttons.append(telebot.types.InlineKeyboardButton(
+                    "▶", callback_data=f"cm:list:{page + 1}",
+                ))
+            markup.row(*nav_buttons)
+
+        return header, markup
+
+    def _build_client_profile(client_id: int) -> tuple[str, telebot.types.InlineKeyboardMarkup]:
+        """Собрать текст профиля + кнопки действий для клиента."""
+        client = registry.get_by_id(client_id)
+        if client is None:
+            return "Клиент не найден.", telebot.types.InlineKeyboardMarkup()
+
+        em = execs.get(client.id)
+        status_icon = _status_icon(client.status)
+        name = client.account_name or client.email or f"#{client.id}"
+        in_loop = "▶ в цикле" if em else "не в цикле"
+
+        lines = [
+            f"Клиент #{client.id} — {name}",
+            f"Статус: {status_icon} {_status_label_ru(client.status)} | {in_loop}",
+        ]
+
+        if client.paid_until:
+            lines.append(f"Подписка до: {client.paid_until.strftime('%d.%m.%Y')}")
+
+        # Баланс
+        if em:
+            try:
+                balance = em.broker.get_portfolio_balance(em.account_id)
+                lines.append(f"Баланс: {balance:,.2f} ₽")
+            except Exception:
+                lines.append("Баланс: ошибка запроса")
+
+        # Открытые позиции (кратко)
+        if em and em.positions:
+            pos_count = len(em.positions)
+            active = sum(1 for p in em.positions.values() if p.status == "active")
+            lines.append(f"Позиций: {pos_count} (активных: {active})")
+
+        # Статистика (кратко)
+        stats = _get_client_stats(db, client.id)
+        if stats["total"] > 0:
+            wr = stats["win_rate"]
+            lines.append(
+                f"Сделок: {stats['total']} | WR: {wr:.0f}% | P&L: {stats['total_pnl']:+.2f} ₽"
+            )
+
+        text = "\n".join(lines)
+
+        # Кнопки действий
+        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                "📅 Продлить", callback_data=f"cm:grant:{client.id}",
+            ),
+            telebot.types.InlineKeyboardButton(
+                "🔴 Отозвать", callback_data=f"cm:revoke:{client.id}",
+            ),
+        )
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                "📊 Статистика", callback_data=f"cm:stats:{client.id}",
+            ),
+            telebot.types.InlineKeyboardButton(
+                "✏ Переименовать", callback_data=f"cm:rename:{client.id}",
+            ),
+        )
+        markup.add(
+            telebot.types.InlineKeyboardButton(
+                "💬 Telegram", url=f"tg://user?id={client.tg_chat_id}",
+            ),
+        )
+        markup.add(telebot.types.InlineKeyboardButton(
+            "◀ Назад к списку", callback_data="cm:list:0",
+        ))
+
+        return text, markup
 
     @bot.message_handler(commands=["clients"])
     def handle_clients(message):
         if not require_admin(message):
             return
+        text, markup = _build_clients_list(page=0)
+        bot.send_message(message.chat.id, text, reply_markup=markup)
 
-        all_clients = registry.list_all()
-        if not all_clients:
-            bot.reply_to(message, "Клиентов нет.")
+    @bot.callback_query_handler(func=lambda call: call.data.startswith("cm:"))
+    def handle_client_menu_callback(call):
+        """Единый обработчик inline-меню клиентов (cm:*)."""
+        admin_chat_id = call.message.chat.id
+        msg_id = call.message.message_id
+
+        # Проверка админа
+        admin = registry.get_by_chat_id(admin_chat_id)
+        if admin is None or admin.role != ClientRole.ADMIN:
+            bot.answer_callback_query(call.id, "⛔ Только для админов")
             return
 
-        admins = [c for c in all_clients if c.role.value == "admin"]
-        subscribers = [c for c in all_clients if c.role.value != "admin"]
-        in_loop_ids = set(execs.keys())
-        in_loop_count = sum(1 for c in all_clients if c.id in in_loop_ids)
+        parts = call.data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
 
-        lines = [
-            f"👥 Всего: {len(all_clients)} "
-            f"(👑 {len(admins)} адм. / 👤 {len(subscribers)} подп.) "
-            f"| ▶ в цикле: {in_loop_count}\n"
-        ]
+        # --- Навигация по списку ---
+        if action == "list":
+            page = int(parts[2]) if len(parts) > 2 else 0
+            text, markup = _build_clients_list(page)
+            try:
+                bot.edit_message_text(text, admin_chat_id, msg_id, reply_markup=markup)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id)
+            return
 
-        # Сначала администраторы, потом подписчики
-        for section_label, section_clients in [("— Администраторы —", admins), ("— Подписчики —", subscribers)]:
-            if not section_clients:
-                continue
-            lines.append(section_label)
-            for c in section_clients:
-                role_icon = "👑" if c.role.value == "admin" else "👤"
-                em = execs.get(c.id)
-                name = c.account_name or c.email or "—"
+        if action == "noop":
+            bot.answer_callback_query(call.id)
+            return
 
-                # Строка 1: роль, id, имя, статус
-                status_icon = _status_icon(c.status)
-                status_label = _status_label_ru(c.status)
-                loop_mark = f" ▶{len(em.positions)}п" if em else ""
-                has_token = "🔑" if c.tbank_token else "🚫"
-                line1 = f"{role_icon}[{c.id}] {name} {status_icon}{status_label}{loop_mark} {has_token}"
+        # --- Профиль клиента ---
+        if action == "profile":
+            client_id = int(parts[2])
+            text, markup = _build_client_profile(client_id)
+            try:
+                bot.edit_message_text(text, admin_chat_id, msg_id, reply_markup=markup)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id)
+            return
 
-                # Строка 2: chat_id, подписка, ошибки
-                details = [f"💬{c.tg_chat_id}"]
-                if c.paid_until:
-                    details.append(f"📅до {c.paid_until.strftime('%d.%m.%y')}")
-                if c.consecutive_errors > 0:
-                    details.append(f"⚠️ошибок:{c.consecutive_errors}")
-                line2 = "   " + " | ".join(details)
+        # --- Меню продления подписки ---
+        if action == "grant":
+            client_id = int(parts[2])
 
-                lines.append(line1)
-                lines.append(line2)
+            # Если есть 4-й элемент — это выбранное кол-во дней
+            if len(parts) == 4:
+                days = int(parts[3])
+                client = registry.get_by_id(client_id)
+                if client is None:
+                    bot.answer_callback_query(call.id, "Клиент не найден")
+                    return
 
-        _send_long(bot, message.chat.id, "\n".join(lines))
+                now = datetime.now(timezone.utc)
+                base = max(client.paid_until or now, now)
+                new_paid_until = base + timedelta(days=days)
+                registry.set_paid_until(client.id, new_paid_until)
+
+                if client.status == ClientStatus.PENDING_PAYMENT:
+                    registry.update_status(client.id, ClientStatus.PENDING_EMAIL)
+
+                _record_payment(db, client.id, days)
+
+                # Уведомить клиента
+                try:
+                    updated = registry.get_by_id(client.id)
+                    if updated and updated.status == ClientStatus.PENDING_EMAIL:
+                        bot.send_message(
+                            client.tg_chat_id,
+                            f"✅ Ваша подписка активирована до {new_paid_until.strftime('%d.%m.%Y')}!\n\n"
+                            "Для начала торговли необходимо указать email и T-Bank токен.\n"
+                            "Отправьте /setup чтобы продолжить.",
+                        )
+                    else:
+                        bot.send_message(
+                            client.tg_chat_id,
+                            f"✅ Подписка продлена до {new_paid_until.strftime('%d.%m.%Y')}.",
+                        )
+                except Exception:
+                    logger.exception("[ADMIN] Failed to notify client %d about grant", client.id)
+
+                logger.info("[ADMIN] Grant via menu: client %d (%d days, until %s)",
+                            client.id, days, new_paid_until)
+
+                # Показать обновлённый профиль
+                name = client.account_name or client.email or f"#{client.id}"
+                result_text = (
+                    f"✅ Подписка продлена\n"
+                    f"{name} — до {new_paid_until.strftime('%d.%m.%Y')} (+{days} дн.)"
+                )
+                back_markup = telebot.types.InlineKeyboardMarkup()
+                back_markup.add(telebot.types.InlineKeyboardButton(
+                    "◀ Назад к клиенту", callback_data=f"cm:profile:{client_id}",
+                ))
+                try:
+                    bot.edit_message_text(result_text, admin_chat_id, msg_id, reply_markup=back_markup)
+                except Exception:
+                    pass
+                bot.answer_callback_query(call.id)
+                return
+
+            # Показать меню выбора дней
+            client = registry.get_by_id(client_id)
+            if client is None:
+                bot.answer_callback_query(call.id, "Клиент не найден")
+                return
+
+            name = client.account_name or client.email or f"#{client.id}"
+            paid_str = client.paid_until.strftime('%d.%m.%Y') if client.paid_until else "—"
+            text = (
+                f"📅 Продлить подписку\n"
+                f"Клиент #{client.id} — {name}\n"
+                f"Текущая: до {paid_str}"
+            )
+            markup = telebot.types.InlineKeyboardMarkup(row_width=4)
+            markup.add(
+                telebot.types.InlineKeyboardButton("7 дн.", callback_data=f"cm:grant:{client_id}:7"),
+                telebot.types.InlineKeyboardButton("14 дн.", callback_data=f"cm:grant:{client_id}:14"),
+                telebot.types.InlineKeyboardButton("30 дн.", callback_data=f"cm:grant:{client_id}:30"),
+                telebot.types.InlineKeyboardButton("90 дн.", callback_data=f"cm:grant:{client_id}:90"),
+            )
+            markup.add(telebot.types.InlineKeyboardButton(
+                "◀ Назад", callback_data=f"cm:profile:{client_id}",
+            ))
+            try:
+                bot.edit_message_text(text, admin_chat_id, msg_id, reply_markup=markup)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id)
+            return
+
+        # --- Отзыв доступа ---
+        if action == "revoke":
+            client_id = int(parts[2])
+            client = registry.get_by_id(client_id)
+            if client is None:
+                bot.answer_callback_query(call.id, "Клиент не найден")
+                return
+            if client.status == ClientStatus.REVOKED:
+                bot.answer_callback_query(call.id, "Уже отозван")
+                return
+
+            # Если есть sub-action (close / wait / cancel)
+            if len(parts) == 4:
+                sub = parts[3]
+
+                if sub == "cancel":
+                    # Вернуться к профилю
+                    text, markup = _build_client_profile(client_id)
+                    try:
+                        bot.edit_message_text(text, admin_chat_id, msg_id, reply_markup=markup)
+                    except Exception:
+                        pass
+                    bot.answer_callback_query(call.id)
+                    return
+
+                if sub == "close":
+                    em = execs.get(client.id)
+                    closed = 0
+                    if em:
+                        for figi in list(em.positions.keys()):
+                            try:
+                                p = em.positions[figi]
+                                em._close_position(figi, p.entry_price, "revoked")
+                                closed += 1
+                            except Exception:
+                                logger.exception("[ADMIN] revoke: failed to close %s for client %d",
+                                                 figi, client.id)
+                        del execs[client.id]
+
+                    registry.update_status(client.id, ClientStatus.REVOKED)
+                    registry.delete_token(client.id)
+                    _notify_client_revoked(bot, client.tg_chat_id)
+                    logger.info("[ADMIN] Revoked client %d via menu (close all)", client.id)
+
+                    result_text = (
+                        f"✅ Доступ клиента #{client.id} отозван.\n"
+                        f"Закрыто позиций: {closed}"
+                    )
+                    back_markup = telebot.types.InlineKeyboardMarkup()
+                    back_markup.add(telebot.types.InlineKeyboardButton(
+                        "◀ Назад к списку", callback_data="cm:list:0",
+                    ))
+                    try:
+                        bot.edit_message_text(result_text, admin_chat_id, msg_id, reply_markup=back_markup)
+                    except Exception:
+                        pass
+                    bot.answer_callback_query(call.id)
+                    return
+
+                if sub == "wait":
+                    em = execs.get(client.id)
+                    if em:
+                        em._revoked = True
+
+                    registry.update_status(client.id, ClientStatus.REVOKED)
+                    _notify_client_revoked(bot, client.tg_chat_id, with_positions=True)
+                    logger.info("[ADMIN] Revoked client %d via menu (wait SL/TP)", client.id)
+
+                    result_text = (
+                        f"✅ Доступ клиента #{client.id} отозван.\n"
+                        "Позиции будут закрыты по SL/TP."
+                    )
+                    back_markup = telebot.types.InlineKeyboardMarkup()
+                    back_markup.add(telebot.types.InlineKeyboardButton(
+                        "◀ Назад к списку", callback_data="cm:list:0",
+                    ))
+                    try:
+                        bot.edit_message_text(result_text, admin_chat_id, msg_id, reply_markup=back_markup)
+                    except Exception:
+                        pass
+                    bot.answer_callback_query(call.id)
+                    return
+
+            # Показать подтверждение отзыва
+            name = client.account_name or client.email or f"#{client.id}"
+            em = execs.get(client.id)
+            pos_count = len(em.positions) if em else 0
+
+            text = (
+                f"🔴 Отозвать доступ?\n"
+                f"Клиент #{client.id} — {name}\n"
+                f"Открытых позиций: {pos_count}"
+            )
+            markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                telebot.types.InlineKeyboardButton(
+                    "🔴 Закрыть все по рынку", callback_data=f"cm:revoke:{client_id}:close",
+                ),
+                telebot.types.InlineKeyboardButton(
+                    "⏳ Оставить до SL/TP", callback_data=f"cm:revoke:{client_id}:wait",
+                ),
+                telebot.types.InlineKeyboardButton(
+                    "❌ Отмена", callback_data=f"cm:revoke:{client_id}:cancel",
+                ),
+            )
+            try:
+                bot.edit_message_text(text, admin_chat_id, msg_id, reply_markup=markup)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id)
+            return
+
+        # --- Развёрнутая статистика ---
+        if action == "stats":
+            client_id = int(parts[2])
+            client = registry.get_by_id(client_id)
+            if client is None:
+                bot.answer_callback_query(call.id, "Клиент не найден")
+                return
+
+            name = client.account_name or client.email or f"#{client.id}"
+            stats = _get_client_stats(db, client.id)
+
+            if stats["total"] == 0:
+                text = f"📊 {name} — сделок пока нет"
+            else:
+                text = (
+                    f"📊 Статистика — {name}\n\n"
+                    f"Всего сделок: {stats['total']}\n"
+                    f"Прибыльных: {stats['wins']} ({stats['win_rate']:.0f}%)\n"
+                    f"Средний P&L: {stats['avg_pnl']:+.2f} ₽\n"
+                    f"Суммарный P&L: {stats['total_pnl']:+.2f} ₽\n"
+                    f"Лучшая: {stats['best_pnl']:+.2f} ₽ ({stats['best_ticker']})\n"
+                    f"Худшая: {stats['worst_pnl']:+.2f} ₽ ({stats['worst_ticker']})\n"
+                    f"Макс. просадка: -{stats['max_drawdown']:.2f} ₽"
+                )
+
+                # Последние 5 сделок
+                recent = _get_trades(db, client.id, limit=5)
+                if recent:
+                    text += f"\n\nПоследние {len(recent)} сделок:"
+                    for row in recent:
+                        pnl = row["pnl"]
+                        icon = "✅" if pnl >= 0 else "❌"
+                        text += f"\n  {icon} {row['ticker']} {row['direction']} {pnl:+.2f}₽ ({row['exit_reason']})"
+
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.add(telebot.types.InlineKeyboardButton(
+                "◀ Назад к клиенту", callback_data=f"cm:profile:{client_id}",
+            ))
+            try:
+                bot.edit_message_text(text, admin_chat_id, msg_id, reply_markup=markup)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id)
+            return
+
+        # --- Переименовать клиента ---
+        if action == "rename":
+            client_id = int(parts[2])
+            client = registry.get_by_id(client_id)
+            if client is None:
+                bot.answer_callback_query(call.id, "Клиент не найден")
+                return
+
+            fsm.set_rename(admin_chat_id, client_id)
+            name = client.account_name or f"#{client.id}"
+            text = (
+                f"✏ Переименовать клиента #{client.id}\n"
+                f"Текущее имя: {name}\n\n"
+                "Введите новый никнейм (2–32 символа):"
+            )
+            markup = telebot.types.InlineKeyboardMarkup()
+            markup.add(telebot.types.InlineKeyboardButton(
+                "❌ Отмена", callback_data=f"cm:rename_cancel:{client_id}",
+            ))
+            try:
+                bot.edit_message_text(text, admin_chat_id, msg_id, reply_markup=markup)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id)
+            return
+
+        if action == "rename_cancel":
+            client_id = int(parts[2])
+            fsm.clear_rename(admin_chat_id)
+            text, markup = _build_client_profile(client_id)
+            try:
+                bot.edit_message_text(text, admin_chat_id, msg_id, reply_markup=markup)
+            except Exception:
+                pass
+            bot.answer_callback_query(call.id)
+            return
+
+        bot.answer_callback_query(call.id)
 
     # ------------------------------------------------------------------
     # /client <id|@nickname|email> — детали конкретного клиента
@@ -553,6 +962,10 @@ def register(
         client = registry.get_by_id(int(client_id_str))
         if client is None:
             bot.answer_callback_query(call.id, "Клиент не найден.")
+            return
+
+        if action != "confirm":
+            bot.answer_callback_query(call.id)
             return
 
         em = execs.pop(client.id, None)
@@ -1112,6 +1525,47 @@ def register(
         except Exception:
             bot.reply_to(message, "Ошибка чтения лога.")
 
+    # ------------------------------------------------------------------
+    # Текстовый ввод: переименование клиента (FSM rename)
+    # ------------------------------------------------------------------
+
+    @bot.message_handler(func=lambda m: m.text and not m.text.startswith("/") and fsm.get_rename(m.chat.id) is not None)
+    def handle_rename_input(message):
+        admin_chat_id = message.chat.id
+        client_id = fsm.get_rename(admin_chat_id)
+        if client_id is None:
+            return
+
+        new_name = message.text.strip()
+        if len(new_name) < 2 or len(new_name) > 32:
+            bot.reply_to(message, "Никнейм должен быть от 2 до 32 символов. Попробуйте ещё раз:")
+            return
+
+        fsm.clear_rename(admin_chat_id)
+
+        client = registry.get_by_id(client_id)
+        if client is None:
+            bot.reply_to(message, "Клиент не найден.")
+            return
+
+        old_name = client.account_name or "—"
+        registry.set_account_name(client_id, new_name)
+
+        text, markup = _build_client_profile(client_id)
+        bot.send_message(
+            admin_chat_id,
+            f"✅ Клиент #{client_id} переименован: {old_name} → {new_name}",
+            reply_markup=markup,
+        )
+        try:
+            bot.send_message(
+                client.tg_chat_id,
+                f"ℹ️ Ваш никнейм изменён администратором: {new_name}",
+            )
+        except Exception:
+            pass
+        logger.info("[ADMIN] Renamed client %d: %s → %s", client_id, old_name, new_name)
+
 
 # ---------------------------------------------------------------------------
 # Вспомогательные функции
@@ -1476,11 +1930,6 @@ def _build_daily_report(db: Database, registry, now_msk: datetime) -> str:
     if not trades:
         return f"📊 Итоги дня {date_str}: сделок не было."
 
-    total_pnl = sum(float(t["pnl"]) for t in trades)
-    wins = sum(1 for t in trades if float(t["pnl"]) > 0)
-    losses = len(trades) - wins
-    win_rate = wins / len(trades) * 100
-
     _exit_labels = {
         "stop_loss": "стоп-лосс",
         "take_profit": "тейк-профит",
@@ -1489,38 +1938,68 @@ def _build_daily_report(db: Database, registry, now_msk: datetime) -> str:
         "deleted": "удаление клиента",
     }
 
-    # Разбивка по тикерам
-    ticker_stats: dict[str, dict] = {}
+    # Дедупликация: все клиенты торгуют одни и те же сетапы.
+    # Группируем по (ticker, direction, entry_price, exit_price, exit_reason, entry_reason)
+    # и берём одну запись на сделку.
+    unique_trades: list[dict] = []
+    seen_keys: set[tuple] = set()
     for t in trades:
-        tk = t["ticker"]
-        if tk not in ticker_stats:
-            ticker_stats[tk] = {"pnl": 0.0, "total": 0, "wins": 0}
-        ticker_stats[tk]["pnl"] += float(t["pnl"])
-        ticker_stats[tk]["total"] += 1
-        if float(t["pnl"]) > 0:
-            ticker_stats[tk]["wins"] += 1
+        key = (
+            t["ticker"], t["direction"],
+            round(float(t["entry_price"]), 2),
+            round(float(t["exit_price"]), 2),
+            t["exit_reason"], t["entry_reason"] or "",
+        )
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_trades.append(t)
+
+    wins = sum(1 for t in unique_trades if float(t["pnl"]) > 0)
+    losses = len(unique_trades) - wins
+    win_rate = wins / len(unique_trades) * 100
 
     lines = [
         f"📊 Итоги торгового дня {date_str}",
         "━━━━━━━━━━━━━━━━━━━━━",
-        f"Сделок: {len(trades)} | P&L: {total_pnl:+.2f} ₽",
-        f"✅ Прибыльных: {wins} ({win_rate:.0f}%) | ❌ Убыточных: {losses}",
+        f"Сделок: {len(unique_trades)} | "
+        f"✅ {wins} ({win_rate:.0f}%) | ❌ {losses}",
     ]
 
-    if len(ticker_stats) > 1:
-        lines.append("\n📈 По тикерам:")
-        for tk, s in sorted(ticker_stats.items(), key=lambda x: -x[1]["pnl"]):
-            tk_wr = s["wins"] / s["total"] * 100
-            icon = "✅" if s["pnl"] >= 0 else "❌"
-            lines.append(
-                f"  {icon} {tk}: {s['pnl']:+.2f} ₽ | {s['total']} сд. | WR {tk_wr:.0f}%"
-            )
+    # Общий P&L (руб + %)
+    total_pnl = sum(float(t["pnl"]) for t in unique_trades)
+    total_commission = sum(float(t["commission"]) for t in unique_trades)
+    total_net = total_pnl - total_commission
+    # Средневзвешенный % (сумма pnl_pct по сделкам)
+    pnl_pcts = []
+    for t in unique_trades:
+        ep = float(t["entry_price"])
+        xp = float(t["exit_price"])
+        if t["direction"] == "BUY":
+            pnl_pcts.append((xp - ep) / ep * 100)
+        else:
+            pnl_pcts.append((ep - xp) / ep * 100)
+    avg_pnl_pct = sum(pnl_pcts) / len(pnl_pcts) if pnl_pcts else 0
+    pnl_icon = "📈" if total_net >= 0 else "📉"
+    lines.append(
+        f"{pnl_icon} P&L: {total_net:+,.2f} ₽ | "
+        f"средний: {avg_pnl_pct:+.2f}%"
+    )
+    if total_commission > 0:
+        lines.append(f"   Комиссии: {total_commission:,.2f} ₽")
 
     lines.append("\n📋 Сделки:")
 
-    for i, t in enumerate(trades, 1):
-        pnl = float(t["pnl"])
-        icon = "✅" if pnl >= 0 else "❌"
+    for i, t in enumerate(unique_trades, 1):
+        entry_price = float(t["entry_price"])
+        exit_price = float(t["exit_price"])
+        pnl_rub = float(t["pnl"]) - float(t["commission"])
+        # P&L в процентах от цены входа
+        if t["direction"] == "BUY":
+            pnl_pct = (exit_price - entry_price) / entry_price * 100
+        else:
+            pnl_pct = (entry_price - exit_price) / entry_price * 100
+
+        icon = "✅" if pnl_pct >= 0 else "❌"
         try:
             entry_dt = datetime.fromisoformat(t["entry_time"])
             if entry_dt.tzinfo is None:
@@ -1536,17 +2015,11 @@ def _build_daily_report(db: Database, registry, now_msk: datetime) -> str:
         except Exception:
             exit_msk = "??"
 
-        # Имя клиента
-        client = registry.get_by_id(t["client_id"])
-        client_name = (client.account_name or client.email or f"#{t['client_id']}") if client else f"#{t['client_id']}"
-
         exit_label = _exit_labels.get(t["exit_reason"], t["exit_reason"] or "—")
         lines.append(
-            f"\n{i}. {icon} {t['ticker']} {t['direction']} | P&L: {pnl:+.2f} ₽ | {client_name}\n"
-            f"   Вход {entry_msk} @ {t['entry_price']:.2f} → Выход {exit_msk} @ {t['exit_price']:.2f}\n"
-            f"   SL: {t['stop_price']:.2f} | TP: {t['target_price']:.2f}\n"
-            f"   Причина входа: {t['entry_reason'] or '—'}\n"
-            f"   Выход по: {exit_label} | Длительность: {t['candles_held']} свечей"
+            f"\n{i}. {icon} {t['ticker']} {t['direction']} | {pnl_pct:+.2f}% ({pnl_rub:+,.2f} ₽) | {exit_label}\n"
+            f"   Вход {entry_msk} @ {entry_price:.2f} → Выход {exit_msk} @ {exit_price:.2f}\n"
+            f"   Длительность: {t['candles_held']} свечей"
         )
 
     return "\n".join(lines)

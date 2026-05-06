@@ -4,6 +4,7 @@ from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 from t_tech.invest import OrderDirection, StopOrderDirection
+from t_tech.invest.exceptions import RequestError
 
 from traderbot.broker.tbank import TBankBroker, round_to_step
 from traderbot.notifications.telegram import TelegramNotifier
@@ -32,6 +33,7 @@ class ExecutionManager:
         max_candles_timeout: int,
         max_consecutive_sl: int = 3,
         max_daily_sl: int = 5,
+        max_open_positions: int = 4,
         client_id: int = 0,
         is_admin: bool = False,
     ):
@@ -45,6 +47,7 @@ class ExecutionManager:
         self.max_candles_timeout = max_candles_timeout
         self.max_consecutive_sl = max_consecutive_sl
         self.max_daily_sl = max_daily_sl
+        self.max_open_positions = max_open_positions
         self.client_id = client_id
         self.is_admin = is_admin
         # В памяти: figi → Position
@@ -60,6 +63,8 @@ class ExecutionManager:
         self._stop_orders_cache_time: float = 0.0
         # Тикеры, о блокировке которых уже уведомлён админ (ticker, date)
         self._blocked_notified: set[tuple[str, str]] = set()
+        # Буфер торговых событий для консолидации уведомлений
+        self._trade_events: list[dict] = []
 
     def has_position(self, figi: str) -> bool:
         return figi in self.positions
@@ -130,11 +135,10 @@ class ExecutionManager:
     # ------------------------------------------------------------------
 
     def _notify_trade(self, msg: str, client_msg: str | None = None) -> None:
-        """Отправить уведомление о торговом событии.
+        """Отправить уведомление о торговом событии (напрямую, без консолидации).
 
-        - Подробное сообщение уходит ВСЕМ администраторам через send_admin.
-        - Для подписчиков: отдельное краткое сообщение (client_msg).
-          Если client_msg=None — подписчик НЕ получает уведомление (лимитки и т.п.).
+        Используется для warning-сообщений и recovery/reconcile.
+        Для торговых событий в основном цикле используйте _emit_trade_event.
         """
         if not self.notifier:
             return
@@ -143,9 +147,38 @@ class ExecutionManager:
         if not self.is_admin and client_msg is not None:
             self.notifier.send_to_client(self.client_id, client_msg)
 
+    def _emit_trade_event(self, event: dict, client_msg: str | None = None) -> None:
+        """Буферизировать торговое событие для консолидации.
+
+        client_msg отправляется подписчику немедленно.
+        Админ-уведомление формируется позже в _consolidate_and_send.
+        """
+        event["client_id"] = self.client_id
+        self._trade_events.append(event)
+        if not self.is_admin and client_msg is not None and self.notifier:
+            self.notifier.send_to_client(self.client_id, client_msg)
+
+    def drain_trade_events(self) -> list[dict]:
+        """Вернуть и очистить буфер торговых событий."""
+        events = self._trade_events
+        self._trade_events = []
+        return events
+
+    def _determine_close_reason(self, position: Position, exit_price: float) -> str:
+        """Определить причину закрытия по расстоянию от цены до SL/TP."""
+        dist_to_sl = abs(exit_price - position.stop_price)
+        dist_to_tp = abs(exit_price - position.target_price)
+        return "take_profit" if dist_to_tp < dist_to_sl else "stop_loss"
+
     def open_position(self, ticker: str, figi: str, setup: Setup) -> None:
         """Выставить лимитную заявку. SL/TP будут добавлены после исполнения."""
-        # 0. Dividend filter: нельзя шортить перед дивидендной отсечкой
+        # 0a. Лимит одновременных позиций
+        if len(self.positions) >= self.max_open_positions:
+            logger.info("[EXEC] %s: max open positions (%d) reached, skipping",
+                        ticker, self.max_open_positions)
+            return
+
+        # 0b. Dividend filter: нельзя шортить перед дивидендной отсечкой
         if setup.direction == Signal.SELL:
             if self._is_dividend_blocked(ticker, figi):
                 return
@@ -196,9 +229,15 @@ class ExecutionManager:
             order_dir = OrderDirection.ORDER_DIRECTION_SELL
 
         # 5. Разместить только лимитную заявку
-        entry_order_id = self.broker.place_limit_order(
-            self.account_id, figi, qty, order_dir, entry_price
-        )
+        try:
+            entry_order_id = self.broker.place_limit_order(
+                self.account_id, figi, qty, order_dir, entry_price
+            )
+        except RequestError as e:
+            if "30042" in str(e):
+                logger.warning("[EXEC] %s: insufficient funds (30042), skipping", ticker)
+                return
+            raise
 
         # 6. Создать Position в статусе pending (без SL/TP)
         position = Position(
@@ -220,15 +259,21 @@ class ExecutionManager:
         self.positions[figi] = position
         self.state.save_position(position)
 
-        # 8. Уведомление — заявка выставлена
-        msg = (
-            f"\U0001f4cb Лимитная заявка {ticker} {setup.direction.value}\n"
-            f"Цена: {entry_price} | Объём: {qty}\n"
-            f"SL: {stop_price} | TP: {target_price}\n"
-            f"Причина: {setup.entry_reason}"
+        # 8. Уведомление — заявка выставлена (буфер для консолидации)
+        logger.info(
+            "[EXEC] Limit order %s %s price=%.2f qty=%d SL=%.2f TP=%.2f",
+            ticker, setup.direction.value, entry_price, qty, stop_price, target_price,
         )
-        logger.info("[EXEC] %s", msg)
-        self._notify_trade(msg)  # подписчик не видит выставление лимитки
+        self._emit_trade_event({
+            "type": "limit_placed",
+            "ticker": ticker,
+            "direction": setup.direction.value,
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "qty": qty,
+            "entry_reason": setup.entry_reason,
+        })  # подписчик не видит выставление лимитки
 
     def _get_real_exit_price(self, figi: str, fallback_price: float) -> float:
         """Получить реальную цену закрытия из истории операций.
@@ -326,15 +371,25 @@ class ExecutionManager:
         position.last_candle_time = None
         self.state.save_position(position)
 
-        # Уведомление — позиция открыта
-        msg = (
-            f"\U0001f7e2 Позиция открыта {position.ticker} {position.direction.value}\n"
-            f"Вход: {position.entry_price} | SL: {position.stop_price} | TP: {position.target_price}\n"
-            f"Объём: {position.qty}\n"
-            f"Причина: {position.entry_reason}"
+        # Уведомление — позиция открыта (буфер для консолидации)
+        logger.info(
+            "[EXEC] Position opened %s %s entry=%.2f SL=%.2f TP=%.2f qty=%d",
+            position.ticker, position.direction.value, position.entry_price,
+            position.stop_price, position.target_price, position.qty,
         )
-        logger.info("[EXEC] %s", msg)
-        self._notify_trade(msg, f"\U0001f7e2 Открыта новая позиция {position.ticker}")
+        self._emit_trade_event(
+            {
+                "type": "position_opened",
+                "ticker": position.ticker,
+                "direction": position.direction.value,
+                "entry_price": position.entry_price,
+                "stop_price": position.stop_price,
+                "target_price": position.target_price,
+                "qty": position.qty,
+                "entry_reason": position.entry_reason,
+            },
+            f"\U0001f7e2 Открыта новая позиция {position.ticker}",
+        )
 
     def _cancel_pending(self, figi: str) -> None:
         """Отменить неисполненную лимитку по таймауту."""
@@ -362,12 +417,17 @@ class ExecutionManager:
         self.state.remove_position(figi)
         del self.positions[figi]
 
-        msg = (
-            f"\u274c Лимитная заявка {position.ticker} {position.direction.value} отменена\n"
-            f"Цена: {position.entry_price} | Не исполнена за {position.pending_candles} свечей"
+        logger.info(
+            "[EXEC] Limit cancelled %s %s timeout after %d candles",
+            position.ticker, position.direction.value, position.pending_candles,
         )
-        logger.info("[EXEC] %s", msg)
-        self._notify_trade(msg)  # подписчик не видит отмену лимитки
+        self._emit_trade_event({
+            "type": "limit_cancelled_timeout",
+            "ticker": position.ticker,
+            "direction": position.direction.value,
+            "entry_price": position.entry_price,
+            "pending_candles": position.pending_candles,
+        })  # подписчик не видит отмену лимитки
 
     def _is_order_filled(self, order_id: str) -> bool:
         """Проверить, исполнена ли лимитная заявка."""
@@ -407,18 +467,18 @@ class ExecutionManager:
                 self._activate_position(figi)
                 return
 
-            # Проверить, не отменена ли заявка вручную через терминал
+            # Проверить, не отменена ли заявка (вручную или биржей)
             if self._is_order_cancelled(position.entry_order_id):
                 logger.info("[EXEC] %s pending order was cancelled externally, removing position",
                             position.ticker)
                 self.state.remove_position(figi)
                 del self.positions[figi]
-                msg = (
-                    f"\u274c Лимитная заявка {position.ticker} {position.direction.value} "
-                    f"отменена через терминал\nЦена: {position.entry_price}"
-                )
-                logger.info("[EXEC] %s", msg)
-                self._notify_trade(msg)  # подписчик не видит отмену лимитки
+                self._emit_trade_event({
+                    "type": "limit_cancelled_external",
+                    "ticker": position.ticker,
+                    "direction": position.direction.value,
+                    "entry_price": position.entry_price,
+                })
                 return
 
             # Считать свечи ожидания
@@ -459,9 +519,10 @@ class ExecutionManager:
                     )
                 return  # Не закрываем state — ждём ручного вмешательства
             exit_price = self._get_real_exit_price(figi, position.stop_price)
+            reason = self._determine_close_reason(position, exit_price)
             logger.info("[EXEC] %s: both SL/TP gone, portfolio confirms closed, "
-                        "stop_loss, price=%.2f", position.ticker, exit_price)
-            self._close_position(figi, exit_price, "stop_loss")
+                        "%s, price=%.2f", position.ticker, reason, exit_price)
+            self._close_position(figi, exit_price, reason)
             return
         if not tp_active and sl_active:
             # TP исчез, SL ещё жив — проверяем портфель
@@ -516,7 +577,8 @@ class ExecutionManager:
                                position.ticker)
                 self._cancel_orders_safe(position)
                 exit_price = self._get_real_exit_price(figi, current_price)
-                self._close_position(figi, exit_price, "stop_loss")
+                reason = self._determine_close_reason(position, exit_price)
+                self._close_position(figi, exit_price, reason)
                 return
             logger.info("[EXEC] Timeout for %s after %d candles",
                          position.ticker, position.candles_held)
@@ -627,26 +689,31 @@ class ExecutionManager:
         elif reason in ("take_profit", "timeout"):
             self.state.reset_consecutive_sl(position.ticker)
 
-        # 6. Уведомление
-        _reason_label = {
-            "stop_loss": "стоп-лосс",
-            "take_profit": "тейк-профит",
-            "timeout": "по времени",
-            "revoked": "принудительно",
-            "deleted": "удаление клиента",
-        }
-        msg = (
-            f"\U0001f534 Закрыта позиция {position.ticker} {position.direction.value}\n"
-            f"Вход: {position.entry_price} \u2192 Выход: {exit_price}\n"
-            f"P&L: {pnl_net:+.2f} RUB | Причина закрытия: {_reason_label.get(reason, reason)}\n"
-            f"Причина входа: {position.entry_reason}\n"
-            f"Длительность: {position.candles_held} свечей"
+        # 6. Уведомление (буфер для консолидации)
+        logger.info(
+            "[EXEC] Closed %s %s entry=%.2f exit=%.2f pnl=%.2f reason=%s",
+            position.ticker, position.direction.value, position.entry_price,
+            exit_price, pnl_net, reason,
         )
-        logger.info("[EXEC] %s", msg)
         client_msg = (
             f"\U0001f534 Позиция {position.ticker} закрыта | P&L: {pnl_net:+.2f} ₽"
         )
-        self._notify_trade(msg, client_msg)
+        self._emit_trade_event(
+            {
+                "type": "position_closed",
+                "ticker": position.ticker,
+                "direction": position.direction.value,
+                "entry_price": position.entry_price,
+                "exit_price": exit_price,
+                "stop_price": position.stop_price,
+                "target_price": position.target_price,
+                "pnl": pnl_net,
+                "close_reason": reason,
+                "entry_reason": position.entry_reason,
+                "candles_held": position.candles_held,
+            },
+            client_msg,
+        )
 
     def reconcile_with_broker(self, known_tickers_by_figi: dict[str, str]) -> None:
         """Сверить фактические позиции на счёте со state бота.
@@ -691,8 +758,9 @@ class ExecutionManager:
                     reason = "take_profit"
                     cause = "сработал тейк-профит"
                 elif sl_gone and tp_gone:
-                    reason = "stop_loss"
-                    cause = "оба ордера исчезли (вероятно стоп-лосс)"
+                    exit_price_tmp = self._get_real_exit_price(figi, position.stop_price)
+                    reason = self._determine_close_reason(position, exit_price_tmp)
+                    cause = f"оба ордера исчезли → определено как {reason}"
                 else:
                     reason = "stop_loss"
                     cause = "закрыта вручную через терминал"
@@ -847,7 +915,8 @@ class ExecutionManager:
                 self._close_position(figi, exit_price, "take_profit")
             else:
                 exit_price = self._get_real_exit_price(figi, position.stop_price)
-                self._close_position(figi, exit_price, "stop_loss")
+                reason = self._determine_close_reason(position, exit_price)
+                self._close_position(figi, exit_price, reason)
 
         self.state.reset_stale_sl_counters()
 
@@ -864,6 +933,45 @@ class ExecutionManager:
                 f"(закрыто пока стоял: {closed_during_downtime}). "
                 f"Активных: {active_count}, ожидающих: {pending_count}"
             )
+
+    def cancel_pending_market_close(self) -> list[dict]:
+        """Отменить все pending лимитки из-за закрытия рынка.
+
+        Возвращает список событий (для консолидации).
+        """
+        events: list[dict] = []
+        for figi in list(self.positions.keys()):
+            position = self.positions[figi]
+            if position.status != "pending":
+                continue
+            try:
+                self.broker.cancel_order(self.account_id, position.entry_order_id)
+            except Exception:
+                logger.debug("[EXEC] Could not cancel entry order %s on market close",
+                             position.entry_order_id)
+                if self._is_order_filled(position.entry_order_id):
+                    logger.info("[EXEC] %s: order filled during market close cancel — activating",
+                                position.ticker)
+                    try:
+                        self._activate_position(figi)
+                    except Exception:
+                        logger.error("[EXEC] %s: failed to activate after market close race",
+                                     position.ticker)
+                        self.state.remove_position(figi)
+                        del self.positions[figi]
+                    continue
+
+            self.state.remove_position(figi)
+            del self.positions[figi]
+            events.append({
+                "type": "limit_cancelled_market_close",
+                "ticker": position.ticker,
+                "direction": position.direction.value,
+                "entry_price": position.entry_price,
+                "client_id": self.client_id,
+            })
+            logger.info("[EXEC] %s: pending order cancelled (market close)", position.ticker)
+        return events
 
     def _cancel_orders_safe(self, position: Position) -> None:
         """Безопасно отменить все ордера позиции (игнорировать ошибки)."""

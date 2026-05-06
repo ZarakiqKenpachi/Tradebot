@@ -303,6 +303,8 @@ class StrategyBar(QToolBar):
     """Second toolbar row: strategy selection + run/playback controls."""
 
     strategy_run_requested = pyqtSignal(str)
+    run_all_requested = pyqtSignal(int)          # sim_days
+    clear_trades_requested = pyqtSignal()
     playback_play_requested = pyqtSignal(str)
     playback_pause_requested = pyqtSignal()
     playback_stop_requested = pyqtSignal()
@@ -334,6 +336,15 @@ class StrategyBar(QToolBar):
         run_btn = _icon_btn("Run", 40, "Run simulation (instant)", cls="accent-btn")
         run_btn.clicked.connect(self._on_strategy_run)
         self.addWidget(run_btn)
+
+        run_all_btn = _icon_btn("All", 36, "Run all config tickers (shared balance)", cls="accent-btn")
+        run_all_btn.clicked.connect(self._on_run_all)
+        self.addWidget(run_all_btn)
+
+        self._clear_btn = _icon_btn("✕", 26, "Clear simulation trades", cls="stop-btn")
+        self._clear_btn.clicked.connect(self.clear_trades_requested.emit)
+        self._clear_btn.setEnabled(False)
+        self.addWidget(self._clear_btn)
 
         self.addSeparator()
 
@@ -402,10 +413,18 @@ class StrategyBar(QToolBar):
 
     # ── Private ──────────────────────────────────────────
 
+    def set_has_sim_trades(self, has: bool) -> None:
+        """Enable/disable the clear button based on whether sim trades exist."""
+        self._clear_btn.setEnabled(has)
+
     def _on_strategy_run(self) -> None:
         name = self.get_selected_strategy()
         if name:
             self.strategy_run_requested.emit(name)
+
+    def _on_run_all(self) -> None:
+        days = self.get_selected_days()
+        self.run_all_requested.emit(days)
 
     def _on_play(self) -> None:
         name = self.get_selected_strategy()
