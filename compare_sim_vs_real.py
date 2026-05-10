@@ -304,9 +304,44 @@ def compare(real: list[dict], sim: list[dict]):
     print(f"Match rate: {exact_count}/{len(real)} exact + {near_count} near = {exact_count + near_count}/{len(real)}")
 
 
+def show_setup_log():
+    """Show setup_log entries if table exists (live bot diagnostics)."""
+    conn = sqlite3.connect("data/traderbot.db")
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(f"""
+            SELECT ts, ticker, strategy, direction, entry_price, stop_price,
+                   target_price, action, market_price, open_positions, candle_time_30m
+            FROM setup_log
+            WHERE ts >= datetime('now', '-{SIM_DAYS} days')
+            ORDER BY ts
+        """).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return  # table doesn't exist yet
+    conn.close()
+
+    if not rows:
+        return
+
+    print(f"\n{'=' * 120}")
+    print(f"SETUP LOG (live bot, last {SIM_DAYS} days): {len(rows)} entries")
+    print("=" * 120)
+    print(f"{'Time':<20} {'Ticker':<6} {'Dir':<5} {'Entry':>8} {'SL':>8} {'TP':>8} {'Action':<8} {'Mkt':>8} {'Open':>4} {'30m candle'}")
+    print("-" * 120)
+    for r in rows:
+        ts = r["ts"][:19].replace("T", " ")
+        mp = f"{r['market_price']:>8.2f}" if r["market_price"] else "     N/A"
+        ct = str(r["candle_time_30m"])[:16] if r["candle_time_30m"] else ""
+        print(f"{ts:<20} {r['ticker']:<6} {r['direction']:<5} {r['entry_price']:>8.2f} "
+              f"{r['stop_price']:>8.2f} {r['target_price']:>8.2f} {r['action']:<8} "
+              f"{mp} {r['open_positions']:>4}  {ct}")
+
+
 if __name__ == "__main__":
     real = load_real_trades()
     logger.info("Loaded %d real trades", len(real))
     sim = run_simulation()
     logger.info("Got %d simulated trades", len(sim))
     compare(real, sim)
+    show_setup_log()

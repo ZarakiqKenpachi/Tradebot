@@ -117,6 +117,23 @@ CREATE TABLE IF NOT EXISTS payments (
     paid_at     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_payments_client ON payments(client_id);
+
+CREATE TABLE IF NOT EXISTS setup_log (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    ticker        TEXT NOT NULL,
+    strategy      TEXT NOT NULL,
+    direction     TEXT NOT NULL,
+    entry_price   REAL NOT NULL,
+    stop_price    REAL NOT NULL,
+    target_price  REAL NOT NULL,
+    entry_reason  TEXT,
+    action        TEXT NOT NULL,
+    market_price  REAL,
+    open_positions INTEGER,
+    candle_time_30m TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_setup_log_ts ON setup_log(ts);
 """
 
 

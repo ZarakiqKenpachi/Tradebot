@@ -758,6 +758,28 @@ def format_positions_snapshot(execs: dict) -> str:
     return "\n".join(lines) if lines else "Открытых позиций нет."
 
 
+def _log_setup(db: Database, ticker: str, strategy_name: str, setup,
+               action: str, market_price: float | None,
+               open_positions: int, candle_time_30m) -> None:
+    """Record every setup found by the live bot for sim comparison."""
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        ct = str(candle_time_30m) if candle_time_30m else None
+        with db.write() as cur:
+            cur.execute(
+                "INSERT INTO setup_log "
+                "(ts, ticker, strategy, direction, entry_price, stop_price, "
+                " target_price, entry_reason, action, market_price, "
+                " open_positions, candle_time_30m) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (ts, ticker, strategy_name, setup.direction.value,
+                 setup.entry_price, setup.stop_price, setup.target_price,
+                 setup.entry_reason, action, market_price, open_positions, ct),
+            )
+    except Exception:
+        logger.debug("[MAIN] Failed to log setup for %s", ticker, exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1100,6 +1122,15 @@ def main() -> None:
                     # Сигнал — ОДИН РАЗ на тикер
                     shared_setup = strategy.find_setup(candles)
 
+                    # Логируем найденный setup для сравнения с sim
+                    if shared_setup is not None:
+                        total_open = sum(len(em.positions) for em in execs.values())
+                        _log_setup(
+                            db, ticker_name, ticker_conf.strategy, shared_setup,
+                            action="found", market_price=float(current_price),
+                            open_positions=total_open, candle_time_30m=last_candle_time,
+                        )
+
                     # Per-client: обновить/открыть позицию
                     ticker_events: list[dict] = []
                     setup_used = False
@@ -1119,8 +1150,14 @@ def main() -> None:
                                     if em.is_ticker_blocked(ticker_name):
                                         em.notify_ticker_blocked(ticker_name)
                                     else:
-                                        if em.open_position(ticker_name, figi, shared_setup):
+                                        opened = em.open_position(ticker_name, figi, shared_setup)
+                                        if opened:
                                             setup_used = True
+                                            _log_setup(
+                                                db, ticker_name, ticker_conf.strategy, shared_setup,
+                                                action="opened", market_price=float(current_price),
+                                                open_positions=total_open, candle_time_30m=last_candle_time,
+                                            )
                         except Exception:
                             logger.exception("[MAIN] client %d tick error on %s", client_id, ticker_name)
                             handle_client_error(client_id, registry, execs, notifier)
