@@ -290,7 +290,6 @@ class MainWindow(QMainWindow):
 
         balance = self._sim_params.get("initial_balance", 100_000.0)
         all_trades: list = []
-        trade_id = 0
         ticker_count = len(self._ticker_strategy_map)
         max_open = self._sim_params.get("max_open_positions", 4)
 
@@ -338,10 +337,9 @@ class MainWindow(QMainWindow):
             if not candles:
                 continue
 
-            # Trim to sim window
+            # Don't trim strategy candles — strategies need 15-day sliding window.
+            # Only trim 1m scan data to save memory (used only for fill/exit scanning).
             cutoff = pd.Timestamp.now(tz="UTC") - timedelta(days=sim_days)
-            for tf_key in list(candles.keys()):
-                candles[tf_key] = candles[tf_key].loc[candles[tf_key].index >= cutoff]
             if scan_df is not None:
                 scan_df = scan_df.loc[scan_df.index >= cutoff]
                 if scan_df.empty:
@@ -376,40 +374,29 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "No data loaded for any ticker")
             return
 
-        # Run simulation per ticker sequentially (each with its own runner)
-        # Shared balance: after each ticker, pass remaining balance to next
-        # For fairness: run each ticker independently with equal initial balance
-        # (like the backtest engine does with chronological interleaving)
-        self._statusbar.set_status(f"Simulating {len(ticker_states)} tickers...")
+        # Run interleaved simulation: bars from all tickers sorted chronologically,
+        # max_open_positions enforced globally (same as backtest engine)
+        self._statusbar.set_status(f"Simulating {len(ticker_states)} tickers (interleaved)...")
         QApplication.processEvents()
 
-        for symbol, state in ticker_states.items():
-            sim_config = SimulationConfig(
-                initial_balance=balance,
-                scan_tf="1m",
-                lot_size=state["lot_size"],
-                price_step=state["price_step"],
-                dividend_dates=state["dividend_dates"],
-                risk_pct=self._sim_params.get("risk_pct", 0.10),
-                max_position_pct=self._sim_params.get("max_position_pct", 1.50),
-                commission_pct=self._sim_params.get("commission_pct", 0.0004),
-                slippage_pct=self._sim_params.get("slippage_pct", 0.0005),
-                max_candles_timeout=self._sim_params.get("max_candles_timeout", 12),
-                max_consecutive_sl=self._sim_params.get("max_consecutive_sl", 3),
-            )
-            result = self._strategy_runner.run(
-                state["strategy_name"], state["candles"],
-                scan_df=state["scan_df"],
-                config=sim_config,
-                ticker=symbol,
-            )
-            if result and result.trades:
-                for t in result.trades:
-                    t.id = trade_id
-                    trade_id += 1
-                self._multi_sim_trades[symbol] = result.trades
-                all_trades.extend(result.trades)
-                balance = result.final_balance
+        sim_config = SimulationConfig(
+            initial_balance=balance,
+            risk_pct=self._sim_params.get("risk_pct", 0.10),
+            max_position_pct=self._sim_params.get("max_position_pct", 1.50),
+            commission_pct=self._sim_params.get("commission_pct", 0.0004),
+            slippage_pct=self._sim_params.get("slippage_pct", 0.0005),
+            max_candles_timeout=self._sim_params.get("max_candles_timeout", 12),
+            max_consecutive_sl=self._sim_params.get("max_consecutive_sl", 3),
+            max_open_positions=max_open,
+        )
+        sim_start = pd.Timestamp.now(tz="UTC") - timedelta(days=sim_days)
+        trades_by_ticker, balance = self._strategy_runner.run_interleaved(
+            ticker_states, sim_config, sim_start=sim_start,
+        )
+        for symbol, ticker_trades in trades_by_ticker.items():
+            if ticker_trades:
+                self._multi_sim_trades[symbol] = ticker_trades
+                all_trades.extend(ticker_trades)
 
         # Sort all trades chronologically
         all_trades.sort(key=lambda t: t.entry_time)

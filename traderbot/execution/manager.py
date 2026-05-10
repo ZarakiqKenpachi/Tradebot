@@ -170,25 +170,28 @@ class ExecutionManager:
         dist_to_tp = abs(exit_price - position.target_price)
         return "take_profit" if dist_to_tp < dist_to_sl else "stop_loss"
 
-    def open_position(self, ticker: str, figi: str, setup: Setup) -> None:
-        """Выставить лимитную заявку. SL/TP будут добавлены после исполнения."""
+    def open_position(self, ticker: str, figi: str, setup: Setup) -> bool:
+        """Выставить лимитную заявку. SL/TP будут добавлены после исполнения.
+
+        Returns True if a limit order was successfully placed.
+        """
         # 0a. Лимит одновременных позиций
         if len(self.positions) >= self.max_open_positions:
             logger.info("[EXEC] %s: max open positions (%d) reached, skipping",
                         ticker, self.max_open_positions)
-            return
+            return False
 
         # 0b. Dividend filter: нельзя шортить перед дивидендной отсечкой
         if setup.direction == Signal.SELL:
             if self._is_dividend_blocked(ticker, figi):
-                return
+                return False
 
         # 1. Баланс, размер лота и шаг цены
         balance = self.broker.get_portfolio_balance(self.account_id)
         lot_size, price_step = self.broker.get_instrument_info(figi)
         if lot_size < 1:
             logger.error("[EXEC] Invalid lot_size=%d for %s from API, aborting", lot_size, ticker)
-            return
+            return False
         logger.info("[EXEC] %s lot_size=%d price_step=%.6f", ticker, lot_size, price_step)
 
         # 2. Округлить цены до шага цены инструмента
@@ -208,19 +211,19 @@ class ExecutionManager:
                     "[EXEC] %s BUY limit %.2f > market %.2f → skipped",
                     ticker, entry_price, market_price,
                 )
-                return
+                return False
             elif setup.direction == Signal.SELL and entry_price < market_price:
                 logger.info(
                     "[EXEC] %s SELL limit %.2f < market %.2f → skipped",
                     ticker, entry_price, market_price,
                 )
-                return
+                return False
 
         # 3. Размер позиции в лотах
         qty = self.risk.position_size(balance, entry_price, stop_price, lot_size)
         if qty < 1:
             logger.warning("[EXEC] Insufficient balance for %s, qty=0", ticker)
-            return
+            return False
 
         # 4. Определить направление ордера
         if setup.direction == Signal.BUY:
@@ -236,7 +239,7 @@ class ExecutionManager:
         except RequestError as e:
             if "30042" in str(e):
                 logger.warning("[EXEC] %s: insufficient funds (30042), skipping", ticker)
-                return
+                return False
             raise
 
         # 6. Создать Position в статусе pending (без SL/TP)
@@ -274,6 +277,7 @@ class ExecutionManager:
             "qty": qty,
             "entry_reason": setup.entry_reason,
         })  # подписчик не видит выставление лимитки
+        return True
 
     def _get_real_exit_price(self, figi: str, fallback_price: float) -> float:
         """Получить реальную цену закрытия из истории операций.

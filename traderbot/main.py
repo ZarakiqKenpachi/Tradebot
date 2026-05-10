@@ -1102,6 +1102,7 @@ def main() -> None:
 
                     # Per-client: обновить/открыть позицию
                     ticker_events: list[dict] = []
+                    setup_used = False
                     for client_id, em in list(execs.items()):
                         # Если revoked или достигнут дневной лимит SL — только сопровождаем
                         can_open = not em._revoked and not em._daily_sl_limit_reached
@@ -1118,7 +1119,8 @@ def main() -> None:
                                     if em.is_ticker_blocked(ticker_name):
                                         em.notify_ticker_blocked(ticker_name)
                                     else:
-                                        em.open_position(ticker_name, figi, shared_setup)
+                                        if em.open_position(ticker_name, figi, shared_setup):
+                                            setup_used = True
                         except Exception:
                             logger.exception("[MAIN] client %d tick error on %s", client_id, ticker_name)
                             handle_client_error(client_id, registry, execs, notifier)
@@ -1131,6 +1133,10 @@ def main() -> None:
                         # Запомнить для обработки после цикла тикеров (не вызываем повторно)
                         if em._daily_sl_limit_reached and client_id not in daily_sl_triggered:
                             daily_sl_triggered.add(client_id)
+
+                    # Обновить state стратегии после успешного открытия
+                    if setup_used:
+                        strategy.on_trade_opened()
 
                     # Консолидировать и отправить уведомления по тикеру
                     _consolidate_and_send(ticker_events, registry, notifier)

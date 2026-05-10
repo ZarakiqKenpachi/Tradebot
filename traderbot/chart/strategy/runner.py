@@ -26,8 +26,100 @@ logger = logging.getLogger(__name__)
 
 MSK = ZoneInfo("Europe/Moscow")
 _DAYS_WINDOW = 15          # sliding data window for strategies (same as live)
-_MIN_WARMUP = 60           # min bars before first signal
+_MIN_WARMUP = 20           # min bars before first signal (matches backtest _MIN_BARS)
 _PENDING_TIMEOUT = 20      # 30m-candle equivalents for limit order timeout
+_HIGH_PRECISION_DAYS = 7   # use 1m iteration for sim periods <= this
+
+# Timeframe durations for completion checking and live-resampling
+_TF_DURATION = {
+    "1m": timedelta(minutes=1),
+    "5m": timedelta(minutes=5),
+    "15m": timedelta(minutes=15),
+    "30m": timedelta(minutes=30),
+    "1h": timedelta(hours=1),
+    "2h": timedelta(hours=2),
+    "4h": timedelta(hours=4),
+    "1d": timedelta(days=1),
+}
+
+_FREQ_MAP = {
+    "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1D",
+}
+
+
+def _build_strategy_window(
+    candles: dict[str, pd.DataFrame],
+    current_time: pd.Timestamp,
+    primary_tf: str,
+) -> dict[str, pd.DataFrame]:
+    """Build sliding window for strategy (standard mode).
+
+    Include all completed bars up to current_time, exclude 1m.
+    """
+    window_start = current_time - timedelta(days=_DAYS_WINDOW)
+    return {
+        tf: df[(df.index > window_start) & (df.index <= current_time)]
+        for tf, df in candles.items()
+        if tf != "1m"
+    }
+
+
+class _ResampleCache:
+    """Incremental live-resampler: pre-computes completed bars,
+    builds partial current bar from 1m data — replicates feed.get_candles().
+
+    In live, DataFeed loads 1m candles and resamples to 30m/1h/etc.
+    The current (incomplete) bar is visible with partial data.
+    This cache replicates that behavior efficiently.
+    """
+
+    def __init__(self, candles_1m: pd.DataFrame, timeframes: list[str]):
+        self._df = candles_1m
+        self._tfs = [tf for tf in timeframes if tf != "1m" and tf in _FREQ_MAP]
+        # Pre-resample full dataset once
+        self._full: dict[str, pd.DataFrame] = {}
+        for tf in self._tfs:
+            self._full[tf] = candles_1m.resample(_FREQ_MAP[tf]).agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }).dropna(subset=["open"])
+
+    def get_window(self, current_time: pd.Timestamp) -> dict[str, pd.DataFrame]:
+        """Strategy window at current_time with completed + partial bars."""
+        window_start = current_time - timedelta(days=_DAYS_WINDOW)
+        result = {}
+        for tf in self._tfs:
+            dur = _TF_DURATION[tf]
+            full_df = self._full[tf]
+
+            # Completed bars: bar_start + dur <= current_time
+            cutoff = current_time - dur
+            completed = full_df[
+                (full_df.index > window_start) & (full_df.index <= cutoff)
+            ]
+
+            # Partial (current) bar: 1m data from bar_start to current_time
+            partial_start = cutoff + dur  # = current_time (first incomplete bar start)
+            # Align to TF boundary
+            if not completed.empty:
+                partial_start = completed.index[-1] + dur
+
+            partial_1m = self._df[
+                (self._df.index >= partial_start) & (self._df.index <= current_time)
+            ]
+            if not partial_1m.empty:
+                pbar = pd.DataFrame({
+                    "open": [float(partial_1m.iloc[0]["open"])],
+                    "high": [float(partial_1m["high"].max())],
+                    "low": [float(partial_1m["low"].min())],
+                    "close": [float(partial_1m.iloc[-1]["close"])],
+                    "volume": [float(partial_1m["volume"].sum())],
+                }, index=[partial_start])
+                result[tf] = pd.concat([completed, pbar])
+            else:
+                result[tf] = completed
+        return result
 
 
 @dataclass
@@ -42,6 +134,7 @@ class SimulationConfig:
     max_consecutive_sl: int = 3
     lot_size: int = 1                   # overridden per ticker from T-Bank API
     price_step: float = 0.01            # overridden per ticker from T-Bank API
+    max_open_positions: int = 4          # global limit across all tickers
     scan_tf: str = "1m"                 # granularity for SL/TP/fill scanning
     dividend_dates: list = field(default_factory=list)  # list of last_buy_date (date objects)
 
@@ -289,12 +382,8 @@ class StrategyRunner:
             if sl_date == today_str and consecutive_sl >= cfg.max_consecutive_sl:
                 continue
 
-            # Sliding window (15 days, same as live)
-            window_start = current_time - timedelta(days=_DAYS_WINDOW)
-            window = {
-                tf: df[(df.index > window_start) & (df.index <= current_time)]
-                for tf, df in candles.items()
-            }
+            # Sliding window for strategy (exclude 1m)
+            window = _build_strategy_window(candles, current_time, primary_tf)
 
             try:
                 setup = strategy.find_setup(window)
@@ -324,17 +413,21 @@ class StrategyRunner:
             if current_price > 0:
                 is_buy = setup.direction.value == "BUY"
                 if is_buy and setup.entry_price > current_price:
-                    logger.debug(
-                        "[RUNNER] Skipped BUY: entry %.2f > market %.2f",
-                        setup.entry_price, current_price,
-                    )
-                    continue
+                    # Check if price drops to entry within this bar (live polls every 60s)
+                    if bar_scan.empty or bar_scan["low"].min() > setup.entry_price:
+                        logger.debug(
+                            "[RUNNER] Skipped BUY: entry %.2f > market %.2f (no intra-bar reach)",
+                            setup.entry_price, current_price,
+                        )
+                        continue
                 if not is_buy and setup.entry_price < current_price:
-                    logger.debug(
-                        "[RUNNER] Skipped SELL: entry %.2f < market %.2f",
-                        setup.entry_price, current_price,
-                    )
-                    continue
+                    # Check if price rises to entry within this bar
+                    if bar_scan.empty or bar_scan["high"].max() < setup.entry_price:
+                        logger.debug(
+                            "[RUNNER] Skipped SELL: entry %.2f < market %.2f (no intra-bar reach)",
+                            setup.entry_price, current_price,
+                        )
+                        continue
 
             # Position sizing
             qty = _position_size(
@@ -414,6 +507,416 @@ class StrategyRunner:
             result.total_pnl, result.max_drawdown * 100,
         )
         return result
+
+    # ── Multi-ticker interleaved simulation ──────────────
+
+    def run_interleaved(
+        self,
+        ticker_data: dict[str, dict],
+        config: SimulationConfig,
+        sim_start: pd.Timestamp | None = None,
+    ) -> tuple[dict[str, list], float]:
+        """Run chronological interleaved simulation across all tickers.
+
+        Two modes:
+        - **High-precision** (sim_days <= _HIGH_PRECISION_DAYS): iterate on 1m
+          bars, build strategy window by resampling 1m data (completed bars +
+          partial current bar) — replicates live ``feed.get_candles()`` exactly.
+        - **Standard**: iterate on primary-TF bars (faster for long backtests).
+
+        Args:
+            ticker_data: {symbol: {strategy_name, candles, scan_df, lot_size,
+                          price_step, dividend_dates, required}}
+            config: SimulationConfig with max_open_positions
+            sim_start: Only output trades after this timestamp.
+
+        Returns:
+            (trades_by_ticker, final_balance)
+        """
+        max_open = config.max_open_positions
+
+        # Determine mode
+        if sim_start is not None:
+            sim_days = (pd.Timestamp.now(tz="UTC") - sim_start).total_seconds() / 86400
+        else:
+            sim_days = 999
+        high_precision = sim_days <= _HIGH_PRECISION_DAYS + 0.5  # margin for runtime
+
+        # Per-ticker state
+        states: dict[str, _InterleavedState] = {}
+        for symbol, td in ticker_data.items():
+            strategy_name = td["strategy_name"]
+            if strategy_name not in self._registry:
+                continue
+            try:
+                strategy = self._registry[strategy_name]()
+            except Exception:
+                continue
+
+            required_tfs = getattr(strategy, "required_timeframes", [])
+            primary_tf = required_tfs[0] if required_tfs else list(td["candles"].keys())[0]
+            primary_df = td["candles"].get(primary_tf)
+            if primary_df is None or len(primary_df) < _MIN_WARMUP:
+                continue
+
+            scan_df = td.get("scan_df")
+
+            # Build resample cache for high-precision mode
+            rcache = None
+            if high_precision and scan_df is not None and not scan_df.empty:
+                rcache = _ResampleCache(scan_df, required_tfs)
+
+            states[symbol] = _InterleavedState(
+                ticker=symbol,
+                strategy=strategy,
+                strategy_name=strategy_name,
+                candles=td["candles"],
+                primary_tf=primary_tf,
+                primary_df=primary_df,
+                scan_df=scan_df,
+                df_30m=td["candles"].get("30m"),
+                lot_size=td.get("lot_size", 1),
+                price_step=td.get("price_step", 0.01),
+                dividend_dates=td.get("dividend_dates", []),
+                resample_cache=rcache,
+            )
+
+        if not states:
+            return {}, config.initial_balance
+
+        # ── Build event list ─────────────────────────────
+        # (timestamp, symbol, bar_index, is_1m)
+        # Sort by (timestamp, config_order) to replicate live processing:
+        # live processes all tickers in config order within each poll cycle.
+        events: list[tuple] = []
+        config_order = {sym: i for i, sym in enumerate(ticker_data.keys())}
+
+        if high_precision:
+            for symbol, st in states.items():
+                if st.scan_df is not None and not st.scan_df.empty and st.resample_cache is not None:
+                    for j in range(1, len(st.scan_df)):
+                        events.append((st.scan_df.index[j], symbol, j, True))
+                else:
+                    # Fallback to primary TF for tickers without 1m data
+                    for i in range(_MIN_WARMUP, len(st.primary_df)):
+                        events.append((st.primary_df.index[i], symbol, i, False))
+            logger.info("[RUNNER] High-precision mode (1m iteration, %d tickers)", len(states))
+        else:
+            for symbol, st in states.items():
+                for i in range(_MIN_WARMUP, len(st.primary_df)):
+                    events.append((st.primary_df.index[i], symbol, i, False))
+
+        events.sort(key=lambda e: (e[0], config_order.get(e[1], 999)))
+
+        balance = config.initial_balance
+        trades_by_ticker: dict[str, list] = {s: [] for s in states}
+        trade_id = 0
+        sim_started = sim_start is None  # True if no warmup needed
+
+        for ts, symbol, idx, is_1m in events:
+            # ── Reset at sim_start boundary ─────────────────
+            # Warmup period builds strategy state naturally (find_setup +
+            # on_trade_opened calls).  At sim_start we reset balance,
+            # positions, and counters so warmup trades don't bleed into
+            # the comparison period.  Strategy _pending_* state is KEPT —
+            # it was built by warmup and represents the same state the
+            # live bot would have accumulated from prior trading activity.
+            if not sim_started and ts >= sim_start:
+                sim_started = True
+                balance = config.initial_balance
+                for s in states.values():
+                    s.position = None
+                    s.pending = None
+                    s.pending_30m_count = 0
+                    s.pending_last_30m = None
+                    s.consecutive_sl = 0
+                    s.sl_date = ""
+                trades_by_ticker = {s: [] for s in states}
+                trade_id = 0
+            st = states[symbol]
+            cfg = SimulationConfig(
+                initial_balance=balance,
+                risk_pct=config.risk_pct,
+                max_position_pct=config.max_position_pct,
+                commission_pct=config.commission_pct,
+                slippage_pct=config.slippage_pct,
+                max_candles_timeout=config.max_candles_timeout,
+                max_consecutive_sl=config.max_consecutive_sl,
+                lot_size=st.lot_size,
+                price_step=st.price_step,
+                dividend_dates=st.dividend_dates,
+            )
+
+            # ── Resolve current bar data ────────────────
+            if is_1m:
+                current_time = st.scan_df.index[idx]
+                prev_time = st.scan_df.index[idx - 1]
+                bar_scan = st.scan_df.iloc[[idx]]  # single 1m bar
+            else:
+                current_time = st.primary_df.index[idx]
+                prev_time = st.primary_df.index[idx - 1]
+                bar_scan = _get_scan_slice(st.scan_df, prev_time, current_time)
+                if bar_scan.empty:
+                    bar_scan = _synthesize_scan_bar(st.primary_df, idx, current_time)
+
+            current_30m = _get_30m_at(st.df_30m, current_time)
+
+            # ── 1. Manage open position ──────────────────
+            if st.position is not None:
+                if current_30m is not None and current_30m != st.position.last_30m_time:
+                    st.position.candles_held += 1
+                    st.position.last_30m_time = current_30m
+
+                exit_trade = _scan_exit(st.position, bar_scan, cfg)
+                if exit_trade is not None:
+                    exit_trade.id = trade_id
+                    exit_trade.ticker = symbol
+                    trade_id += 1
+                    trades_by_ticker[symbol].append(exit_trade)
+                    balance += exit_trade.pnl
+                    st.consecutive_sl, st.sl_date = _update_sl_counter(
+                        exit_trade.exit_reason, st.consecutive_sl, st.sl_date, exit_trade.exit_time,
+                    )
+                    st.position = None
+                    continue
+
+                if st.position.candles_held >= cfg.max_candles_timeout:
+                    exit_price = float(bar_scan.iloc[-1]["close"]) if not bar_scan.empty else float(st.primary_df.iloc[-1]["close"])
+                    exit_price = _apply_slippage(exit_price, st.position.direction, cfg.slippage_pct)
+                    exit_trade = _close_position(st.position, exit_price, "timeout", current_time, cfg)
+                    exit_trade.id = trade_id
+                    exit_trade.ticker = symbol
+                    trade_id += 1
+                    trades_by_ticker[symbol].append(exit_trade)
+                    balance += exit_trade.pnl
+                    st.consecutive_sl, st.sl_date = _update_sl_counter(
+                        "timeout", st.consecutive_sl, st.sl_date, str(current_time),
+                    )
+                    st.position = None
+
+                continue
+
+            # ── 2. Pending limit order ───────────────────
+            if st.pending is not None:
+                if current_30m is not None and current_30m != st.pending_last_30m:
+                    st.pending_30m_count += 1
+                    st.pending_last_30m = current_30m
+
+                if st.pending_30m_count >= _PENDING_TIMEOUT:
+                    st.pending = None
+                    st.pending_30m_count = 0
+                    st.pending_last_30m = None
+                else:
+                    setup, qty, pending_bal = st.pending
+                    fill_result = _scan_fill(setup, bar_scan, cfg)
+
+                    if fill_result == "invalidated":
+                        st.pending = None
+                        st.pending_30m_count = 0
+                        st.pending_last_30m = None
+                    elif fill_result is not None:
+                        fill_time = fill_result
+                        st.position = _VirtualPosition(
+                            ticker=symbol,
+                            direction=setup.direction.value,
+                            entry_price=setup.entry_price,
+                            stop_price=setup.stop_price,
+                            target_price=setup.target_price,
+                            qty=qty, lot_size=cfg.lot_size,
+                            entry_time=fill_time,
+                            entry_reason=setup.entry_reason,
+                            balance_at_entry=pending_bal,
+                            last_30m_time=current_30m,
+                        )
+                        st.pending = None
+                        st.pending_30m_count = 0
+                        st.pending_last_30m = None
+
+                        remaining = _get_scan_slice(st.scan_df, fill_time, current_time)
+                        if remaining.empty:
+                            remaining = bar_scan[bar_scan.index > fill_time]
+                        if not remaining.empty:
+                            exit_trade = _scan_exit(st.position, remaining, cfg)
+                            if exit_trade is not None:
+                                exit_trade.id = trade_id
+                                exit_trade.ticker = symbol
+                                trade_id += 1
+                                trades_by_ticker[symbol].append(exit_trade)
+                                balance += exit_trade.pnl
+                                st.consecutive_sl, st.sl_date = _update_sl_counter(
+                                    exit_trade.exit_reason, st.consecutive_sl,
+                                    st.sl_date, exit_trade.exit_time,
+                                )
+                                st.position = None
+                    else:
+                        continue  # still waiting for fill
+
+            # ── 3. Search for new setup ──────────────────
+            current_msk = current_time.tz_convert(MSK) if current_time.tzinfo else current_time
+            if hasattr(current_msk, 'weekday') and current_msk.weekday() >= 5:
+                continue
+
+            today_str = str(current_msk.date()) if hasattr(current_msk, 'date') else ""
+            if st.sl_date == today_str and st.consecutive_sl >= cfg.max_consecutive_sl:
+                continue
+
+            # Global open count: positions + pending across ALL tickers
+            open_count = sum(
+                1 for s in states.values()
+                if s.position is not None or s.pending is not None
+            )
+            if open_count >= max_open:
+                continue
+
+            # Strategy window
+            if is_1m and st.resample_cache is not None:
+                window = st.resample_cache.get_window(current_time)
+                # For higher TFs (>=4h), use original broker data instead of
+                # 1m resampling — exchange session boundaries make 1m→4h/1d
+                # resampling inaccurate (different bar opens/closes).
+                _BROKER_OVERRIDE_TFS = ("4h", "1d")
+                window_start = current_time - timedelta(days=_DAYS_WINDOW)
+                for tf in _BROKER_OVERRIDE_TFS:
+                    if tf in st.candles and not st.candles[tf].empty:
+                        tf_df = st.candles[tf]
+                        window[tf] = tf_df[
+                            (tf_df.index > window_start) & (tf_df.index <= current_time)
+                        ]
+            else:
+                window = _build_strategy_window(st.candles, current_time, st.primary_tf)
+
+            try:
+                setup = st.strategy.find_setup(window)
+            except Exception:
+                continue
+
+            if setup is None:
+                continue
+
+            if setup.direction.value == "SELL" and cfg.dividend_dates:
+                bar_date = current_time.date() if hasattr(current_time, 'date') else None
+                if bar_date and _is_near_dividend(bar_date, cfg.dividend_dates):
+                    continue
+
+            if cfg.price_step > 0:
+                setup = _round_setup(setup, cfg.price_step)
+
+            # Price validation: use current 1m price (high precision)
+            # or intra-bar range (standard)
+            if not bar_scan.empty:
+                current_price = float(bar_scan.iloc[0]["open"])
+            else:
+                current_price = 0.0
+
+            if current_price > 0:
+                is_buy = setup.direction.value == "BUY"
+                if is_buy and setup.entry_price > current_price:
+                    if is_1m:
+                        continue  # Live: BUY limit > market → rejected
+                    if bar_scan.empty or bar_scan["low"].min() > setup.entry_price:
+                        continue
+                if not is_buy and setup.entry_price < current_price:
+                    if is_1m:
+                        continue  # Live: SELL limit < market → rejected
+                    if bar_scan.empty or bar_scan["high"].max() < setup.entry_price:
+                        continue
+
+            qty = _position_size(
+                balance, setup.entry_price, setup.stop_price,
+                cfg.risk_pct, cfg.max_position_pct, cfg.lot_size,
+            )
+            if qty < 1:
+                continue
+
+            st.strategy.on_trade_opened()
+
+            fill_result = _scan_fill(setup, bar_scan, cfg)
+
+            if fill_result == "invalidated":
+                pass
+            elif fill_result is not None:
+                fill_time = fill_result
+                st.position = _VirtualPosition(
+                    ticker=symbol,
+                    direction=setup.direction.value,
+                    entry_price=setup.entry_price,
+                    stop_price=setup.stop_price,
+                    target_price=setup.target_price,
+                    qty=qty, lot_size=cfg.lot_size,
+                    entry_time=fill_time,
+                    entry_reason=setup.entry_reason,
+                    balance_at_entry=balance,
+                    last_30m_time=current_30m,
+                )
+                remaining = _get_scan_slice(st.scan_df, fill_time, current_time)
+                if remaining.empty:
+                    remaining = bar_scan[bar_scan.index > fill_time]
+                if not remaining.empty:
+                    exit_trade = _scan_exit(st.position, remaining, cfg)
+                    if exit_trade is not None:
+                        exit_trade.id = trade_id
+                        exit_trade.ticker = symbol
+                        trade_id += 1
+                        trades_by_ticker[symbol].append(exit_trade)
+                        balance += exit_trade.pnl
+                        st.consecutive_sl, st.sl_date = _update_sl_counter(
+                            exit_trade.exit_reason, st.consecutive_sl,
+                            st.sl_date, exit_trade.exit_time,
+                        )
+                        st.position = None
+            else:
+                st.pending = (setup, qty, balance)
+                st.pending_30m_count = 0
+                st.pending_last_30m = current_30m
+
+        # Close remaining positions at last price
+        for symbol, st in states.items():
+            if st.position is not None:
+                last_price = float(st.primary_df.iloc[-1]["close"])
+                last_price = _apply_slippage(last_price, st.position.direction, config.slippage_pct)
+                exit_trade = _close_position(
+                    st.position, last_price, "end_of_data", st.primary_df.index[-1], config,
+                )
+                exit_trade.id = trade_id
+                exit_trade.ticker = symbol
+                trade_id += 1
+                trades_by_ticker[symbol].append(exit_trade)
+                balance += exit_trade.pnl
+
+        # NOTE: warmup trades no longer need filtering — state is reset
+        # at sim_start boundary (see reset block in event loop above).
+
+        mode = "1m" if high_precision else "bar"
+        logger.info(
+            "[RUNNER INTERLEAVED] %s mode, %d tickers, %d trades, balance=%.0f",
+            mode, len(states),
+            sum(len(t) for t in trades_by_ticker.values()),
+            balance,
+        )
+        return trades_by_ticker, balance
+
+
+@dataclass
+class _InterleavedState:
+    """Per-ticker mutable state for interleaved simulation."""
+    ticker: str
+    strategy: object
+    strategy_name: str
+    candles: dict[str, pd.DataFrame]
+    primary_tf: str
+    primary_df: pd.DataFrame
+    scan_df: pd.DataFrame | None
+    df_30m: pd.DataFrame | None
+    lot_size: int
+    price_step: float
+    dividend_dates: list
+    resample_cache: _ResampleCache | None = None
+    position: _VirtualPosition | None = None
+    pending: tuple | None = None
+    pending_30m_count: int = 0
+    pending_last_30m: pd.Timestamp | None = None
+    consecutive_sl: int = 0
+    sl_date: str = ""
 
 
 # ── Helper functions ──────────────────────────────────────────
